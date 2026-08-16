@@ -1,11 +1,12 @@
-"""Explicitly run an RFPro analysis while reusing valid existing results.
+"""Explicitly save and run an RFPro analysis with configurable result reuse.
 
 This script is intentionally separate from the CSV importer. Importing sweep
 cases never launches a simulation. Run this file inside RFPro only when the
-analysis is ready to be queued. The public ``runAnalysis`` API is called with
-``reuseExistingIfPossible=True`` so RFPro can skip parameter instances whose
-results remain valid. Required private FEM environment overrides are scoped to
-the ``runAnalysis`` call and restored afterward.
+analysis is ready to be queued. The active project is saved immediately before
+the public ``runAnalysis`` API is called. Existing-result reuse is controlled
+by an editable global option. Required private FEM environment overrides are
+applied to the RFPro process before submission and remain set for the rest of
+the current RFPro session so asynchronously launched solvers inherit them.
 """
 
 from __future__ import annotations
@@ -14,15 +15,14 @@ import argparse
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 # Edit these defaults when RFPro's Run Script command cannot pass arguments.
 DEFAULT_ANALYSIS_NAME = ""
-DEFAULT_SAVE_PROJECT = True
+DEFAULT_REUSE_EXISTING_RESULTS = True
 DEFAULT_RUN_ENVIRONMENT = {
     "FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR": "0.5",
     "FEMIZER_WAVEGUIDE_VERTICAL_FACTOR": "2.0",
@@ -248,22 +248,24 @@ def _available_result_ids(empro_module: Any, analysis: Any) -> list[Any]:
     return list(output.getAvailableSimulationIds())
 
 
-@contextmanager
-def scoped_environment(overrides: Mapping[str, str]) -> Iterator[None]:
-    """Apply process environment overrides and restore the exact prior state."""
+def apply_session_environment(overrides: Mapping[str, str]) -> None:
+    """Set persistent process values inherited by later RFPro solver launches."""
 
-    previous = {
-        name: (name in os.environ, os.environ.get(name)) for name in overrides
+    for name, value in overrides.items():
+        os.environ[name] = value
+    mismatches = {
+        name: os.environ.get(name)
+        for name, expected in overrides.items()
+        if os.environ.get(name) != expected
     }
-    os.environ.update(overrides)
-    try:
-        yield
-    finally:
-        for name, (was_set, value) in previous.items():
-            if was_set:
-                os.environ[name] = value if value is not None else ""
-            else:
-                os.environ.pop(name, None)
+    if mismatches:
+        raise RuntimeError(
+            "Could not apply the required RFPro session environment: "
+            + ", ".join(f"{name}={value!r}" for name, value in mismatches.items())
+        )
+    print("Persistent RFPro session environment applied:")
+    for name, value in overrides.items():
+        print(f"  {name}={value}")
 
 
 def validate_reuse_supported(empro_module: Any, analysis: Any) -> None:
@@ -284,22 +286,42 @@ def validate_reuse_supported(empro_module: Any, analysis: Any) -> None:
         )
 
 
-def build_run_preview(analysis: Any, configured_count: int, result_count: int) -> str:
+def build_run_preview(
+    analysis: Any,
+    configured_count: int,
+    result_count: int,
+    reuse_existing: bool,
+) -> str:
     environment_preview = "\n".join(
         f"  {name}={value}" for name, value in DEFAULT_RUN_ENVIRONMENT.items()
     )
+    if reuse_existing:
+        reuse_preview = (
+            "Existing-result reuse: enabled",
+            "RFPro will be asked to reuse valid existing results.",
+            "Missing or invalidated instances may be queued for simulation.",
+        )
+    else:
+        reuse_preview = (
+            "Existing-result reuse: disabled",
+            "RFPro will be asked to run regardless of existing results.",
+            "All configured instances may be queued for simulation.",
+        )
     return "\n".join(
         (
             f"Analysis: {analysis.name}",
             f"Configured parameter instances: {configured_count}",
             f"Existing result sets: {result_count}",
             f"Potentially missing instances: {max(configured_count - result_count, 0)}",
+            reuse_preview[0],
             "",
             "FEM run environment:",
             environment_preview,
             "",
-            "RFPro will be asked to reuse valid existing results.",
-            "Missing or invalidated instances may be queued for simulation.",
+            reuse_preview[1],
+            reuse_preview[2],
+            "The active RFPro project will be saved before submission.",
+            "The FEM environment will remain set for the current RFPro session.",
             "This action starts the analysis now.",
         )
     )
@@ -310,7 +332,7 @@ def _confirm_run(preview: str) -> bool:
 
     answer = QMessageBox.question(
         None,
-        "Start RFPro analysis with result reuse?",
+        "Save and start RFPro analysis?",
         preview,
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         QMessageBox.StandardButton.No,
@@ -319,31 +341,38 @@ def _confirm_run(preview: str) -> bool:
 
 
 def run_analysis_reusing_results(
-    run_analysis: Callable[..., Any], analysis: Any, save_project: bool
+    run_analysis: Callable[..., Any], analysis: Any, reuse_existing: bool
 ) -> Any:
-    """Call RFPro with result reuse and the required scoped FEM environment."""
+    """Apply persistent FEM settings and submit with the selected reuse mode."""
 
-    with scoped_environment(DEFAULT_RUN_ENVIRONMENT):
-        return run_analysis(
-            analysis,
-            waitForConfirmation=False,
-            saveProject=save_project,
-            reuseExistingIfPossible=True,
-        )
+    apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
+    return run_analysis(
+        analysis,
+        waitForConfirmation=False,
+        saveProject=True,
+        reuseExistingIfPossible=reuse_existing,
+    )
+
+
+def save_and_run_analysis(
+    project: Any,
+    run_analysis: Callable[..., Any],
+    analysis: Any,
+    reuse_existing: bool,
+) -> Any:
+    """Save synchronously, then submit; a save failure prevents submission."""
+
+    project.saveActiveProject()
+    return run_analysis_reusing_results(run_analysis, analysis, reuse_existing)
 
 
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Explicitly run RFPro while reusing valid existing results.",
+        description="Explicitly save and run RFPro with configurable result reuse.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--analysis", default=DEFAULT_ANALYSIS_NAME, help="RFPro analysis name"
-    )
-    parser.add_argument(
-        "--no-save",
-        action="store_true",
-        help="do not save the modified analysis before launching it",
     )
     parser.add_argument(
         "--yes", action="store_true", help="start without the confirmation dialog"
@@ -381,17 +410,29 @@ def main(argv: Sequence[str] | None = None) -> None:
     validate_reuse_supported(empro, analysis)
     configured_count = _configured_instance_count(analysis)
     result_count = len(_available_result_ids(empro, analysis))
-    preview = build_run_preview(analysis, configured_count, result_count)
+    reuse_existing = DEFAULT_REUSE_EXISTING_RESULTS
+    preview = build_run_preview(
+        analysis,
+        configured_count,
+        result_count,
+        reuse_existing,
+    )
     print(preview)
     if not arguments.yes and not _confirm_run(preview):
         print("Run cancelled; no RFPro simulations were started.")
         return
 
-    save_project = DEFAULT_SAVE_PROJECT and not arguments.no_save
-    run_analysis_reusing_results(runAnalysis, analysis, save_project)
+    save_and_run_analysis(
+        empro.activeProject,
+        runAnalysis,
+        analysis,
+        reuse_existing,
+    )
+    reuse_summary = "enabled" if reuse_existing else "disabled"
     summary = (
-        f"Started analysis {analysis.name!r} with existing-result reuse requested. "
-        "RFPro determines which result sets remain valid."
+        f"Saved the active project and started analysis {analysis.name!r} "
+        f"with existing-result reuse {reuse_summary}. Required FEM settings "
+        "remain active for the current RFPro session."
     )
     print(summary)
     from PySide6.QtWidgets import QMessageBox

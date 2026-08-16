@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-08-16
+
+- Save the active RFPro project synchronously after confirmation and before
+  submitting the analysis; a save error now prevents the run from starting.
+- Add the editable `DEFAULT_REUSE_EXISTING_RESULTS` global and show its enabled
+  or disabled state in the final run preview.
+- Keep the required FEM environment values set globally for the remainder of
+  the current RFPro session so queued solver processes inherit them.
+- Remove the runner's `--no-save` option because runs now always save first.
+
 ## 0.3.2 - 2026-08-16
 
 - Read swept FEM, CTI, or SIO circuit results directly with

@@ -133,12 +133,23 @@ scripting.run(
 
 The script asks you to choose an analysis, reports the configured instance and
 existing-result counts, and defaults the final start confirmation to **No**.
-After confirmation it calls the public `empro.toolkit.analysis.runAnalysis()`
-API with `reuseExistingIfPossible=True`. RFPro skips existing result sets only
-when it still considers them valid; missing or invalidated cases are queued.
+After confirmation it explicitly saves the active RFPro project, then calls the
+public `empro.toolkit.analysis.runAnalysis()` API. A save failure stops the
+operation before any simulation is submitted.
 
-The runner also applies these required private FEM environment controls for
-the complete `runAnalysis()` call:
+Result reuse is controlled by this global near the top of the runner:
+
+```python
+DEFAULT_REUSE_EXISTING_RESULTS = True
+```
+
+With `True`, RFPro skips existing result sets only when it still considers them
+valid; missing or invalidated cases are queued. Set it to `False` to request a
+run regardless of existing results, which may queue every configured instance.
+The selected mode is shown in the final confirmation preview.
+
+The runner applies these required private FEM environment controls to the
+current RFPro process before submission:
 
 ```text
 FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR=0.5
@@ -146,10 +157,11 @@ FEMIZER_WAVEGUIDE_VERTICAL_FACTOR=2.0
 FEM_ALWAYS_SOLVE_ON_FINEST_MESH=on
 ```
 
-They are shown in the final confirmation preview. The script records whether
-each variable was originally unset, empty, or assigned another value, then
-restores that exact state after RFPro accepts the run request, including when
-the call raises an exception. Importing CSV cases never sets these variables.
+They are shown in the final confirmation preview and remain set for the rest
+of the current RFPro session, including after `runAnalysis()` returns or raises
+an exception. This allows solver processes launched asynchronously from the
+queue to inherit the required values. Running the script again reapplies the
+same values. Importing CSV cases never sets these variables.
 
 For an explicit scripted launch:
 
@@ -164,7 +176,6 @@ Useful runner options:
 
 ```text
 --analysis NAME
---no-save
 --yes
 ```
 

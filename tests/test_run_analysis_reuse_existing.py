@@ -44,13 +44,22 @@ class FakeEmpro:
 
 class ReuseRunnerTests(unittest.TestCase):
     def test_preview_makes_manual_start_and_reuse_explicit(self) -> None:
-        preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3)
+        preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, True)
         self.assertIn("Potentially missing instances: 2", preview)
+        self.assertIn("Existing-result reuse: enabled", preview)
         self.assertIn("reuse valid existing results", preview)
+        self.assertIn("will be saved before submission", preview)
+        self.assertIn("remain set for the current RFPro session", preview)
         self.assertIn("starts the analysis now", preview)
         self.assertIn("FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR=0.5", preview)
         self.assertIn("FEMIZER_WAVEGUIDE_VERTICAL_FACTOR=2.0", preview)
         self.assertIn("FEM_ALWAYS_SOLVE_ON_FINEST_MESH=on", preview)
+
+    def test_preview_warns_when_reuse_is_disabled(self) -> None:
+        preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, False)
+        self.assertIn("Existing-result reuse: disabled", preview)
+        self.assertIn("run regardless of existing results", preview)
+        self.assertIn("All configured instances may be queued", preview)
 
     def test_public_runner_receives_reuse_flags(self) -> None:
         calls: list[tuple[object, dict[str, object]]] = []
@@ -61,7 +70,7 @@ class ReuseRunnerTests(unittest.TestCase):
 
         analysis = FakeAnalysis()
         result = MODULE.run_analysis_reusing_results(
-            fake_run, analysis, save_project=True
+            fake_run, analysis, reuse_existing=True
         )
         self.assertEqual(result, "queued")
         self.assertEqual(
@@ -81,9 +90,52 @@ class ReuseRunnerTests(unittest.TestCase):
     def test_confirmation_is_enabled_by_default(self) -> None:
         arguments = MODULE._parse_arguments([])
         self.assertFalse(arguments.yes)
-        self.assertFalse(arguments.no_save)
 
-    def test_required_fem_environment_is_active_only_during_run(self) -> None:
+    def test_project_is_saved_before_submission(self) -> None:
+        events: list[str] = []
+
+        class FakeProject:
+            @staticmethod
+            def saveActiveProject() -> None:
+                events.append("save")
+
+        def fake_run(_analysis: object, **kwargs: object) -> str:
+            events.append("run")
+            self.assertFalse(kwargs["reuseExistingIfPossible"])
+            self.assertTrue(kwargs["saveProject"])
+            return "queued"
+
+        result = MODULE.save_and_run_analysis(
+            FakeProject(),
+            fake_run,
+            FakeAnalysis(),
+            reuse_existing=False,
+        )
+        self.assertEqual(result, "queued")
+        self.assertEqual(events, ["save", "run"])
+
+    def test_save_failure_prevents_submission(self) -> None:
+        run_called = False
+
+        class FakeProject:
+            @staticmethod
+            def saveActiveProject() -> None:
+                raise RuntimeError("save failed")
+
+        def fake_run(_analysis: object, **_kwargs: object) -> None:
+            nonlocal run_called
+            run_called = True
+
+        with self.assertRaisesRegex(RuntimeError, "save failed"):
+            MODULE.save_and_run_analysis(
+                FakeProject(),
+                fake_run,
+                FakeAnalysis(),
+                reuse_existing=True,
+            )
+        self.assertFalse(run_called)
+
+    def test_required_fem_environment_persists_after_submission(self) -> None:
         observed: dict[str, str | None] = {}
 
         def fake_run(_analysis: object, **_kwargs: object) -> str:
@@ -96,12 +148,12 @@ class ReuseRunnerTests(unittest.TestCase):
             for name in names:
                 os.environ.pop(name, None)
             MODULE.run_analysis_reusing_results(fake_run, FakeAnalysis(), True)
-            restored = {name: os.environ.get(name) for name in names}
+            persisted = {name: os.environ.get(name) for name in names}
 
         self.assertEqual(observed, MODULE.DEFAULT_RUN_ENVIRONMENT)
-        self.assertEqual(restored, {name: None for name in names})
+        self.assertEqual(persisted, MODULE.DEFAULT_RUN_ENVIRONMENT)
 
-    def test_existing_fem_environment_is_restored_exactly(self) -> None:
+    def test_existing_fem_environment_is_replaced_and_left_set(self) -> None:
         existing = {
             "FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR": "old-horizontal",
             "FEMIZER_WAVEGUIDE_VERTICAL_FACTOR": "",
@@ -117,11 +169,11 @@ class ReuseRunnerTests(unittest.TestCase):
 
         with patch.dict(os.environ, existing, clear=False):
             MODULE.run_analysis_reusing_results(fake_run, FakeAnalysis(), True)
-            restored = {name: os.environ.get(name) for name in existing}
+            persisted = {name: os.environ.get(name) for name in existing}
 
-        self.assertEqual(restored, existing)
+        self.assertEqual(persisted, MODULE.DEFAULT_RUN_ENVIRONMENT)
 
-    def test_fem_environment_is_restored_when_run_fails(self) -> None:
+    def test_fem_environment_persists_when_submission_fails(self) -> None:
         names = list(MODULE.DEFAULT_RUN_ENVIRONMENT)
 
         def fake_run(_analysis: object, **_kwargs: object) -> str:
@@ -132,9 +184,9 @@ class ReuseRunnerTests(unittest.TestCase):
                 os.environ.pop(name, None)
             with self.assertRaisesRegex(RuntimeError, "submission failed"):
                 MODULE.run_analysis_reusing_results(fake_run, FakeAnalysis(), True)
-            restored = {name: os.environ.get(name) for name in names}
+            persisted = {name: os.environ.get(name) for name in names}
 
-        self.assertEqual(restored, {name: None for name in names})
+        self.assertEqual(persisted, MODULE.DEFAULT_RUN_ENVIRONMENT)
 
     def test_unsupported_analysis_type_is_rejected_before_running(self) -> None:
         MODULE.validate_reuse_supported(FakeEmpro, FakeAnalysis())
