@@ -60,6 +60,39 @@ class FakeMatrix:
         return self.data[key]
 
 
+class FakeEvaluatedCircuitMatrix:
+    def __init__(self, values: list[list[complex]]) -> None:
+        self.values = values
+
+    def __call__(self, row: int, column: int) -> complex:
+        return self.values[row][column]
+
+
+class FakeCircuitMatrix:
+    def __init__(self) -> None:
+        self._frequencies = [1.0e9, 2.0e9]
+        self._values = {
+            1.0e9: [
+                [0.1 + 0.2j, 0.4 + 0.5j],
+                [0.7 + 0.8j, 1.0 + 1.1j],
+            ],
+            2.0e9: [
+                [0.2 + 0.3j, 0.5 + 0.6j],
+                [0.8 + 0.9j, 1.1 + 1.2j],
+            ],
+        }
+
+    @staticmethod
+    def numberOfPorts() -> int:
+        return 2
+
+    def frequencies(self) -> object:
+        return types.SimpleNamespace(data=self._frequencies)
+
+    def Smatrix(self, frequency: float) -> FakeEvaluatedCircuitMatrix:
+        return FakeEvaluatedCircuitMatrix(self._values[frequency])
+
+
 class FakeSweep:
     def __init__(self, name: str, values: list[str]) -> None:
         self.parameterName = name
@@ -135,6 +168,14 @@ class MDIFExportTests(unittest.TestCase):
         self.assertEqual(block.frequencies_hz, (1.0e9, 2.0e9))
         self.assertEqual(block.values[0][2], 0.7 + 0.8j)
 
+    def test_circuit_matrix_is_exported_in_row_major_order(self) -> None:
+        block = MODULE.circuit_matrix_to_block(
+            FakeCircuitMatrix(), "000001", {"W": "1 mm", "L": "2 mm"}
+        )
+        self.assertEqual(block.labels, ("S11", "S12", "S21", "S22"))
+        self.assertEqual(block.frequencies_hz, (1.0e9, 2.0e9))
+        self.assertEqual(block.values[0][2], 0.7 + 0.8j)
+
     def test_inconsistent_sparameter_frequency_grid_is_rejected(self) -> None:
         matrix = FakeMatrix()
         matrix.data[(2, 2)] = FakeDataSet(
@@ -174,15 +215,13 @@ class MDIFExportTests(unittest.TestCase):
 
     def test_smatrix_uses_parent_result_context_and_simulation_id(self) -> None:
         calls: list[tuple[object, object]] = []
-        fake_portparam = types.ModuleType("empro.toolkit.portparam")
-
-        def get_smatrix(context: object = None, sim: object = None) -> FakeMatrix:
-            calls.append((context, sim))
-            return FakeMatrix()
-
-        fake_portparam.getSMatrix = get_smatrix  # type: ignore[attr-defined]
         fake_toolkit = types.ModuleType("empro.toolkit")
-        fake_toolkit.portparam = fake_portparam  # type: ignore[attr-defined]
+
+        def get_circuit_matrix(proj: object = None, sim: object = None) -> FakeCircuitMatrix:
+            calls.append((proj, sim))
+            return FakeCircuitMatrix()
+
+        fake_toolkit.getCircuitMatrix = get_circuit_matrix  # type: ignore[attr-defined]
         fake_empro_package = types.ModuleType("empro")
         fake_empro_package.toolkit = fake_toolkit  # type: ignore[attr-defined]
 
@@ -199,7 +238,6 @@ class MDIFExportTests(unittest.TestCase):
         modules = {
             "empro": fake_empro_package,
             "empro.toolkit": fake_toolkit,
-            "empro.toolkit.portparam": fake_portparam,
         }
 
         with mock.patch.dict(sys.modules, modules):

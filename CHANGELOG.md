@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 - 2026-08-16
+
+- Read swept FEM, CTI, or SIO circuit results directly with
+  `empro.toolkit.getCircuitMatrix()` instead of requiring RFPro's nested result
+  directories to register as result-browser projects.
+- Add regression coverage for converting file-backed circuit matrices to MDIF.
+
 ## 0.3.1 - 2026-08-16
 
 - Derive the owning RFPro result project from each case path and load swept

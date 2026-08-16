@@ -482,6 +482,57 @@ def smatrix_to_block(
     )
 
 
+def circuit_matrix_to_block(
+    circuit_matrix: Any,
+    simulation_id: str,
+    parameters: Mapping[str, str],
+) -> MDIFBlock:
+    """Convert a file-backed RFPro ``CircuitMatrix`` into an MDIF block."""
+
+    port_count = int(circuit_matrix.numberOfPorts())
+    if port_count <= 0:
+        raise ValueError(f"Simulation {simulation_id}: S-matrix has no ports.")
+
+    frequency_dataset = circuit_matrix.frequencies()
+    frequencies = tuple(float(value) for value in frequency_dataset.data)
+    if not frequencies:
+        raise ValueError(f"Simulation {simulation_id}: S-parameter data is empty.")
+
+    labels = tuple(
+        _sparameter_label(row + 1, column + 1)
+        for row in range(port_count)
+        for column in range(port_count)
+    )
+    rows_of_values: list[tuple[complex, ...]] = []
+    for frequency in frequencies:
+        if not math.isfinite(frequency):
+            raise ValueError(
+                f"Simulation {simulation_id}: frequency is not finite: {frequency}."
+            )
+        evaluated_matrix = circuit_matrix.Smatrix(frequency)
+        row_values = tuple(
+            complex(evaluated_matrix(row, column))
+            for row in range(port_count)
+            for column in range(port_count)
+        )
+        if any(
+            not math.isfinite(value.real) or not math.isfinite(value.imag)
+            for value in row_values
+        ):
+            raise ValueError(
+                f"Simulation {simulation_id}: S-parameter data contains NaN or infinity."
+            )
+        rows_of_values.append(row_values)
+
+    return MDIFBlock(
+        simulation_id=str(simulation_id),
+        parameters=tuple((str(name), str(value)) for name, value in parameters.items()),
+        frequencies_hz=frequencies,
+        labels=labels,
+        values=tuple(rows_of_values),
+    )
+
+
 def _case_insensitive_value(mapping: Mapping[str, str], name: str) -> str | None:
     if name in mapping:
         return mapping[name]
@@ -516,7 +567,7 @@ def collect_analysis_blocks(
 ) -> list[MDIFBlock]:
     """Walk public RFPro analysis outputs and extract every usable S-matrix."""
 
-    from empro.toolkit import portparam
+    from empro import toolkit
 
     analysis_output = empro_module.output.AnalysisOutput(analysis)
     # Preserve the public API's result order. It matches the configured sweep
@@ -565,12 +616,16 @@ def collect_analysis_blocks(
                 raise ValueError(
                     f"could not derive a result-project path from {simulation_path!r}"
                 )
-            smatrix = portparam.getSMatrix(
-                context=result_context,
+            # Read the simulation's circuit result files directly.  RFPro's
+            # nested analysis directories are not necessarily registerable
+            # result-browser projects, which makes portparam.getSMatrix fail
+            # before it reaches otherwise valid FEM/CTI/SIO result data.
+            circuit_matrix = toolkit.getCircuitMatrix(
+                proj=result_context,
                 sim=str(simulation_id),
             )
-            block = smatrix_to_block(
-                smatrix,
+            block = circuit_matrix_to_block(
+                circuit_matrix,
                 simulation_id=str(simulation_id),
                 parameters=selected,
             )

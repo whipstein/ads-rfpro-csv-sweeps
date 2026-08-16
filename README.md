@@ -195,14 +195,13 @@ scripting.run(
 ```
 
 The exporter uses `empro.output.AnalysisOutput` to enumerate analysis result
-cases and `empro.toolkit.portparam.getSMatrix()` to retrieve each complete
-S-matrix. It loads the analysis result project as the query context and selects
-each swept case by simulation ID; individual RFPro case directories are not
-treated as standalone result projects. The owning result project is derived
-from each simulation output path because RFPro may report the individual case
-path through both the analysis and simulation output objects. Parameter values
-come from the result metadata, with the configured analysis sweep as a fallback
-when its expanded case count matches the results.
+cases and `empro.toolkit.getCircuitMatrix()` to read each case's FEM, CTI, or
+SIO result files directly. This avoids treating nested RFPro analysis folders
+as standalone result-browser projects. The owning result directory is derived
+from each simulation output path, and the leaf directory is selected by
+simulation ID. Parameter values come from the result metadata, with the
+configured analysis sweep as a fallback when its expanded case count matches
+the results.
 
 The output contains one block per result:
 
@@ -295,7 +294,7 @@ Update 2.1 and EMPro 2026 corpus:
 - EMPro public Python documentation for `Analysis.simulationSettings`,
   `AnalysisList.names/index`, `AnalysisOutput`, `SimulationOutput.metadata`,
   `SimulationOutput.simulationPath`, `DataSetMatrix`, and
-  `empro.toolkit.portparam.getSMatrix()`.
+  `empro.toolkit.getCircuitMatrix()`.
 - `empro.toolkit.analysis.runAnalysis()` and its
   `reuseExistingIfPossible=True` option for explicitly starting only after the
   user confirms.
