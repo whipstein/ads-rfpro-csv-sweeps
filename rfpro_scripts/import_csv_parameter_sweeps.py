@@ -25,7 +25,7 @@ from typing import Any, Iterable, Sequence
 # Edit these defaults when RFPro's Run Script command cannot pass arguments.
 DEFAULT_CSV_PATH = ""
 DEFAULT_ANALYSIS_NAME = ""
-DEFAULT_IMPORT_MODE = "replace"  # "replace" or "append"
+DEFAULT_IMPORT_MODE = "ask"  # "ask", "replace", or "append"
 DEFAULT_SAVE_PROJECT = True
 
 _RESERVED_COLUMNS = {"__case__", "__comment__", "__enabled__"}
@@ -417,12 +417,46 @@ def _choose_csv_path(configured_path: str) -> Path:
     return Path(selected).expanduser().resolve()
 
 
+def _choose_import_mode(settings: Any, configured_mode: str) -> str:
+    """Resolve replace/append explicitly before changing the analysis."""
+
+    if configured_mode in {"replace", "append"}:
+        return configured_mode
+    if configured_mode != "ask":
+        raise ValueError(f"Unknown import mode: {configured_mode!r}")
+
+    from PySide6.QtWidgets import QInputDialog
+
+    choices = (
+        "Replace all existing sweep sequences",
+        "Append CSV cases to existing sweep sequences",
+    )
+    selected, accepted = QInputDialog.getItem(
+        None,
+        "RFPro CSV Parameter Sweeps",
+        (
+            f"The analysis currently has {len(settings.parameterSequences)} sweep "
+            "sequence(s).\nChoose how to import the CSV cases:"
+        ),
+        choices,
+        1,
+        False,
+    )
+    if not accepted:
+        raise RuntimeError("Import-mode selection was cancelled.")
+    return "replace" if str(selected) == choices[0] else "append"
+
+
 def _preview_text(analysis: Any, path: Path, cases: Sequence[SweepCase], mode: str) -> str:
     parameter_names = [name for name, _ in cases[0].parameters]
+    existing_count = len(analysis.simulationSettings.parameterSequences)
+    resulting_count = len(cases) if mode == "replace" else existing_count + len(cases)
     lines = [
         f"Analysis: {analysis.name}",
         f"CSV: {path}",
         f"Mode: {mode}",
+        f"Existing sweep sequences: {existing_count}",
+        f"Resulting sweep sequences: {resulting_count}",
         f"Independent cases: {len(cases)}",
         "Parameters: " + ", ".join(parameter_names),
         "",
@@ -459,9 +493,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("replace", "append"),
+        choices=("ask", "replace", "append"),
         default=DEFAULT_IMPORT_MODE,
-        help="replace existing sequences or append independent cases",
+        help="ask in RFPro, replace existing sequences, or append independent cases",
     )
     parser.add_argument(
         "--no-save",
@@ -506,15 +540,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     cases = read_sweep_csv(csv_path)
     validate_cases_against_project(project, cases)
     sequences = build_parameter_sequences(empro, cases)
+    import_mode = _choose_import_mode(analysis.simulationSettings, arguments.mode)
 
-    preview = _preview_text(analysis, csv_path, cases, arguments.mode)
+    preview = _preview_text(analysis, csv_path, cases, import_mode)
     print(preview)
     if not arguments.yes and not _confirm_import(preview):
         print("Import cancelled; the RFPro analysis was not changed.")
         return
 
     before, after = install_parameter_sequences(
-        analysis.simulationSettings, sequences, arguments.mode
+        analysis.simulationSettings, sequences, import_mode
     )
     should_save = DEFAULT_SAVE_PROJECT and not arguments.no_save
     if should_save:

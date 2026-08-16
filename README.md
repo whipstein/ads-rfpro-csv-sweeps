@@ -8,7 +8,7 @@ RFPro process:
 - `rfpro_scripts/export_analysis_mdif.py` exports all available swept
   S-parameter results from an analysis to one generic MDIF file.
 
-The current release is **0.1.0**.
+The current release is **0.1.1**.
 
 ## Execution model
 
@@ -29,8 +29,10 @@ scripting.run(
 ```
 
 With no arguments, the importer opens dialogs for the analysis and CSV file,
-shows a preview, and asks for confirmation. The exporter similarly asks for
-the analysis and output MDIF path.
+then explicitly asks whether to replace all existing sweep sequences or append
+the CSV cases. It shows a preview and asks for final confirmation before making
+the change. Append is preselected in the interactive chooser. The exporter
+similarly asks for the analysis and output MDIF path.
 
 RFPro's scripting loader can also pass the argument list expected by
 `main(argv)`:
@@ -92,18 +94,24 @@ the Cartesian combinations `(1,20)` and `(2,10)`.
 5. Inspect the analysis's parameter sweep in RFPro, then run it through the
    normal RFPro workflow.
 
-The default mode is `replace`: existing `parameterSequences` are cleared only
+The default mode is `ask`, so an interactive RFPro run always makes the choice
+explicit. In `replace` mode, existing `parameterSequences` are cleared only
 after the complete CSV has been parsed, validated, and converted to native
-objects. `append` preserves the existing sequences and adds the CSV cases.
-The script enables the parameter sweep, saves the active project by default,
-and does not create or queue simulations.
+objects. In `append` mode, all existing sequences are preserved and the CSV
+cases are added after them. The preview reports the selected operation before
+the final confirmation. The script enables the parameter sweep, saves the
+active project by default, and does not create or queue simulations.
+
+For non-interactive use, pass `--mode replace` or `--mode append`. You can also
+set `DEFAULT_IMPORT_MODE` near the top of the script to either value to make it
+the fixed behavior for launches that cannot pass arguments.
 
 Useful importer options:
 
 ```text
 --csv PATH
 --analysis NAME
---mode {replace,append}
+--mode {ask,replace,append}
 --no-save
 --yes
 ```

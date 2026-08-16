@@ -147,6 +147,14 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual((before, after), (1, 2))
         self.assertEqual(settings.parameterSequences[0], "existing")
 
+    def test_import_mode_can_be_explicit_or_interactive(self) -> None:
+        settings = FakeSettings()
+        self.assertEqual(MODULE._choose_import_mode(settings, "replace"), "replace")
+        self.assertEqual(MODULE._choose_import_mode(settings, "append"), "append")
+        self.assertEqual(MODULE._parse_arguments([]).mode, "ask")
+        with self.assertRaisesRegex(ValueError, "Unknown import mode"):
+            MODULE._choose_import_mode(settings, "invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 - 2026-08-16
+
+- Prompt direct RFPro runs to choose between replacing all existing sweep
+  sequences and appending the CSV cases.
+- Retain explicit `--mode replace` and `--mode append` operation for scripted
+  and non-interactive launches.
+
 ## 0.1.0 - 2026-08-16
 
 - Add direct-in-RFPro CSV import of correlated geometry cases.
