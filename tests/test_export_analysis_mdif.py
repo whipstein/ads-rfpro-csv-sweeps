@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +77,34 @@ class FakeSettings:
         ]
 
 
+class FakeSingleCaseSettings:
+    def __init__(self) -> None:
+        self.parameterSequences = [[FakeSweep("W", ["1 mm"])]]
+
+
+class FakeSimulationOutput:
+    simulationPath = "/project/rfpro/000001/000002"
+
+    @staticmethod
+    def metadata() -> object:
+        return object()
+
+
+class FakeAnalysisOutput:
+    def __init__(self, analysis: object) -> None:
+        self.analysis = analysis
+
+    @staticmethod
+    def getAvailableSimulationIds() -> list[str]:
+        return ["000002"]
+
+    @staticmethod
+    def getSimulation(simulation_id: str) -> FakeSimulationOutput:
+        if simulation_id != "000002":
+            raise KeyError(simulation_id)
+        return FakeSimulationOutput()
+
+
 class MDIFExportTests(unittest.TestCase):
     def test_parameter_metadata_parsing(self) -> None:
         self.assertEqual(
@@ -141,6 +171,46 @@ class MDIFExportTests(unittest.TestCase):
         block = MODULE.smatrix_to_block(FakeMatrix(), "1", {"bad name": "1 mm"})
         with self.assertRaisesRegex(ValueError, "not a valid"):
             MODULE.render_mdif([block], 50.0)
+
+    def test_smatrix_uses_analysis_context_and_simulation_id(self) -> None:
+        calls: list[tuple[object, object]] = []
+        fake_portparam = types.ModuleType("empro.toolkit.portparam")
+
+        def get_smatrix(context: object = None, sim: object = None) -> FakeMatrix:
+            calls.append((context, sim))
+            return FakeMatrix()
+
+        fake_portparam.getSMatrix = get_smatrix  # type: ignore[attr-defined]
+        fake_toolkit = types.ModuleType("empro.toolkit")
+        fake_toolkit.portparam = fake_portparam  # type: ignore[attr-defined]
+        fake_empro_package = types.ModuleType("empro")
+        fake_empro_package.toolkit = fake_toolkit  # type: ignore[attr-defined]
+
+        analysis = types.SimpleNamespace(
+            name="RF Analysis",
+            simulationPath="/project/rfpro/000001",
+            simulationSettings=FakeSingleCaseSettings(),
+        )
+        empro_module = types.SimpleNamespace(
+            output=types.SimpleNamespace(AnalysisOutput=FakeAnalysisOutput)
+        )
+        modules = {
+            "empro": fake_empro_package,
+            "empro.toolkit": fake_toolkit,
+            "empro.toolkit.portparam": fake_portparam,
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            blocks = MODULE.collect_analysis_blocks(
+                empro_module,
+                analysis,
+                parameter_names=("W",),
+                skip_errors=False,
+            )
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(calls, [("/project/rfpro/000001", "000002")])
+        self.assertNotEqual(calls[0][0], FakeSimulationOutput.simulationPath)
 
 
 if __name__ == "__main__":

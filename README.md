@@ -196,8 +196,11 @@ scripting.run(
 
 The exporter uses `empro.output.AnalysisOutput` to enumerate analysis result
 cases and `empro.toolkit.portparam.getSMatrix()` to retrieve each complete
-S-matrix. Parameter values come from the result metadata, with the configured
-analysis sweep as a fallback when its expanded case count matches the results.
+S-matrix. It loads the analysis result project as the query context and selects
+each swept case by simulation ID; individual RFPro case directories are not
+treated as standalone result projects. Parameter values come from the result
+metadata, with the configured analysis sweep as a fallback when its expanded
+case count matches the results.
 
 The output contains one block per result:
 

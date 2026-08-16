@@ -525,6 +525,18 @@ def collect_analysis_blocks(
     if not simulation_ids:
         raise RuntimeError(f"Analysis {analysis.name!r} has no available simulations.")
 
+    # The dataset API treats a string context as a result-project ID.  RFPro
+    # sweep cases live below the analysis result project, so passing an
+    # individual SimulationOutput.simulationPath as the context attempts to
+    # register that leaf directory as a project and fails.  Select each case
+    # with the analysis context and its simulation ID instead.
+    result_context = str(getattr(analysis, "simulationPath", "") or "")
+    if not result_context:
+        raise RuntimeError(
+            f"Analysis {analysis.name!r} has no result-project path. "
+            "Save the RFPro project and run the analysis before exporting."
+        )
+
     configured_cases = configured_parameter_cases(analysis.simulationSettings)
     configured_matches = len(configured_cases) == len(simulation_ids)
     if configured_cases and not configured_matches:
@@ -556,7 +568,10 @@ def collect_analysis_blocks(
             simulation_path = str(simulation_output.simulationPath)
             if not simulation_path:
                 raise ValueError("simulation output has no result path")
-            smatrix = portparam.getSMatrix(context=simulation_path)
+            smatrix = portparam.getSMatrix(
+                context=result_context,
+                sim=str(simulation_id),
+            )
             block = smatrix_to_block(
                 smatrix,
                 simulation_id=str(simulation_id),

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-08-16
+
+- Load swept S-parameters with the RFPro analysis result context and explicit
+  simulation ID instead of treating each case directory as a result project.
+- Add regression coverage for exporting an existing nested RFPro sweep result.
+
 ## 0.3.0 - 2026-08-16
 
 - Apply the required waveguide horizontal factor `0.5`, vertical factor `2.0`,
