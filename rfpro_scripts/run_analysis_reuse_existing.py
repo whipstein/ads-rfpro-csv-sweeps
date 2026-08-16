@@ -4,7 +4,8 @@ This script is intentionally separate from the CSV importer. Importing sweep
 cases never launches a simulation. Run this file inside RFPro only when the
 analysis is ready to be queued. The public ``runAnalysis`` API is called with
 ``reuseExistingIfPossible=True`` so RFPro can skip parameter instances whose
-results remain valid.
+results remain valid. Required private FEM environment overrides are scoped to
+the ``runAnalysis`` call and restored afterward.
 """
 
 from __future__ import annotations
@@ -13,14 +14,20 @@ import argparse
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 # Edit these defaults when RFPro's Run Script command cannot pass arguments.
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_SAVE_PROJECT = True
+DEFAULT_RUN_ENVIRONMENT = {
+    "FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR": "0.5",
+    "FEMIZER_WAVEGUIDE_VERTICAL_FACTOR": "2.0",
+    "FEM_ALWAYS_SOLVE_ON_FINEST_MESH": "on",
+}
 
 
 @dataclass(frozen=True)
@@ -241,6 +248,24 @@ def _available_result_ids(empro_module: Any, analysis: Any) -> list[Any]:
     return list(output.getAvailableSimulationIds())
 
 
+@contextmanager
+def scoped_environment(overrides: Mapping[str, str]) -> Iterator[None]:
+    """Apply process environment overrides and restore the exact prior state."""
+
+    previous = {
+        name: (name in os.environ, os.environ.get(name)) for name in overrides
+    }
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, (was_set, value) in previous.items():
+            if was_set:
+                os.environ[name] = value if value is not None else ""
+            else:
+                os.environ.pop(name, None)
+
+
 def validate_reuse_supported(empro_module: Any, analysis: Any) -> None:
     """Reject analysis types for which the public reuse flag is not defined."""
 
@@ -260,12 +285,18 @@ def validate_reuse_supported(empro_module: Any, analysis: Any) -> None:
 
 
 def build_run_preview(analysis: Any, configured_count: int, result_count: int) -> str:
+    environment_preview = "\n".join(
+        f"  {name}={value}" for name, value in DEFAULT_RUN_ENVIRONMENT.items()
+    )
     return "\n".join(
         (
             f"Analysis: {analysis.name}",
             f"Configured parameter instances: {configured_count}",
             f"Existing result sets: {result_count}",
             f"Potentially missing instances: {max(configured_count - result_count, 0)}",
+            "",
+            "FEM run environment:",
+            environment_preview,
             "",
             "RFPro will be asked to reuse valid existing results.",
             "Missing or invalidated instances may be queued for simulation.",
@@ -290,14 +321,15 @@ def _confirm_run(preview: str) -> bool:
 def run_analysis_reusing_results(
     run_analysis: Callable[..., Any], analysis: Any, save_project: bool
 ) -> Any:
-    """Call the public RFPro runner with overwrite disabled by reuse intent."""
+    """Call RFPro with result reuse and the required scoped FEM environment."""
 
-    return run_analysis(
-        analysis,
-        waitForConfirmation=False,
-        saveProject=save_project,
-        reuseExistingIfPossible=True,
-    )
+    with scoped_environment(DEFAULT_RUN_ENVIRONMENT):
+        return run_analysis(
+            analysis,
+            waitForConfirmation=False,
+            saveProject=save_project,
+            reuseExistingIfPossible=True,
+        )
 
 
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:

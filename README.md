@@ -10,7 +10,7 @@ RFPro process:
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
   later while requesting reuse of valid existing results.
 
-The current release is **0.2.0**.
+The current release is **0.3.0**.
 
 ## Execution model
 
@@ -136,6 +136,20 @@ existing-result counts, and defaults the final start confirmation to **No**.
 After confirmation it calls the public `empro.toolkit.analysis.runAnalysis()`
 API with `reuseExistingIfPossible=True`. RFPro skips existing result sets only
 when it still considers them valid; missing or invalidated cases are queued.
+
+The runner also applies these required private FEM environment controls for
+the complete `runAnalysis()` call:
+
+```text
+FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR=0.5
+FEMIZER_WAVEGUIDE_VERTICAL_FACTOR=2.0
+FEM_ALWAYS_SOLVE_ON_FINEST_MESH=on
+```
+
+They are shown in the final confirmation preview. The script records whether
+each variable was originally unset, empty, or assigned another value, then
+restores that exact state after RFPro accepts the run request, including when
+the call raises an exception. Importing CSV cases never sets these variables.
 
 For an explicit scripted launch:
 
@@ -282,5 +296,9 @@ Update 2.1 and EMPro 2026 corpus:
   user confirms.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
+
+The three private FEM environment variables used by the explicit runner are
+intentional project requirements supplied for the target RFPro installation;
+they are not part of the public documented API corpus.
 
 Final verification against the installed target release remains required.

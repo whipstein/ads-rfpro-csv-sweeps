@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 - 2026-08-16
+
+- Apply the required waveguide horizontal factor `0.5`, vertical factor `2.0`,
+  and finest-mesh setting `on` during explicit RFPro analysis submission.
+- Show the private FEM environment overrides in the final run preview.
+- Restore the exact previous process environment after the run call.
+
 ## 0.2.0 - 2026-08-16
 
 - Add a separate, explicitly invoked RFPro analysis runner that requests reuse
