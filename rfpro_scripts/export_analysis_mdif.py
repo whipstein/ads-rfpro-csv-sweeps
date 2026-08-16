@@ -525,18 +525,6 @@ def collect_analysis_blocks(
     if not simulation_ids:
         raise RuntimeError(f"Analysis {analysis.name!r} has no available simulations.")
 
-    # The dataset API treats a string context as a result-project ID.  RFPro
-    # sweep cases live below the analysis result project, so passing an
-    # individual SimulationOutput.simulationPath as the context attempts to
-    # register that leaf directory as a project and fails.  Select each case
-    # with the analysis context and its simulation ID instead.
-    result_context = str(getattr(analysis, "simulationPath", "") or "")
-    if not result_context:
-        raise RuntimeError(
-            f"Analysis {analysis.name!r} has no result-project path. "
-            "Save the RFPro project and run the analysis before exporting."
-        )
-
     configured_cases = configured_parameter_cases(analysis.simulationSettings)
     configured_matches = len(configured_cases) == len(simulation_ids)
     if configured_cases and not configured_matches:
@@ -548,6 +536,7 @@ def collect_analysis_blocks(
     blocks: list[MDIFBlock] = []
     parameter_order: list[str] | None = list(parameter_names) if parameter_names else None
     for index, simulation_id in enumerate(simulation_ids):
+        result_context = ""
         try:
             simulation_output = analysis_output.getSimulation(simulation_id)
             metadata = simulation_output.metadata()
@@ -568,6 +557,14 @@ def collect_analysis_blocks(
             simulation_path = str(simulation_output.simulationPath)
             if not simulation_path:
                 raise ValueError("simulation output has no result path")
+            # RFPro may set analysis.simulationPath to this same case directory,
+            # so it is not a reliable project context.  The parent of the
+            # SimulationOutput path is the result project that owns the case.
+            result_context = os.path.dirname(os.path.normpath(simulation_path))
+            if not result_context:
+                raise ValueError(
+                    f"could not derive a result-project path from {simulation_path!r}"
+                )
             smatrix = portparam.getSMatrix(
                 context=result_context,
                 sim=str(simulation_id),
@@ -588,8 +585,14 @@ def collect_analysis_blocks(
             )
         except Exception as error:
             if not skip_errors:
+                context_details = (
+                    f" from result project {result_context!r}"
+                    if result_context
+                    else ""
+                )
                 raise RuntimeError(
-                    f"Could not export simulation {simulation_id}: {error}"
+                    f"Could not export simulation {simulation_id}"
+                    f"{context_details}: {error}"
                 ) from error
             print(f"Skipping simulation {simulation_id}: {error}")
 

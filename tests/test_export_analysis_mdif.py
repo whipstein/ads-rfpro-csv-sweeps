@@ -172,7 +172,7 @@ class MDIFExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a valid"):
             MODULE.render_mdif([block], 50.0)
 
-    def test_smatrix_uses_analysis_context_and_simulation_id(self) -> None:
+    def test_smatrix_uses_parent_result_context_and_simulation_id(self) -> None:
         calls: list[tuple[object, object]] = []
         fake_portparam = types.ModuleType("empro.toolkit.portparam")
 
@@ -188,7 +188,9 @@ class MDIFExportTests(unittest.TestCase):
 
         analysis = types.SimpleNamespace(
             name="RF Analysis",
-            simulationPath="/project/rfpro/000001",
+            # Some RFPro versions expose the leaf here too; the exporter must
+            # derive the owning result project from SimulationOutput instead.
+            simulationPath=FakeSimulationOutput.simulationPath,
             simulationSettings=FakeSingleCaseSettings(),
         )
         empro_module = types.SimpleNamespace(
@@ -210,6 +212,7 @@ class MDIFExportTests(unittest.TestCase):
 
         self.assertEqual(len(blocks), 1)
         self.assertEqual(calls, [("/project/rfpro/000001", "000002")])
+        self.assertNotEqual(calls[0][0], analysis.simulationPath)
         self.assertNotEqual(calls[0][0], FakeSimulationOutput.simulationPath)
 
 

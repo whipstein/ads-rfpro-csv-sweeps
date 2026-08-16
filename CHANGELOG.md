@@ -2,8 +2,9 @@
 
 ## 0.3.1 - 2026-08-16
 
-- Load swept S-parameters with the RFPro analysis result context and explicit
-  simulation ID instead of treating each case directory as a result project.
+- Derive the owning RFPro result project from each case path and load swept
+  S-parameters with that context plus the explicit simulation ID instead of
+  treating each case directory as a result project.
 - Add regression coverage for exporting an existing nested RFPro sweep result.
 
 ## 0.3.0 - 2026-08-16
