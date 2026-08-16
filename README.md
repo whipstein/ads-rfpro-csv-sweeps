@@ -1,14 +1,16 @@
 # RFPro CSV Parameter Sweeps and MDIF Export
 
-This repository provides two scripts that run directly in an open Keysight
+This repository provides three scripts that run directly in an open Keysight
 RFPro process:
 
 - `rfpro_scripts/import_csv_parameter_sweeps.py` installs correlated geometry
   cases from CSV into an existing RFPro analysis.
 - `rfpro_scripts/export_analysis_mdif.py` exports all available swept
   S-parameter results from an analysis to one generic MDIF file.
+- `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
+  later while requesting reuse of valid existing results.
 
-The current release is **0.1.1**.
+The current release is **0.2.0**.
 
 ## Execution model
 
@@ -116,6 +118,42 @@ Useful importer options:
 --yes
 ```
 
+## Explicitly run with existing-result reuse
+
+Importing or appending CSV cases never launches a simulation. When the analysis
+is ready, explicitly run the separate reuse script:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(
+    r"C:\path\to\rfpro_scripts\run_analysis_reuse_existing.py"
+)
+```
+
+The script asks you to choose an analysis, reports the configured instance and
+existing-result counts, and defaults the final start confirmation to **No**.
+After confirmation it calls the public `empro.toolkit.analysis.runAnalysis()`
+API with `reuseExistingIfPossible=True`. RFPro skips existing result sets only
+when it still considers them valid; missing or invalidated cases are queued.
+
+For an explicit scripted launch:
+
+```python
+scripting.run(
+    r"C:\path\to\rfpro_scripts\run_analysis_reuse_existing.py",
+    ["--analysis", "My RF Analysis", "--yes"],
+)
+```
+
+Useful runner options:
+
+```text
+--analysis NAME
+--no-save
+--yes
+```
+
 ## MDIF export workflow
 
 After the analysis has results, run:
@@ -182,7 +220,7 @@ Useful exporter options:
 
 ## Integrated Qt behavior
 
-Both production scripts carry the startup implementation from
+All production scripts carry the startup implementation from
 `ads-rfpro-pcell-recovery`:
 
 1. Import PySide6 and check for an existing `QApplication` before searching
@@ -239,6 +277,9 @@ Update 2.1 and EMPro 2026 corpus:
   `AnalysisList.names/index`, `AnalysisOutput`, `SimulationOutput.metadata`,
   `SimulationOutput.simulationPath`, `DataSetMatrix`, and
   `empro.toolkit.portparam.getSMatrix()`.
+- `empro.toolkit.analysis.runAnalysis()` and its
+  `reuseExistingIfPossible=True` option for explicitly starting only after the
+  user confirms.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
 

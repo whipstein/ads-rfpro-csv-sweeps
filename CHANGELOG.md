@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 - 2026-08-16
+
+- Add a separate, explicitly invoked RFPro analysis runner that requests reuse
+  of valid existing results.
+- Keep CSV import and simulation launch as independent user actions.
+- Require confirmation immediately before starting or queuing simulations.
+
 ## 0.1.1 - 2026-08-16
 
 - Prompt direct RFPro runs to choose between replacing all existing sweep
