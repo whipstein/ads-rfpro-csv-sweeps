@@ -18,13 +18,17 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FakeSettings:
-    numberOfParameterInstances = 5
+    def __init__(self) -> None:
+        self.numberOfParameterInstances = 5
+        self.reuseExistingResults = False
 
 
 class FakeAnalysis:
     name = "RF Setup"
     analysisType = 7
-    simulationSettings = FakeSettings()
+
+    def __init__(self) -> None:
+        self.simulationSettings = FakeSettings()
 
 
 class FakeAnalysisClass:
@@ -47,6 +51,7 @@ class ReuseRunnerTests(unittest.TestCase):
         preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, True)
         self.assertIn("Potentially missing instances: 2", preview)
         self.assertIn("Existing-result reuse: enabled", preview)
+        self.assertIn("Persisted analysis reuse setting: True", preview)
         self.assertIn("reuse valid existing results", preview)
         self.assertIn("will be saved before submission", preview)
         self.assertIn("remain set for the current RFPro session", preview)
@@ -73,6 +78,7 @@ class ReuseRunnerTests(unittest.TestCase):
             fake_run, analysis, reuse_existing=True
         )
         self.assertEqual(result, "queued")
+        self.assertTrue(analysis.simulationSettings.reuseExistingResults)
         self.assertEqual(
             calls,
             [
@@ -105,14 +111,76 @@ class ReuseRunnerTests(unittest.TestCase):
             self.assertTrue(kwargs["saveProject"])
             return "queued"
 
+        analysis = FakeAnalysis()
         result = MODULE.save_and_run_analysis(
-            FakeProject(),
-            fake_run,
-            FakeAnalysis(),
-            reuse_existing=False,
+            FakeProject(), fake_run, analysis, reuse_existing=False
         )
         self.assertEqual(result, "queued")
+        self.assertFalse(analysis.simulationSettings.reuseExistingResults)
         self.assertEqual(events, ["save", "run"])
+
+    def test_persisted_reuse_setting_is_applied_before_save(self) -> None:
+        events: list[str] = []
+
+        class TrackedSettings:
+            def __init__(self) -> None:
+                self._reuse = False
+
+            @property
+            def reuseExistingResults(self) -> bool:
+                return self._reuse
+
+            @reuseExistingResults.setter
+            def reuseExistingResults(self, value: bool) -> None:
+                self._reuse = value
+                events.append(f"reuse={value}")
+
+        class TrackedAnalysis:
+            simulationSettings = TrackedSettings()
+
+        class FakeProject:
+            @staticmethod
+            def saveActiveProject() -> None:
+                events.append("save")
+
+        def fake_run(_analysis: object, **_kwargs: object) -> str:
+            events.append("run")
+            return "queued"
+
+        MODULE.save_and_run_analysis(
+            FakeProject(), fake_run, TrackedAnalysis(), reuse_existing=True
+        )
+
+        self.assertEqual(events, ["reuse=True", "save", "run"])
+
+    def test_reuse_setting_failure_prevents_save_and_submission(self) -> None:
+        events: list[str] = []
+
+        class BadSettings:
+            @property
+            def reuseExistingResults(self) -> bool:
+                return False
+
+            @reuseExistingResults.setter
+            def reuseExistingResults(self, _value: bool) -> None:
+                raise RuntimeError("unsupported")
+
+        class BadAnalysis:
+            simulationSettings = BadSettings()
+
+        class FakeProject:
+            @staticmethod
+            def saveActiveProject() -> None:
+                events.append("save")
+
+        def fake_run(_analysis: object, **_kwargs: object) -> None:
+            events.append("run")
+
+        with self.assertRaisesRegex(RuntimeError, "Nothing was started"):
+            MODULE.save_and_run_analysis(
+                FakeProject(), fake_run, BadAnalysis(), reuse_existing=True
+            )
+        self.assertEqual(events, [])
 
     def test_save_failure_prevents_submission(self) -> None:
         run_called = False

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 - 2026-08-16
+
+- Set and verify the saved `SimulationData.reuseExistingResults` value before
+  saving, then pass the same value through `reuseExistingIfPossible` when the
+  analysis is submitted.
+- Abort before saving or submitting if RFPro cannot retain the requested saved
+  reuse setting.
+- Add a read-only analysis reuse diagnostic for flow identity, sequence/result
+  mappings, registered cache prerequisites, and reuse-related solver logs.
+- Add a read-only unique cache inventory that distinguishes registered result
+  paths from historical or orphaned FEM caches without repeating shared-tree
+  matches for every condition.
+
 ## 0.4.0 - 2026-08-16
 
 - Save the active RFPro project synchronously after confirmation and before

@@ -1,7 +1,7 @@
 # RFPro CSV Parameter Sweeps and MDIF Export
 
-This repository provides three scripts that run directly in an open Keysight
-RFPro process:
+This repository provides RFPro workflow and diagnostic scripts that run
+directly in an open Keysight RFPro process:
 
 - `rfpro_scripts/import_csv_parameter_sweeps.py` installs correlated geometry
   cases from CSV into an existing RFPro analysis.
@@ -9,8 +9,12 @@ RFPro process:
   S-parameter results from an analysis to one generic MDIF file.
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
   later while requesting reuse of valid existing results.
+- `rfpro_scripts/diagnose_analysis_reuse.py` reports an analysis's saved reuse
+  setting, result mappings, per-condition cache files, and reuse-related logs.
+- `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
+  caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.3.0**.
+The current release is **0.5.0**.
 
 ## Execution model
 
@@ -146,7 +150,17 @@ DEFAULT_REUSE_EXISTING_RESULTS = True
 With `True`, RFPro skips existing result sets only when it still considers them
 valid; missing or invalidated cases are queued. Set it to `False` to request a
 run regardless of existing results, which may queue every configured instance.
-The selected mode is shown in the final confirmation preview.
+The selected mode is shown in the final confirmation preview. Before saving,
+the runner also assigns and verifies the same value on the analysis:
+
+```python
+analysis.simulationSettings.reuseExistingResults = DEFAULT_REUSE_EXISTING_RESULTS
+```
+
+The saved `reuseExistingResults` setting and the submission-time
+`reuseExistingIfPossible` argument therefore cannot silently disagree. If the
+saved setting cannot be assigned or read back, the project is not saved and no
+simulation is submitted.
 
 The runner applies these required private FEM environment controls to the
 current RFPro process before submission:
@@ -177,6 +191,59 @@ Useful runner options:
 ```text
 --analysis NAME
 --yes
+```
+
+## Reuse diagnostics
+
+Both reuse diagnostics are read-only: they do not save the project, modify an
+analysis, create simulations, or alter result files.
+
+To inspect the current analysis/result association, registered condition paths,
+required FEM cache files, private flow version, and relevant solver-log lines:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(
+    r"C:\path\to\rfpro_scripts\diagnose_analysis_reuse.py",
+    ["--analysis", "My RF Analysis"],
+)
+```
+
+The summary separately reports result IDs, registered paths, `.reuse.hash`
+files, and `emds_dsn/design/.reusable` markers. This prevents a cache found
+elsewhere in the result tree from being mistaken for the cache registered to a
+specific condition.
+
+To locate every unique FEM cache beneath the RFPro result area and compare it
+with the analysis's registered paths:
+
+```python
+scripting.run(
+    r"C:\path\to\rfpro_scripts\find_reusable_simulation_caches.py",
+    ["--analysis", "My RF Analysis"],
+)
+```
+
+The cache finder walks two parent directories above `simulationGroupPath` by
+default. Set `DEFAULT_SCAN_ROOT`, pass `--root`, or adjust `--parent-levels`
+when a project's result layout differs:
+
+```python
+scripting.run(
+    r"C:\path\to\rfpro_scripts\find_reusable_simulation_caches.py",
+    [
+        "--analysis", "My RF Analysis",
+        "--root", r"C:\my_workspace\data\rfpro",
+    ],
+)
+```
+
+Useful diagnostic options:
+
+```text
+diagnose_analysis_reuse.py: --analysis NAME --log-limit 20
+find_reusable_simulation_caches.py: --analysis NAME --root PATH --parent-levels 2
 ```
 
 ## MDIF export workflow
@@ -303,9 +370,10 @@ Update 2.1 and EMPro 2026 corpus:
 - `python_scripts/addons/SimpleParameterSweep.py` for editable project
   parameters and `setParameterValues()`.
 - EMPro public Python documentation for `Analysis.simulationSettings`,
-  `AnalysisList.names/index`, `AnalysisOutput`, `SimulationOutput.metadata`,
-  `SimulationOutput.simulationPath`, `DataSetMatrix`, and
-  `empro.toolkit.getCircuitMatrix()`.
+  `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
+  `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,
+  `SimulationOutput.metadata`, `SimulationOutput.simulationPath`,
+  `DataSetMatrix`, and `empro.toolkit.getCircuitMatrix()`.
 - `empro.toolkit.analysis.runAnalysis()` and its
   `reuseExistingIfPossible=True` option for explicitly starting only after the
   user confirms.
