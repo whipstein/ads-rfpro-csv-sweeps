@@ -1,0 +1,5 @@
+__case__,__enabled__,W,L,Gap,__comment__
+case_001,true,0.40 mm,1.20 mm,0.10 mm,training point
+case_002,true,0.55 mm,1.20 mm,0.12 mm,training point
+case_003,true,0.40 mm,1.45 mm,0.10 mm,verification point
+case_004,false,0.70 mm,1.60 mm,0.15 mm,disabled example

@@ -1,0 +1,32 @@
+name: Static checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile Python sources
+        run: python -m py_compile rfpro_scripts/*.py scripts/*.py tests/*.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate VS Code JSON
+        run: |
+          for file in .vscode/*.json; do
+            python -m json.tool "$file" >/dev/null
+          done

@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Static check: Python",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m",
+        "py_compile",
+        "rfpro_scripts/import_csv_parameter_sweeps.py",
+        "rfpro_scripts/export_analysis_mdif.py",
+        "scripts/diagnose_qt.py",
+        "scripts/test_qt_startup.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$python"
+      ]
+    },
+    {
+      "label": "Test: unit",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Repo: static checks",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Static check: Python",
+        "Test: unit"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
