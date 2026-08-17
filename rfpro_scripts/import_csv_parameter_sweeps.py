@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import subprocess
 import sys
@@ -27,6 +28,11 @@ DEFAULT_CSV_PATH = ""
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_IMPORT_MODE = "ask"  # "ask", "replace", or "append"
 DEFAULT_SAVE_PROJECT = True
+# Dimensionless multiplier applied to every imported RFPro parameter expression.
+DEFAULT_VALUE_SCALE = 1.0
+# Evaluated RFPro sweep values are compared in reference units with math.isclose().
+DEFAULT_MATCH_REL_TOLERANCE = 1.0e-9
+DEFAULT_MATCH_ABS_TOLERANCE = 1.0e-15
 
 _RESERVED_COLUMNS = {"__case__", "__comment__", "__enabled__"}
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
@@ -41,6 +47,39 @@ class SweepCase:
     label: str
     parameters: tuple[tuple[str, str], ...]
     comment: str = ""
+
+
+@dataclass(frozen=True)
+class SweepCSVData:
+    """Parsed cases plus the project-aware CSV column selection."""
+
+    cases: tuple[SweepCase, ...]
+    parameter_names: tuple[str, ...]
+    ignored_columns: tuple[str, ...]
+    value_scale: float
+
+
+@dataclass(frozen=True)
+class SequenceImportPlan:
+    """A non-mutating plan that preserves matching native sweep objects."""
+
+    mode: str
+    before_count: int
+    final_sequences: tuple[Any, ...]
+    reused_existing_count: int
+    added_count: int
+    duplicate_csv_count: int
+    removed_existing_count: int
+    sequences_changed: bool
+    sweep_was_enabled: bool
+
+    @property
+    def after_count(self) -> int:
+        return len(self.final_sequences)
+
+    @property
+    def mutation_required(self) -> bool:
+        return self.sequences_changed or not self.sweep_was_enabled
 
 
 @dataclass(frozen=True)
@@ -230,11 +269,57 @@ def _enabled_cell(value: str, row_number: int) -> bool:
     )
 
 
-def read_sweep_csv(path: Path) -> list[SweepCase]:
-    """Read a header-based CSV whose enabled rows are correlated cases."""
+def validated_value_scale(value: Any) -> float:
+    """Return a finite dimensionless CSV-to-RFPro value multiplier."""
+
+    try:
+        scale = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"CSV value scale must be a finite number, not {value!r}."
+        ) from error
+    if not math.isfinite(scale):
+        raise ValueError(f"CSV value scale must be finite, not {value!r}.")
+    return scale
+
+
+def validated_match_tolerance(value: Any, label: str) -> float:
+    """Return one finite, nonnegative duplicate-match tolerance."""
+
+    try:
+        tolerance = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite nonnegative number.") from error
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(f"{label} must be a finite nonnegative number.")
+    return tolerance
+
+
+def scale_sweep_expression(expression: str, value_scale: float) -> str:
+    """Apply a dimensionless scale while preserving any RFPro units/formula."""
+
+    scale = validated_value_scale(value_scale)
+    value = str(expression).strip()
+    if scale == 1.0:
+        return value
+    return f"({value})*{scale!r}"
+
+
+def read_sweep_csv_data(
+    path: Path,
+    available_parameter_names: Iterable[str] | None = None,
+    value_scale: float = 1.0,
+) -> SweepCSVData:
+    """Read correlated cases using only headings available in RFPro."""
 
     if not path.is_file():
         raise FileNotFoundError(f"CSV file does not exist: {path}")
+    scale = validated_value_scale(value_scale)
+    available = (
+        None
+        if available_parameter_names is None
+        else {str(name) for name in available_parameter_names}
+    )
 
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -247,17 +332,28 @@ def read_sweep_csv(path: Path) -> list[SweepCase]:
         duplicates = sorted({name for name in headers if headers.count(name) > 1})
         if duplicates:
             raise ValueError(f"CSV contains duplicate columns: {', '.join(duplicates)}")
-        unknown_reserved = sorted(
-            name for name in headers if name.startswith("__") and name not in _RESERVED_COLUMNS
-        )
-        if unknown_reserved:
-            raise ValueError(
-                "Unknown reserved CSV columns: " + ", ".join(unknown_reserved)
-            )
-
-        parameter_names = [name for name in headers if not name.startswith("__")]
+        parameter_names = [
+            name
+            for name in headers
+            if name not in _RESERVED_COLUMNS
+            and not name.startswith("__")
+            and (available is None or name in available)
+        ]
+        ignored_columns = [
+            name
+            for name in headers
+            if name not in parameter_names and name not in _RESERVED_COLUMNS
+        ]
         if not parameter_names:
-            raise ValueError("CSV must contain at least one RFPro parameter column.")
+            if available is None:
+                raise ValueError("CSV must contain at least one RFPro parameter column.")
+            available_text = ", ".join(sorted(available)) or "(none)"
+            ignored_text = ", ".join(ignored_columns) or "(none)"
+            raise ValueError(
+                "CSV has no headings matching editable RFPro project parameters. "
+                f"Editable parameters: {available_text}. Ignored columns: "
+                f"{ignored_text}."
+            )
 
         # DictReader retains the original, possibly whitespace-padded field names.
         original_by_stripped = dict(zip(headers, reader.fieldnames))
@@ -293,7 +389,7 @@ def read_sweep_csv(path: Path) -> list[SweepCase]:
                     raise ValueError(
                         f"CSV row {row_number}: parameter {name!r} contains a newline."
                     )
-                values.append((name, value))
+                values.append((name, scale_sweep_expression(value, scale)))
 
             label = row.get("__case__", "") or f"row-{row_number}"
             cases.append(
@@ -307,11 +403,38 @@ def read_sweep_csv(path: Path) -> list[SweepCase]:
 
     if not cases:
         raise ValueError(f"CSV contains no enabled sweep cases: {path}")
-    return cases
+    return SweepCSVData(
+        cases=tuple(cases),
+        parameter_names=tuple(parameter_names),
+        ignored_columns=tuple(ignored_columns),
+        value_scale=scale,
+    )
+
+
+def read_sweep_csv(
+    path: Path,
+    available_parameter_names: Iterable[str] | None = None,
+    value_scale: float = 1.0,
+) -> list[SweepCase]:
+    """Compatibility wrapper returning only the parsed independent cases."""
+
+    return list(
+        read_sweep_csv_data(path, available_parameter_names, value_scale).cases
+    )
 
 
 def analysis_names(project: Any) -> list[str]:
     return [str(name) for name in project.analyses.names()]
+
+
+def editable_project_parameter_names(project: Any) -> list[str]:
+    """Return exact live-project parameter headings accepted by the importer."""
+
+    return [
+        str(name)
+        for name in project.parameters.names()
+        if project.parameters.isEditable(str(name))
+    ]
 
 
 def find_analysis(project: Any, name: str) -> Any:
@@ -362,6 +485,167 @@ def build_parameter_sequences(empro_module: Any, cases: Sequence[SweepCase]) -> 
             sequence.append(sweep)
         sequences.append(sequence)
     return sequences
+
+
+def _evaluated_sequence_values(
+    sequence: Any,
+) -> dict[str, tuple[float, ...]] | None:
+    """Read the documented evaluated values from one native sequence."""
+
+    try:
+        sweeps = list(sequence)
+    except (TypeError, ValueError):
+        return None
+    if not sweeps:
+        return None
+
+    result: dict[str, tuple[float, ...]] = {}
+    for sweep in sweeps:
+        name = str(getattr(sweep, "parameterName", "") or "")
+        if not name or name in result:
+            return None
+        try:
+            raw_values = getattr(sweep, "parameterValues")
+            raw_values = raw_values() if callable(raw_values) else raw_values
+            values = tuple(float(value) for value in raw_values)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not values or not all(math.isfinite(value) for value in values):
+            return None
+        result[name] = values
+    return result
+
+
+def _sequence_values_match(
+    left: dict[str, tuple[float, ...]] | None,
+    right: dict[str, tuple[float, ...]] | None,
+    relative_tolerance: float,
+    absolute_tolerance: float,
+) -> bool:
+    if left is None or right is None or left.keys() != right.keys():
+        return False
+    for name, left_values in left.items():
+        right_values = right[name]
+        if len(left_values) != len(right_values):
+            return False
+        if not all(
+            math.isclose(
+                left_value,
+                right_value,
+                rel_tol=relative_tolerance,
+                abs_tol=absolute_tolerance,
+            )
+            for left_value, right_value in zip(left_values, right_values)
+        ):
+            return False
+    return True
+
+
+def plan_parameter_sequence_import(
+    settings: Any,
+    candidate_sequences: Iterable[Any],
+    mode: str,
+    relative_tolerance: float = DEFAULT_MATCH_REL_TOLERANCE,
+    absolute_tolerance: float = DEFAULT_MATCH_ABS_TOLERANCE,
+) -> SequenceImportPlan:
+    """Plan append/replace while retaining equivalent existing sequences."""
+
+    if mode not in {"replace", "append"}:
+        raise ValueError(f"Unknown import mode: {mode!r}")
+    relative_tolerance = validated_match_tolerance(
+        relative_tolerance, "Duplicate-match relative tolerance"
+    )
+    absolute_tolerance = validated_match_tolerance(
+        absolute_tolerance, "Duplicate-match absolute tolerance"
+    )
+
+    existing = list(settings.parameterSequences)
+    candidates = list(candidate_sequences)
+    existing_values = [_evaluated_sequence_values(value) for value in existing]
+    accepted_values: list[dict[str, tuple[float, ...]] | None] = []
+    selected_for_replace: list[Any] = []
+    additions: list[Any] = []
+    used_existing_indices: set[int] = set()
+    reused_existing_count = 0
+    duplicate_csv_count = 0
+
+    for candidate in candidates:
+        candidate_values = _evaluated_sequence_values(candidate)
+        if any(
+            _sequence_values_match(
+                candidate_values,
+                previous_values,
+                relative_tolerance,
+                absolute_tolerance,
+            )
+            for previous_values in accepted_values
+        ):
+            duplicate_csv_count += 1
+            continue
+
+        matching_existing_index = next(
+            (
+                index
+                for index, values in enumerate(existing_values)
+                if index not in used_existing_indices
+                and _sequence_values_match(
+                    candidate_values,
+                    values,
+                    relative_tolerance,
+                    absolute_tolerance,
+                )
+            ),
+            None,
+        )
+        if matching_existing_index is not None:
+            selected = existing[matching_existing_index]
+            used_existing_indices.add(matching_existing_index)
+            reused_existing_count += 1
+        else:
+            selected = candidate
+            additions.append(candidate)
+        selected_for_replace.append(selected)
+        accepted_values.append(candidate_values)
+
+    if mode == "append":
+        final_sequences = [*existing, *additions]
+        removed_existing_count = 0
+    else:
+        final_sequences = selected_for_replace
+        removed_existing_count = len(existing) - len(used_existing_indices)
+
+    sequences_changed = len(existing) != len(final_sequences) or any(
+        before is not after for before, after in zip(existing, final_sequences)
+    )
+    return SequenceImportPlan(
+        mode=mode,
+        before_count=len(existing),
+        final_sequences=tuple(final_sequences),
+        reused_existing_count=reused_existing_count,
+        added_count=len(additions),
+        duplicate_csv_count=duplicate_csv_count,
+        removed_existing_count=removed_existing_count,
+        sequences_changed=sequences_changed,
+        sweep_was_enabled=bool(settings.parameterSweepEnabled),
+    )
+
+
+def apply_parameter_sequence_import_plan(
+    settings: Any, plan: SequenceImportPlan
+) -> tuple[int, int]:
+    """Apply a confirmed plan, avoiding any list mutation when unchanged."""
+
+    if plan.sequences_changed:
+        if plan.mode == "replace":
+            settings.parameterSequences.clear()
+            sequences_to_append = plan.final_sequences
+        else:
+            sequences_to_append = plan.final_sequences[plan.before_count :]
+        for sequence in sequences_to_append:
+            settings.parameterSequences.append(sequence)
+    if not plan.sweep_was_enabled:
+        settings.parameterSweepEnabled = True
+    return plan.before_count, plan.after_count
 
 
 def install_parameter_sequences(
@@ -428,8 +712,8 @@ def _choose_import_mode(settings: Any, configured_mode: str) -> str:
     from PySide6.QtWidgets import QInputDialog
 
     choices = (
-        "Replace all existing sweep sequences",
-        "Append CSV cases to existing sweep sequences",
+        "Replace/synchronize to CSV (reuse matching sequences)",
+        "Append only new CSV cases (leave existing sequences untouched)",
     )
     selected, accepted = QInputDialog.getItem(
         None,
@@ -447,20 +731,51 @@ def _choose_import_mode(settings: Any, configured_mode: str) -> str:
     return "replace" if str(selected) == choices[0] else "append"
 
 
-def _preview_text(analysis: Any, path: Path, cases: Sequence[SweepCase], mode: str) -> str:
+def _preview_text(
+    analysis: Any,
+    path: Path,
+    cases: Sequence[SweepCase],
+    mode: str,
+    value_scale: float = 1.0,
+    ignored_columns: Sequence[str] = (),
+    import_plan: SequenceImportPlan | None = None,
+) -> str:
     parameter_names = [name for name, _ in cases[0].parameters]
-    existing_count = len(analysis.simulationSettings.parameterSequences)
-    resulting_count = len(cases) if mode == "replace" else existing_count + len(cases)
+    existing_count = (
+        import_plan.before_count
+        if import_plan is not None
+        else len(analysis.simulationSettings.parameterSequences)
+    )
+    resulting_count = (
+        import_plan.after_count
+        if import_plan is not None
+        else len(cases) if mode == "replace" else existing_count + len(cases)
+    )
     lines = [
         f"Analysis: {analysis.name}",
         f"CSV: {path}",
         f"Mode: {mode}",
+        f"CSV value scale: {value_scale!r}",
+        "Ignored CSV columns: "
+        + (", ".join(ignored_columns) if ignored_columns else "(none)"),
         f"Existing sweep sequences: {existing_count}",
         f"Resulting sweep sequences: {resulting_count}",
         f"Independent cases: {len(cases)}",
         "Parameters: " + ", ".join(parameter_names),
-        "",
     ]
+    if import_plan is not None:
+        lines.extend(
+            [
+                f"Matching existing cases retained: "
+                f"{import_plan.reused_existing_count}",
+                f"New cases to add: {import_plan.added_count}",
+                f"Duplicate CSV rows skipped: {import_plan.duplicate_csv_count}",
+                f"Existing sequences to remove: "
+                f"{import_plan.removed_existing_count}",
+                f"Analysis mutation required: {import_plan.mutation_required}",
+            ]
+        )
+    lines.append("")
     for case in cases[:8]:
         values = ", ".join(f"{name}={value}" for name, value in case.parameters)
         lines.append(f"{case.label}: {values}")
@@ -496,6 +811,24 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("ask", "replace", "append"),
         default=DEFAULT_IMPORT_MODE,
         help="ask in RFPro, replace existing sequences, or append independent cases",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=DEFAULT_VALUE_SCALE,
+        help="dimensionless multiplier applied to every imported parameter value",
+    )
+    parser.add_argument(
+        "--match-rel-tol",
+        type=float,
+        default=DEFAULT_MATCH_REL_TOLERANCE,
+        help="relative tolerance for matching evaluated existing sweep values",
+    )
+    parser.add_argument(
+        "--match-abs-tol",
+        type=float,
+        default=DEFAULT_MATCH_ABS_TOLERANCE,
+        help="absolute reference-unit tolerance for matching sweep values",
     )
     parser.add_argument(
         "--no-save",
@@ -537,27 +870,60 @@ def main(argv: Sequence[str] | None = None) -> None:
     project = empro.activeProject
     analysis = _choose_analysis(project, arguments.analysis)
     csv_path = _choose_csv_path(arguments.csv)
-    cases = read_sweep_csv(csv_path)
+    csv_data = read_sweep_csv_data(
+        csv_path,
+        editable_project_parameter_names(project),
+        validated_value_scale(arguments.scale),
+    )
+    cases = list(csv_data.cases)
     validate_cases_against_project(project, cases)
     sequences = build_parameter_sequences(empro, cases)
     import_mode = _choose_import_mode(analysis.simulationSettings, arguments.mode)
+    import_plan = plan_parameter_sequence_import(
+        analysis.simulationSettings,
+        sequences,
+        import_mode,
+        validated_match_tolerance(
+            arguments.match_rel_tol, "Duplicate-match relative tolerance"
+        ),
+        validated_match_tolerance(
+            arguments.match_abs_tol, "Duplicate-match absolute tolerance"
+        ),
+    )
 
-    preview = _preview_text(analysis, csv_path, cases, import_mode)
+    preview = _preview_text(
+        analysis,
+        csv_path,
+        cases,
+        import_mode,
+        csv_data.value_scale,
+        csv_data.ignored_columns,
+        import_plan,
+    )
     print(preview)
     if not arguments.yes and not _confirm_import(preview):
         print("Import cancelled; the RFPro analysis was not changed.")
         return
 
-    before, after = install_parameter_sequences(
-        analysis.simulationSettings, sequences, import_mode
+    before, after = apply_parameter_sequence_import_plan(
+        analysis.simulationSettings, import_plan
     )
-    should_save = DEFAULT_SAVE_PROJECT and not arguments.no_save
+    should_save = (
+        import_plan.mutation_required
+        and DEFAULT_SAVE_PROJECT
+        and not arguments.no_save
+    )
     if should_save:
         project.saveActiveProject()
 
     summary = (
-        f"Installed {len(cases)} independent CSV cases in analysis {analysis.name!r}. "
+        f"Processed {len(cases)} independent CSV cases for analysis "
+        f"{analysis.name!r}. Retained {import_plan.reused_existing_count} matching "
+        f"existing case(s), added {import_plan.added_count}, skipped "
+        f"{import_plan.duplicate_csv_count} duplicate CSV row(s), and removed "
+        f"{import_plan.removed_existing_count} existing sequence(s). "
         f"Parameter sequences: {before} -> {after}. "
+        f"Analysis changed: {import_plan.mutation_required}. "
         f"Project saved: {should_save}. No simulation was started."
     )
     print(summary)

@@ -10,13 +10,14 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
   later while requesting reuse of valid existing results.
 - `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
-  point and displays its regenerated geometry in RFPro for inspection.
+  point, displays its regenerated geometry, and loads or exports available
+  saved Mesh/Ports results in RFPro for inspection.
 - `rfpro_scripts/diagnose_analysis_reuse.py` reports an analysis's saved reuse
   setting, result mappings, per-condition cache files, and reuse-related logs.
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.9.0**.
+The current release is **0.11.0**.
 
 ## Execution model
 
@@ -51,7 +52,8 @@ scripting.run(
     [
         "--csv", r"C:\data\geometry_cases.csv",
         "--analysis", "My RF Analysis",
-        "--mode", "replace",
+        "--mode", "append",
+        "--scale", "1e-6",
         "--yes",
     ],
 )
@@ -62,15 +64,17 @@ script when the RFPro launcher cannot pass arguments.
 
 ## CSV contract
 
-The required CSV columns are the exact, case-sensitive names of editable
-parameters in `empro.activeProject.parameters`. Each enabled data row is one
-independent, correlated geometry case:
+CSV headings whose exact, case-sensitive names match editable parameters in
+`empro.activeProject.parameters` are imported. Every other heading is ignored
+as metadata, so columns such as `verification_sequence` may be present and may
+contain empty cells. Each enabled data row is one independent, correlated
+geometry case:
 
 ```csv
-__case__,__enabled__,W,L,Gap,__comment__
-case_001,true,0.40 mm,1.20 mm,0.10 mm,training point
-case_002,true,0.55 mm,1.20 mm,0.12 mm,training point
-case_003,false,0.70 mm,1.40 mm,0.15 mm,temporarily excluded
+__case__,__enabled__,verification_sequence,W,L,Gap,__comment__
+case_001,true,,0.40 mm,1.20 mm,0.10 mm,training point
+case_002,true,,0.55 mm,1.20 mm,0.12 mm,training point
+case_003,false,1,0.70 mm,1.40 mm,0.15 mm,temporarily excluded
 ```
 
 See `examples/geometry_cases.csv` for a ready-to-edit file.
@@ -78,8 +82,14 @@ See `examples/geometry_cases.csv` for a ready-to-edit file.
 Rules:
 
 - One row becomes one native `ParameterSequence`.
-- Every parameter cell in an enabled row must be non-empty.
+- Every matched RFPro parameter cell in an enabled row must be non-empty.
+- Headings that do not match an editable live-project parameter are ignored,
+  even when their cells are blank. The confirmation preview lists them.
 - Values are RFPro expressions, including units, such as `0.40 mm`.
+- `DEFAULT_VALUE_SCALE` or `--scale` applies one dimensionless multiplier to
+  every imported expression. For example, CSV value `400` with `--scale 1e-6`
+  is installed as `(400)*1e-06`; values with units and formulas are preserved
+  inside the scaled expression.
 - A cell cannot contain a comma because RFPro interprets commas as multiple
   sweep values; that would break the one-row/one-case relationship.
 - Empty rows are ignored.
@@ -103,12 +113,24 @@ the Cartesian combinations `(1,20)` and `(2,10)`.
    normal RFPro workflow.
 
 The default mode is `ask`, so an interactive RFPro run always makes the choice
-explicit. In `replace` mode, existing `parameterSequences` are cleared only
-after the complete CSV has been parsed, validated, and converted to native
-objects. In `append` mode, all existing sequences are preserved and the CSV
-cases are added after them. The preview reports the selected operation before
-the final confirmation. The script enables the parameter sweep, saves the
-active project by default, and does not create or queue simulations.
+explicit. In `append` mode, existing sequences are never removed or replaced:
+CSV cases matching an existing independent parameter group are skipped and
+only new conditions are appended. This is the recommended mode when rows were
+added to a previously imported CSV.
+
+In `replace` mode, the final sequence list follows the CSV. Matching native
+sequence objects are retained, new conditions are created, and existing
+conditions absent from the CSV are removed. Duplicate CSV rows are skipped in
+both modes. If append finds that every condition already exists, the importer
+does not mutate the sequence list and does not save the unchanged project.
+
+Matching uses the public evaluated `SingleParameterSweep.parameterValues`, so
+equivalent unit expressions compare in RFPro reference units. It uses
+`math.isclose()` with `DEFAULT_MATCH_REL_TOLERANCE` and
+`DEFAULT_MATCH_ABS_TOLERANCE`; the same settings are available as
+`--match-rel-tol` and `--match-abs-tol`. The preview reports retained, added,
+skipped, and removed counts before confirmation. The script never creates or
+queues simulations.
 
 For non-interactive use, pass `--mode replace` or `--mode append`. You can also
 set `DEFAULT_IMPORT_MODE` near the top of the script to either value to make it
@@ -120,6 +142,9 @@ Useful importer options:
 --csv PATH
 --analysis NAME
 --mode {ask,replace,append}
+--scale FACTOR
+--match-rel-tol FACTOR
+--match-abs-tol REFERENCE_VALUE
 --no-save
 --yes
 ```
@@ -206,6 +231,37 @@ The script never saves the project and never creates, queues, reruns, or
 deletes a simulation. It captures the original formulas before opening and
 restores them when the inspector closes, including when a second inspector
 replaces an existing one.
+
+### Inspect and export saved Mesh/Ports results
+
+The inspector scans the selected analysis through
+`empro.output.AnalysisOutput`, adds a **Mesh/Ports** status column, and maps
+saved simulation results to configured sweep points. Partial result sets are
+matched by parameter metadata. Positional order is used only when RFPro
+returns a complete result set, so an unsolved point cannot silently shift all
+later result-to-condition assignments.
+
+**Load Mesh/Ports** loads the selected condition's saved result into RFPro's
+combined Mesh/Ports result view and fits it to the window. FEM results use the
+saved `*.ovm` under `<simulationPath>/emds_dsn/design`; Momentum results use
+the saved `*.ovm` under `<simulationPath>/work`. The table distinguishes an
+available result, an unmatched or unsolved point, and a saved result whose
+mesh data is missing.
+
+**Mesh/Ports PDF** scans again, then loads and exports every available saved
+Mesh/Ports result through RFPro's same **View > Export Image** command used by
+the raw-geometry report. It creates one verified PNG and one landscape PDF
+page per available result. The completion message lists points with no matched
+result, points whose result has no saved mesh, and result IDs that could not be
+matched safely. Missing conditions are skipped; they are never simulated or
+queued. If an actual view or image export fails, the batch stops and does not
+create a misleading PDF.
+
+Mesh/Ports reports use the same `um` scaling and
+`DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES` rounding setting as geometry
+reports. Because a solver Mesh/Ports view depends on a saved `*.ovm`, raw
+geometry can still be inspected before simulation but a mesh cannot be shown
+for a condition that has never produced mesh data.
 
 Useful inspector options:
 

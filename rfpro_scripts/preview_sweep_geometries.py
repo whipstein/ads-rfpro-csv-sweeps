@@ -1,9 +1,10 @@
-"""Interactively preview every parameter point in an RFPro analysis sweep.
+"""Interactively preview geometry and saved Mesh/Ports sweep results in RFPro.
 
 Run this script inside the open RFPro project. It expands the selected
 analysis's native ``parameterSequences``, applies one point at a time to the
-active project, and refreshes RFPro's geometry view. No simulations are
-created, queued, deleted, or otherwise modified.
+active project, and refreshes RFPro's geometry view. For solved conditions it
+can also load and export RFPro's saved Mesh/Ports result view. No simulations
+are created, queued, deleted, or otherwise modified.
 
 The original project-parameter formulas are restored when the inspector
 closes. The script deliberately does not save the project.
@@ -22,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 # Edit this when RFPro's Run Script command cannot pass arguments.
@@ -65,13 +66,51 @@ class QtRuntime:
 
 @dataclass(frozen=True)
 class GeometryReportPage:
-    """One checked sweep point and its optional saved geometry image."""
+    """One sweep-point report page and its optional exported RFPro image."""
 
     point: SweepPoint
     valid: bool | None
     message: str
     image_path: Path | None
     capture_error: str = ""
+    status_label: str = ""
+
+
+@dataclass(frozen=True)
+class MeshPortsResult:
+    """One saved RFPro result and its discovered Mesh/Ports data."""
+
+    simulation_id: str
+    simulation_output: Any
+    parameters: tuple[tuple[str, str], ...]
+    mesh_kind: str | None
+    mesh_file: Path | None
+    unavailable_reason: str = ""
+
+
+@dataclass(frozen=True)
+class MeshPortsInventory:
+    """Safe mapping between configured sweep points and saved RFPro results."""
+
+    analysis_output: Any
+    results_by_point: tuple[tuple[int, MeshPortsResult], ...]
+    missing_point_indices: tuple[int, ...]
+    missing_mesh_point_indices: tuple[int, ...]
+    unmatched_result_ids: tuple[str, ...]
+    diagnostics: tuple[str, ...]
+
+    def result_for_point(self, point_index: int) -> MeshPortsResult | None:
+        for candidate_index, result in self.results_by_point:
+            if candidate_index == point_index:
+                return result
+        return None
+
+    def available_results(self) -> tuple[tuple[int, MeshPortsResult], ...]:
+        return tuple(
+            (point_index, result)
+            for point_index, result in self.results_by_point
+            if result.mesh_file is not None and result.mesh_kind is not None
+        )
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -1295,6 +1334,13 @@ def default_geometry_report_filename(analysis_name: str) -> str:
     return f"{stem or 'rfpro'}_geometry_validation.pdf"
 
 
+def default_mesh_ports_report_filename(analysis_name: str) -> str:
+    """Build a portable default filename for saved Mesh/Ports results."""
+
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(analysis_name)).strip("._-")
+    return f"{stem or 'rfpro'}_mesh_ports_validation.pdf"
+
+
 def next_available_image_directory(pdf_path: Path) -> Path:
     """Choose a sibling image directory without replacing an older capture set."""
 
@@ -1393,6 +1439,377 @@ def format_geometry_report_value(
     return f"{text} um"
 
 
+def parse_result_parameter_string(text: str) -> dict[str, str]:
+    """Parse RFPro metadata such as ``W:1 mm, L:2 mm``."""
+
+    parsed: dict[str, str] = {}
+    for part in re.split(r"\s*[,;]\s*", str(text).strip()):
+        if not part:
+            continue
+        separator = "=" if "=" in part else ":" if ":" in part else ""
+        if not separator:
+            continue
+        name, value = part.split(separator, 1)
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            parsed[name] = value
+    return parsed
+
+
+def _coerce_result_parameter_mapping(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        return parse_result_parameter_string(raw)
+    if isinstance(raw, Mapping) or hasattr(raw, "items"):
+        try:
+            return {
+                str(name): str(value)
+                for name, value in raw.items()
+                if str(name) and value is not None
+            }
+        except Exception:
+            return {}
+    try:
+        pairs = list(raw)
+    except (TypeError, ValueError):
+        return {}
+    result: dict[str, str] = {}
+    for item in pairs:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            result[str(item[0])] = str(item[1])
+            continue
+        name = getattr(item, "name", None)
+        value = getattr(item, "value", None)
+        if name is not None and value is not None:
+            result[str(name)] = str(value)
+    return result
+
+
+def simulation_result_parameters(metadata: Any) -> dict[str, str]:
+    """Read public SimulationMetaData parameter accessors and display text."""
+
+    mapping: dict[str, str] = {}
+    for method_name in ("getParameterValues", "parameterValues"):
+        method = getattr(metadata, method_name, None)
+        if not callable(method):
+            continue
+        for arguments in ((), ("ValueAndFrontendUnit",)):
+            try:
+                candidate = _coerce_result_parameter_mapping(method(*arguments))
+            except Exception:
+                continue
+            if candidate:
+                mapping.update(candidate)
+                break
+    display = str(getattr(metadata, "parameterString", "") or "")
+    for name, value in parse_result_parameter_string(display).items():
+        mapping.setdefault(name, value)
+    return mapping
+
+
+def _normalized_parameter_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value)).casefold()
+
+
+def _parameter_text_reference_value(value: Any) -> float | None:
+    """Convert a simple length/result value to RFPro reference meters."""
+
+    display = str(value).replace("\u00b5", "u").replace("\u03bc", "u")
+    match = _REPORT_LENGTH_PATTERN.fullmatch(display)
+    if match is None:
+        return None
+    unit = match.group(2).casefold()
+    factor = _REPORT_LENGTH_TO_UM.get(unit)
+    if factor is None:
+        return None
+    reference_value = float(match.group(1)) * factor / 1.0e6
+    return reference_value if math.isfinite(reference_value) else None
+
+
+def _sweep_value_matches_result(value: SweepValue, result_text: str) -> bool:
+    if _normalized_parameter_text(value.display) == _normalized_parameter_text(
+        result_text
+    ):
+        return True
+
+    result_reference = _parameter_text_reference_value(result_text)
+    if result_reference is None:
+        return False
+    point_reference = _parameter_text_reference_value(value.display)
+    if point_reference is None:
+        try:
+            point_reference = float(value.value)
+        except (TypeError, ValueError):
+            point_reference = None
+    if point_reference is None or not math.isfinite(point_reference):
+        return False
+    return math.isclose(
+        point_reference,
+        result_reference,
+        rel_tol=1.0e-10,
+        abs_tol=1.0e-15,
+    )
+
+
+def _matching_point_indices(
+    parameters: Mapping[str, str], points: Sequence[SweepPoint]
+) -> list[int]:
+    """Return points whose complete value tuple matches result metadata."""
+
+    if not parameters:
+        return []
+    values_by_name = {
+        str(name).casefold(): str(value) for name, value in parameters.items()
+    }
+    matches: list[int] = []
+    for point in points:
+        if not point.values:
+            continue
+        if all(
+            value.parameter_name.casefold() in values_by_name
+            and _sweep_value_matches_result(
+                value,
+                values_by_name[value.parameter_name.casefold()],
+            )
+            for value in point.values
+        ):
+            matches.append(point.point_index)
+    return matches
+
+
+def find_mesh_ports_data(
+    simulation_output: Any,
+) -> tuple[str | None, Path | None, str]:
+    """Find the saved OVM consumed by RFPro's public Mesh/Ports viewer."""
+
+    raw_path = str(getattr(simulation_output, "simulationPath", "") or "").strip()
+    if not raw_path:
+        return None, None, "The saved simulation has no simulationPath."
+    simulation_path = Path(raw_path).expanduser()
+    candidates = (
+        ("FEM", simulation_path / "emds_dsn" / "design", "options.xml"),
+        ("Momentum", simulation_path / "work", "proj.opt"),
+    )
+    checked: list[str] = []
+    for mesh_kind, result_directory, marker_name in candidates:
+        marker = result_directory / marker_name
+        checked.append(str(result_directory))
+        if not marker.is_file():
+            continue
+        try:
+            mesh_files = sorted(
+                path for path in result_directory.rglob("*.ovm") if path.is_file()
+            )
+        except OSError as error:
+            return (
+                None,
+                None,
+                f"Could not inspect {mesh_kind} Mesh/Ports data: {error}",
+            )
+        if mesh_files:
+            return mesh_kind, mesh_files[0], ""
+    return (
+        None,
+        None,
+        "No saved Mesh/Ports *.ovm was found under " + " or ".join(checked) + ".",
+    )
+
+
+def discover_mesh_ports_results(
+    empro_module: Any,
+    analysis: Any,
+    points: Sequence[SweepPoint],
+) -> MeshPortsInventory:
+    """Map saved simulations to configured points without starting any jobs."""
+
+    diagnostics: list[str] = []
+    try:
+        analysis_output = empro_module.output.AnalysisOutput(analysis)
+        simulation_ids = [
+            (value, str(value))
+            for value in analysis_output.getAvailableSimulationIds()
+        ]
+    except Exception as error:
+        return MeshPortsInventory(
+            analysis_output=None,
+            results_by_point=(),
+            missing_point_indices=tuple(point.point_index for point in points),
+            missing_mesh_point_indices=(),
+            unmatched_result_ids=(),
+            diagnostics=(f"Could not enumerate saved analysis results: {error}",),
+        )
+
+    results: list[MeshPortsResult] = []
+    for raw_simulation_id, simulation_id in simulation_ids:
+        try:
+            simulation_output = analysis_output.getSimulation(raw_simulation_id)
+        except Exception as error:
+            diagnostics.append(
+                f"Simulation {simulation_id} could not be loaded: {error}"
+            )
+            continue
+        try:
+            parameters = simulation_result_parameters(simulation_output.metadata())
+        except Exception as error:
+            parameters = {}
+            diagnostics.append(
+                f"Simulation {simulation_id} metadata could not be read: {error}"
+            )
+        mesh_kind, mesh_file, unavailable_reason = find_mesh_ports_data(
+            simulation_output
+        )
+        results.append(
+            MeshPortsResult(
+                simulation_id=simulation_id,
+                simulation_output=simulation_output,
+                parameters=tuple(parameters.items()),
+                mesh_kind=mesh_kind,
+                mesh_file=mesh_file,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    assignments: dict[int, MeshPortsResult] = {}
+    unmatched: list[MeshPortsResult] = []
+    for result in results:
+        parameters = dict(result.parameters)
+        candidate_indices = [
+            index
+            for index in _matching_point_indices(parameters, points)
+            if index not in assignments
+        ]
+        if candidate_indices:
+            selected_index = candidate_indices[0]
+            assignments[selected_index] = result
+            if len(candidate_indices) > 1:
+                diagnostics.append(
+                    f"Simulation {result.simulation_id} matched duplicate parameter "
+                    f"points; assigned it to point {selected_index + 1}."
+                )
+        else:
+            unmatched.append(result)
+
+    # RFPro preserves configured order when it returns a complete result set.
+    # Use that complete-list behavior only for results whose metadata could not
+    # establish a unique mapping. Never guess positions in a partial result set.
+    if len(results) == len(points):
+        still_unmatched: list[MeshPortsResult] = []
+        result_positions = {id(result): index for index, result in enumerate(results)}
+        for result in unmatched:
+            point_index = points[result_positions[id(result)]].point_index
+            if point_index not in assignments:
+                assignments[point_index] = result
+                diagnostics.append(
+                    f"Simulation {result.simulation_id} was mapped to point "
+                    f"{point_index + 1} by complete result order because its "
+                    "parameter metadata was insufficient."
+                )
+            else:
+                still_unmatched.append(result)
+        unmatched = still_unmatched
+
+    assigned_indices = set(assignments)
+    missing_point_indices = tuple(
+        point.point_index
+        for point in points
+        if point.point_index not in assigned_indices
+    )
+    missing_mesh_point_indices = tuple(
+        point_index
+        for point_index, result in assignments.items()
+        if result.mesh_file is None or result.mesh_kind is None
+    )
+    return MeshPortsInventory(
+        analysis_output=analysis_output,
+        results_by_point=tuple(sorted(assignments.items())),
+        missing_point_indices=missing_point_indices,
+        missing_mesh_point_indices=tuple(sorted(missing_mesh_point_indices)),
+        unmatched_result_ids=tuple(result.simulation_id for result in unmatched),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def display_mesh_ports_result(
+    empro_module: Any,
+    result: MeshPortsResult,
+    zoom_to_extents: bool = True,
+) -> None:
+    """Load one saved result through RFPro's Mesh/Ports geometry-view binding."""
+
+    if result.mesh_kind is None or result.mesh_file is None:
+        raise RuntimeError(
+            result.unavailable_reason
+            or f"Simulation {result.simulation_id} has no saved Mesh/Ports data."
+        )
+    project_view = empro_module.gui.activeProjectView()
+    project_view.showGeometryView()
+    empro_module.gui.processEvents()
+    geometry_view = project_view.geometryView()
+    method_name = (
+        "displayFemMesh" if result.mesh_kind == "FEM" else "displayMomMesh"
+    )
+    display_method = getattr(geometry_view, method_name, None)
+    if not callable(display_method):
+        raise RuntimeError(
+            f"RFPro's geometry view does not expose {method_name}() in this release."
+        )
+    display_method(result.simulation_output)
+    empro_module.gui.processEvents()
+    if zoom_to_extents:
+        geometry_view.zoomGeometryViewToExtents()
+        empro_module.gui.processEvents()
+
+
+def mesh_ports_inventory_summary(
+    inventory: MeshPortsInventory, total_point_count: int
+) -> str:
+    available = len(inventory.available_results())
+    no_result = len(inventory.missing_point_indices)
+    no_mesh = len(inventory.missing_mesh_point_indices)
+    unmatched = len(inventory.unmatched_result_ids)
+    return (
+        f"Mesh/Ports available: {available}/{total_point_count}; "
+        f"no matched saved result: {no_result}; "
+        f"saved result without mesh: {no_mesh}; "
+        f"unmatched saved results: {unmatched}"
+    )
+
+
+def mesh_ports_inventory_details(
+    inventory: MeshPortsInventory, total_point_count: int
+) -> str:
+    """Build user-facing details without overwhelming RFPro message boxes."""
+
+    lines = [mesh_ports_inventory_summary(inventory, total_point_count)]
+
+    def point_list(indices: Sequence[int]) -> str:
+        shown = [str(index + 1) for index in indices[:20]]
+        if len(indices) > 20:
+            shown.append(f"... ({len(indices) - 20} more)")
+        return ", ".join(shown)
+
+    if inventory.missing_point_indices:
+        lines.append(
+            "Points without a matched saved result: "
+            + point_list(inventory.missing_point_indices)
+        )
+    if inventory.missing_mesh_point_indices:
+        lines.append(
+            "Points with a saved result but no Mesh/Ports data: "
+            + point_list(inventory.missing_mesh_point_indices)
+        )
+    if inventory.unmatched_result_ids:
+        lines.append(
+            "Saved result IDs that could not be matched: "
+            + ", ".join(inventory.unmatched_result_ids[:20])
+        )
+    if inventory.diagnostics:
+        lines.append("Diagnostics: " + " | ".join(inventory.diagnostics[:5]))
+    return "\n".join(lines)
+
+
 def _geometry_report_page_html(
     analysis_name: str,
     page: GeometryReportPage,
@@ -1400,6 +1817,7 @@ def _geometry_report_page_html(
     report_page_count: int,
     total_point_count: int,
     parameter_decimal_places: int = DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES,
+    report_title: str = "RFPro Geometry Validation",
 ) -> str:
     """Render the wrapped metadata header used on one PDF page."""
 
@@ -1411,13 +1829,13 @@ def _geometry_report_page_html(
     ) or "(baseline parameters)"
     if page.valid is True:
         status_color = "#1b5e20"
-        status = "Valid"
+        status = page.status_label or "Valid"
     elif page.valid is False:
         status_color = "#b71c1c"
-        status = "INVALID"
+        status = page.status_label or "INVALID"
     else:
         status_color = "#795500"
-        status = "Automatic validity unavailable"
+        status = page.status_label or "Automatic validity unavailable"
     details = page.message
     if page.capture_error:
         details += f" Capture: {page.capture_error}"
@@ -1428,14 +1846,14 @@ def _geometry_report_page_html(
   h1 {{ font-size: 15pt; margin: 0 0 3px 0; }}
   p {{ margin: 1px 0; }}
 </style>
-<h1>RFPro Geometry Validation</h1>
+<h1>{html.escape(report_title)}</h1>
 <p><b>Analysis:</b> {html.escape(str(analysis_name))}
    &nbsp;&nbsp; <b>Sweep point:</b> {point.point_index + 1} of {total_point_count}
    &nbsp;&nbsp; <b>Sequence:</b> {point.sequence_index + 1}
    &nbsp;&nbsp; <b>Combination:</b> {point.combination_index + 1}</p>
 <p style="margin-top: 3px;"><b>Geometry parameters (um):</b> {parameters}</p>
 <p style="color: {status_color}; margin-top: 3px;">
-  <b>{status}:</b> {html.escape(details)}
+  <b>{html.escape(status)}:</b> {html.escape(details)}
 </p>
 """.strip()
 
@@ -1446,6 +1864,7 @@ def write_geometry_pdf_report(
     pages: Sequence[GeometryReportPage],
     total_point_count: int,
     parameter_decimal_places: int = DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES,
+    report_title: str = "RFPro Geometry Validation",
 ) -> None:
     """Create a fitted multi-page PDF using RFPro's existing PySide6 runtime."""
 
@@ -1465,7 +1884,7 @@ def write_geometry_pdf_report(
 
     writer = QPdfWriter(str(output_path))
     writer.setCreator("ads-rfpro-csv-sweeps")
-    writer.setTitle(f"RFPro Geometry Validation - {analysis_name}")
+    writer.setTitle(f"{report_title} - {analysis_name}")
     writer.setResolution(150)
     writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
     if not writer.setPageOrientation(QPageLayout.Orientation.Landscape):
@@ -1498,6 +1917,7 @@ def write_geometry_pdf_report(
                     len(pages),
                     total_point_count,
                     parameter_decimal_places,
+                    report_title,
                 )
             )
             header.setTextWidth(content_width)
@@ -1653,6 +2073,8 @@ def create_inspector_dialog(
             super().__init__(None)
             self._restored = False
             self._applying = False
+            self._active_view_text = "Geometry"
+            self._mesh_inventory: MeshPortsInventory | None = None
             self._statuses: list[tuple[bool | None, str] | None] = [
                 None for _ in points
             ]
@@ -1666,15 +2088,20 @@ def create_inspector_dialog(
                 "Select a row to apply that parameter combination to RFPro's active "
                 "geometry view. Use Load Selected to explicitly regenerate the "
                 "highlighted row; Fit View only fits the geometry already displayed. "
+                "Load Mesh/Ports displays a matched saved simulation result. "
                 "No simulation is created or queued. Original parameter formulas are "
                 "restored when this window closes."
             )
             instructions.setWordWrap(True)
             layout.addWidget(instructions)
 
-            self.table = QTableWidget(len(points), 3 + len(parameter_names))
+            geometry_column = 2 + len(parameter_names)
+            mesh_ports_column = geometry_column + 1
+            self._geometry_column = geometry_column
+            self._mesh_ports_column = mesh_ports_column
+            self.table = QTableWidget(len(points), 4 + len(parameter_names))
             self.table.setHorizontalHeaderLabels(
-                ["Point", "Sequence", *parameter_names, "Geometry"]
+                ["Point", "Sequence", *parameter_names, "Geometry", "Mesh/Ports"]
             )
             self.table.setSelectionBehavior(
                 QAbstractItemView.SelectionBehavior.SelectRows
@@ -1694,6 +2121,7 @@ def create_inspector_dialog(
                     str(point.sequence_index + 1),
                     *(values_by_name.get(name, "(baseline)") for name in parameter_names),
                     "Not checked",
+                    "Scanning saved results...",
                 ]
                 for column, text in enumerate(cells):
                     item = QTableWidgetItem(text)
@@ -1711,6 +2139,8 @@ def create_inspector_dialog(
             self.fit_button = QPushButton("Fit View")
             self.check_all_button = QPushButton("Check All")
             self.report_button = QPushButton("Check All + PDF")
+            self.load_mesh_ports_button = QPushButton("Load Mesh/Ports")
+            self.mesh_ports_report_button = QPushButton("Mesh/Ports PDF")
             close_button = QPushButton("Close and Restore")
             self.previous_button.clicked.connect(self._previous)
             self.next_button.clicked.connect(self._next)
@@ -1718,6 +2148,12 @@ def create_inspector_dialog(
             self.fit_button.clicked.connect(self._fit_view)
             self.check_all_button.clicked.connect(self._check_all)
             self.report_button.clicked.connect(self._check_all_with_pdf)
+            self.load_mesh_ports_button.clicked.connect(
+                self._load_selected_mesh_ports
+            )
+            self.mesh_ports_report_button.clicked.connect(
+                self._export_mesh_ports_with_pdf
+            )
             close_button.clicked.connect(self.close)
             self.load_selected_button.setToolTip(
                 "Regenerate and display the parameter combination in the highlighted row."
@@ -1728,6 +2164,14 @@ def create_inspector_dialog(
             self.report_button.setToolTip(
                 "Check every point, save one PNG per geometry, and create a PDF."
             )
+            self.load_mesh_ports_button.setToolTip(
+                "Display the selected condition's saved RFPro Mesh/Ports result; "
+                "this never starts a simulation."
+            )
+            self.mesh_ports_report_button.setToolTip(
+                "Export every available saved Mesh/Ports result to PNG and PDF; "
+                "unsolved or missing-mesh conditions are skipped."
+            )
             for button in (
                 self.previous_button,
                 self.next_button,
@@ -1735,6 +2179,8 @@ def create_inspector_dialog(
                 self.fit_button,
                 self.check_all_button,
                 self.report_button,
+                self.load_mesh_ports_button,
+                self.mesh_ports_report_button,
                 close_button,
             ):
                 controls.addWidget(button)
@@ -1745,6 +2191,8 @@ def create_inspector_dialog(
             self.summary.setWordWrap(True)
             layout.addWidget(self.summary)
 
+            self._refresh_mesh_ports_inventory()
+
             self.table.blockSignals(True)
             self.table.selectRow(0)
             self.table.blockSignals(False)
@@ -1754,7 +2202,7 @@ def create_inspector_dialog(
             self, row: int, valid: bool | None, message: str
         ) -> None:
             self._statuses[row] = (valid, message)
-            item = self.table.item(row, self.table.columnCount() - 1)
+            item = self.table.item(row, self._geometry_column)
             item.setText(_status_text(valid, message))
             item.setToolTip(message)
             if valid is True:
@@ -1763,8 +2211,46 @@ def create_inspector_dialog(
                 item.setBackground(QColor("#ffcdd2"))
             else:
                 item.setBackground(QColor("#fff9c4"))
-            self.table.resizeColumnToContents(self.table.columnCount() - 1)
+            self.table.resizeColumnToContents(self._geometry_column)
             self._update_summary(row)
+
+        def _refresh_mesh_ports_inventory(self) -> MeshPortsInventory:
+            inventory = discover_mesh_ports_results(
+                empro_module,
+                analysis,
+                points,
+            )
+            self._mesh_inventory = inventory
+            missing_mesh = set(inventory.missing_mesh_point_indices)
+            for row, point in enumerate(points):
+                result = inventory.result_for_point(point.point_index)
+                item = self.table.item(row, self._mesh_ports_column)
+                if result is None:
+                    item.setText("No matched saved result")
+                    item.setToolTip(
+                        "No saved simulation could be safely matched to this "
+                        "parameter condition."
+                    )
+                    item.setBackground(QColor("#eeeeee"))
+                elif point.point_index in missing_mesh:
+                    item.setText(f"Simulation {result.simulation_id}: no mesh")
+                    item.setToolTip(result.unavailable_reason)
+                    item.setBackground(QColor("#fff9c4"))
+                else:
+                    item.setText(
+                        f"{result.mesh_kind} simulation {result.simulation_id}"
+                    )
+                    item.setToolTip(
+                        f"Saved Mesh/Ports data: {result.mesh_file}"
+                    )
+                    item.setBackground(QColor("#c8e6c9"))
+            self.table.resizeColumnToContents(self._mesh_ports_column)
+            for diagnostic in inventory.diagnostics:
+                print(f"Mesh/Ports inventory: {diagnostic}")
+            current_row = self.table.currentRow()
+            if current_row >= 0:
+                self._update_summary(current_row)
+            return inventory
 
         def _update_summary(self, current_row: int) -> None:
             checked = sum(status is not None for status in self._statuses)
@@ -1778,7 +2264,16 @@ def create_inspector_dialog(
             )
             self.summary.setText(
                 f"Showing point {current_row + 1} of {len(points)}: {values}\n"
-                f"Checked: {checked}/{len(points)}; invalid/errors: {invalid}"
+                f"Current view: {self._active_view_text}\n"
+                f"Checked: {checked}/{len(points)}; invalid/errors: {invalid}\n"
+                + (
+                    mesh_ports_inventory_summary(
+                        self._mesh_inventory,
+                        len(points),
+                    )
+                    if self._mesh_inventory is not None
+                    else "Mesh/Ports results have not been scanned."
+                )
             )
             self.previous_button.setEnabled(current_row > 0)
             self.next_button.setEnabled(current_row + 1 < len(points))
@@ -1799,6 +2294,7 @@ def create_inspector_dialog(
                 empro_module.gui.processEvents()
                 fit_view = zoom_to_extents if force_fit is None else force_fit
                 refresh_geometry_view(empro_module, fit_view)
+                self._active_view_text = "Geometry"
                 valid, message = geometry_validity(project)
                 self._set_status(row, valid, message)
                 if log_native_status:
@@ -1833,6 +2329,44 @@ def create_inspector_dialog(
         def _load_selected(self) -> None:
             self._apply_row(max(0, self.table.currentRow()))
 
+        def _load_selected_mesh_ports(self) -> None:
+            row = max(0, self.table.currentRow())
+            inventory = self._refresh_mesh_ports_inventory()
+            result = inventory.result_for_point(points[row].point_index)
+            if result is None:
+                QMessageBox.information(
+                    self,
+                    "No saved Mesh/Ports result",
+                    "No saved simulation could be safely matched to the selected "
+                    "condition. The script did not start a simulation.",
+                )
+                return
+            if result.mesh_file is None or result.mesh_kind is None:
+                QMessageBox.information(
+                    self,
+                    "Mesh/Ports data unavailable",
+                    result.unavailable_reason
+                    or "The selected saved result contains no Mesh/Ports data.",
+                )
+                return
+            try:
+                display_mesh_ports_result(empro_module, result, True)
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Could not load Mesh/Ports result",
+                    f"Simulation {result.simulation_id}: {error}",
+                )
+                return
+            self._active_view_text = (
+                f"{result.mesh_kind} Mesh/Ports - simulation {result.simulation_id}"
+            )
+            self._update_summary(row)
+            print(
+                f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
+                f"result from simulation {result.simulation_id}."
+            )
+
         def _fit_view(self) -> None:
             try:
                 refresh_geometry_view(empro_module, True)
@@ -1855,6 +2389,179 @@ def create_inspector_dialog(
             if pdf_path.suffix.casefold() != ".pdf":
                 pdf_path = pdf_path.with_suffix(".pdf")
             self._run_check_all(pdf_path)
+
+        def _export_mesh_ports_with_pdf(self) -> None:
+            selected_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save RFPro Mesh/Ports Validation Report",
+                default_mesh_ports_report_filename(str(analysis.name)),
+                "PDF files (*.pdf)",
+            )
+            if not selected_path:
+                return
+            pdf_path = Path(selected_path).expanduser().resolve()
+            if pdf_path.suffix.casefold() != ".pdf":
+                pdf_path = pdf_path.with_suffix(".pdf")
+            self._run_mesh_ports_export(pdf_path)
+
+        def _run_mesh_ports_export(self, pdf_path: Path) -> None:
+            selected_row = max(0, self.table.currentRow())
+            inventory = self._refresh_mesh_ports_inventory()
+            available_results = inventory.available_results()
+            if not available_results:
+                QMessageBox.information(
+                    self,
+                    "No Mesh/Ports data available",
+                    mesh_ports_inventory_details(inventory, len(points))
+                    + "\n\nNo simulation was started.",
+                )
+                return
+
+            image_directory = next_available_image_directory(pdf_path)
+            try:
+                image_directory.mkdir(parents=True, exist_ok=False)
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Could not create Mesh/Ports image directory",
+                    str(error),
+                )
+                return
+
+            pages_by_index = {point.point_index: point for point in points}
+            report_pages: list[GeometryReportPage] = []
+            exported_image_count = 0
+            export_failure = ""
+            progress = QProgressDialog(
+                "Loading and exporting available saved Mesh/Ports results...",
+                "Cancel",
+                0,
+                len(available_results),
+                self,
+            )
+            progress.setWindowTitle("RFPro Mesh/Ports Export")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            for export_index, (point_index, result) in enumerate(available_results):
+                if progress.wasCanceled():
+                    break
+                point = pages_by_index[point_index]
+                progress.setLabelText(
+                    f"Loading point {point_index + 1} Mesh/Ports result "
+                    f"({export_index + 1} of {len(available_results)})..."
+                )
+                progress.setValue(export_index)
+                empro_module.gui.processEvents()
+                safe_simulation_id = re.sub(
+                    r"[^A-Za-z0-9._-]+", "_", result.simulation_id
+                ).strip("._-") or "result"
+                image_path = image_directory / (
+                    f"point_{point_index + 1:04d}_simulation_"
+                    f"{safe_simulation_id}_mesh_ports.png"
+                )
+                try:
+                    display_mesh_ports_result(empro_module, result, True)
+                    self._active_view_text = (
+                        f"{result.mesh_kind} Mesh/Ports - simulation "
+                        f"{result.simulation_id}"
+                    )
+                    export_method = export_geometry_view_png(
+                        empro_module,
+                        QApplication.instance(),
+                        image_path,
+                    )
+                except Exception as error:
+                    export_failure = (
+                        f"Point {point_index + 1}, simulation "
+                        f"{result.simulation_id}, could not be exported from "
+                        f"RFPro's Mesh/Ports view:\n{error}"
+                    )
+                    print(export_failure)
+                    break
+                exported_image_count += 1
+                print(
+                    f"Exported point {point_index + 1} {result.mesh_kind} "
+                    f"Mesh/Ports via {export_method}: {image_path}"
+                )
+                report_pages.append(
+                    GeometryReportPage(
+                        point=point,
+                        valid=True,
+                        message=(
+                            f"Saved simulation {result.simulation_id}; "
+                            f"{result.mesh_kind} Mesh/Ports result."
+                        ),
+                        image_path=image_path,
+                        status_label="Mesh/Ports loaded",
+                    )
+                )
+
+            if not progress.wasCanceled():
+                progress.setValue(len(available_results))
+            else:
+                progress.close()
+
+            self.table.blockSignals(True)
+            self.table.selectRow(selected_row)
+            self.table.blockSignals(False)
+            self._apply_row(selected_row)
+
+            if export_failure:
+                removed_empty_directory = (
+                    exported_image_count == 0
+                    and remove_empty_image_directory(image_directory)
+                )
+                image_note = (
+                    "No PNG images were exported; the empty image directory "
+                    "was removed."
+                    if removed_empty_directory
+                    else f"Successfully exported PNG files remain in:\n{image_directory}"
+                )
+                QMessageBox.warning(
+                    self,
+                    "RFPro Mesh/Ports export failed",
+                    export_failure
+                    + "\n\nNo PDF was created because every PDF page must "
+                    "have its verified RFPro-exported PNG.\n\n"
+                    + image_note,
+                )
+                return
+            if not report_pages:
+                remove_empty_image_directory(image_directory)
+                return
+            try:
+                write_geometry_pdf_report(
+                    pdf_path,
+                    str(analysis.name),
+                    report_pages,
+                    len(points),
+                    report_title="RFPro Mesh/Ports Validation",
+                )
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Could not create Mesh/Ports PDF",
+                    f"{error}\n\nCaptured PNG files remain in:\n{image_directory}",
+                )
+                return
+
+            completion = (
+                f"Created {len(report_pages)} Mesh/Ports PDF page(s) from "
+                f"{len(available_results)} available saved result(s).\n\n"
+                f"PDF:\n{pdf_path}\n\nPNG images:\n{image_directory}\n\n"
+                + mesh_ports_inventory_details(inventory, len(points))
+                + "\n\nNo simulation was started."
+            )
+            if progress.wasCanceled():
+                completion = (
+                    "The export was canceled; a partial report was saved.\n\n"
+                    + completion
+                )
+            QMessageBox.information(
+                self,
+                "Mesh/Ports report created",
+                completion,
+            )
 
         def _run_check_all(self, pdf_path: Path | None) -> None:
             selected_row = max(0, self.table.currentRow())

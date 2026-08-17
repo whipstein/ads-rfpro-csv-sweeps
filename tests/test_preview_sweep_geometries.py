@@ -132,9 +132,21 @@ class FakeApplication:
 class FakeGeometryViewController:
     def __init__(self) -> None:
         self.update_calls = 0
+        self.zoom_calls = 0
+        self.fem_mesh_calls = []
+        self.momentum_mesh_calls = []
 
     def updateView(self) -> None:
         self.update_calls += 1
+
+    def zoomGeometryViewToExtents(self) -> None:
+        self.zoom_calls += 1
+
+    def displayFemMesh(self, simulation_output) -> None:
+        self.fem_mesh_calls.append(simulation_output)
+
+    def displayMomMesh(self, simulation_output) -> None:
+        self.momentum_mesh_calls.append(simulation_output)
 
 
 class FakeAction:
@@ -227,6 +239,40 @@ class FakeCaptureGui:
 
     def processEvents(self) -> None:
         self.process_events_calls += 1
+
+
+class FakeSimulationMetadata:
+    def __init__(self, parameters=None, parameter_string: str = "") -> None:
+        self.parameters = parameters
+        self.parameterString = parameter_string
+
+    def getParameterValues(self, *_arguments):
+        return self.parameters
+
+
+class FakeSimulationOutput:
+    def __init__(self, simulation_path: Path, metadata: FakeSimulationMetadata) -> None:
+        self.simulationPath = str(simulation_path)
+        self._metadata = metadata
+
+    def metadata(self) -> FakeSimulationMetadata:
+        return self._metadata
+
+
+class FakeAnalysisOutput:
+    def __init__(self, simulations) -> None:
+        self.simulations = dict(simulations)
+
+    def getAvailableSimulationIds(self):
+        return list(self.simulations)
+
+    def getSimulation(self, simulation_id):
+        return self.simulations[str(simulation_id)]
+
+
+class FakeOutputNamespace:
+    def AnalysisOutput(self, analysis):
+        return analysis.analysis_output
 
 
 class PreviewSweepGeometryTests(unittest.TestCase):
@@ -344,6 +390,213 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             ),
             (False, "self-intersection"),
         )
+
+    def test_saved_fem_and_momentum_mesh_ports_data_are_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fem_output = FakeSimulationOutput(
+                root / "fem_case", FakeSimulationMetadata()
+            )
+            fem_directory = root / "fem_case" / "emds_dsn" / "design"
+            fem_directory.mkdir(parents=True)
+            (fem_directory / "options.xml").write_text("options")
+            fem_mesh = fem_directory / "mesh" / "final.ovm"
+            fem_mesh.parent.mkdir()
+            fem_mesh.write_bytes(b"mesh")
+
+            momentum_output = FakeSimulationOutput(
+                root / "mom_case", FakeSimulationMetadata()
+            )
+            momentum_directory = root / "mom_case" / "work"
+            momentum_directory.mkdir(parents=True)
+            (momentum_directory / "proj.opt").write_text("options")
+            momentum_mesh = momentum_directory / "mesh.ovm"
+            momentum_mesh.write_bytes(b"mesh")
+
+            self.assertEqual(
+                MODULE.find_mesh_ports_data(fem_output),
+                ("FEM", fem_mesh, ""),
+            )
+            self.assertEqual(
+                MODULE.find_mesh_ports_data(momentum_output),
+                ("Momentum", momentum_mesh, ""),
+            )
+
+    def test_partial_saved_results_are_mapped_by_parameter_metadata(self) -> None:
+        points = (
+            MODULE.SweepPoint(
+                0,
+                0,
+                0,
+                (MODULE.SweepValue("W", 1.0e-3, "1 mm"),),
+            ),
+            MODULE.SweepPoint(
+                1,
+                0,
+                1,
+                (MODULE.SweepValue("W", 2.0e-3, "2 mm"),),
+            ),
+            MODULE.SweepPoint(
+                2,
+                0,
+                2,
+                (MODULE.SweepValue("W", 3.0e-3, "3 mm"),),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            simulation_path = Path(directory) / "case"
+            mesh_directory = simulation_path / "emds_dsn" / "design"
+            mesh_directory.mkdir(parents=True)
+            (mesh_directory / "options.xml").write_text("options")
+            (mesh_directory / "point.ovm").write_bytes(b"mesh")
+            simulation = FakeSimulationOutput(
+                simulation_path,
+                FakeSimulationMetadata({"W": "2000 um"}),
+            )
+            analysis = type(
+                "FakeAnalysis",
+                (),
+                {"analysis_output": FakeAnalysisOutput({"000002": simulation})},
+            )()
+            empro_module = type(
+                "FakeEmpro", (), {"output": FakeOutputNamespace()}
+            )()
+
+            inventory = MODULE.discover_mesh_ports_results(
+                empro_module, analysis, points
+            )
+
+        self.assertEqual(
+            [
+                (index, result.simulation_id)
+                for index, result in inventory.results_by_point
+            ],
+            [(1, "000002")],
+        )
+        self.assertEqual(inventory.missing_point_indices, (0, 2))
+        self.assertEqual(inventory.unmatched_result_ids, ())
+
+    def test_partial_result_without_metadata_is_not_positionally_guessed(self) -> None:
+        points = (
+            MODULE.SweepPoint(
+                0,
+                0,
+                0,
+                (MODULE.SweepValue("W", 1.0e-3, "1 mm"),),
+            ),
+            MODULE.SweepPoint(
+                1,
+                0,
+                1,
+                (MODULE.SweepValue("W", 2.0e-3, "2 mm"),),
+            ),
+        )
+        simulation = FakeSimulationOutput(
+            Path("missing"), FakeSimulationMetadata(None)
+        )
+        analysis = type(
+            "FakeAnalysis",
+            (),
+            {"analysis_output": FakeAnalysisOutput({"000009": simulation})},
+        )()
+        empro_module = type(
+            "FakeEmpro", (), {"output": FakeOutputNamespace()}
+        )()
+
+        inventory = MODULE.discover_mesh_ports_results(
+            empro_module, analysis, points
+        )
+
+        self.assertEqual(inventory.results_by_point, ())
+        self.assertEqual(inventory.missing_point_indices, (0, 1))
+        self.assertEqual(inventory.unmatched_result_ids, ("000009",))
+
+    def test_complete_results_can_fall_back_to_public_result_order(self) -> None:
+        points = (
+            MODULE.SweepPoint(
+                0,
+                0,
+                0,
+                (MODULE.SweepValue("W", 1.0e-3, "1 mm"),),
+            ),
+            MODULE.SweepPoint(
+                1,
+                0,
+                1,
+                (MODULE.SweepValue("W", 2.0e-3, "2 mm"),),
+            ),
+        )
+        simulations = {
+            "000001": FakeSimulationOutput(
+                Path("missing_1"), FakeSimulationMetadata(None)
+            ),
+            "000002": FakeSimulationOutput(
+                Path("missing_2"), FakeSimulationMetadata(None)
+            ),
+        }
+        analysis = type(
+            "FakeAnalysis",
+            (),
+            {"analysis_output": FakeAnalysisOutput(simulations)},
+        )()
+        empro_module = type(
+            "FakeEmpro", (), {"output": FakeOutputNamespace()}
+        )()
+
+        inventory = MODULE.discover_mesh_ports_results(
+            empro_module, analysis, points
+        )
+
+        self.assertEqual(
+            [
+                (index, result.simulation_id)
+                for index, result in inventory.results_by_point
+            ],
+            [(0, "000001"), (1, "000002")],
+        )
+        self.assertEqual(inventory.missing_mesh_point_indices, (0, 1))
+
+    def test_mesh_ports_display_uses_verified_geometry_view_binding(self) -> None:
+        simulation_output = object()
+        result = MODULE.MeshPortsResult(
+            simulation_id="000002",
+            simulation_output=simulation_output,
+            parameters=(),
+            mesh_kind="FEM",
+            mesh_file=Path("mesh.ovm"),
+        )
+        geometry_view = FakeGeometryViewController()
+        project_view = FakeProjectView(geometry_view)
+        gui = FakeCaptureGui(project_view)
+        empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+        MODULE.display_mesh_ports_result(empro_module, result, True)
+
+        self.assertEqual(project_view.show_calls, 1)
+        self.assertEqual(geometry_view.fem_mesh_calls, [simulation_output])
+        self.assertEqual(geometry_view.momentum_mesh_calls, [])
+        self.assertEqual(geometry_view.zoom_calls, 1)
+        self.assertGreaterEqual(gui.process_events_calls, 3)
+
+    def test_momentum_mesh_ports_display_uses_momentum_binding(self) -> None:
+        simulation_output = object()
+        result = MODULE.MeshPortsResult(
+            simulation_id="000003",
+            simulation_output=simulation_output,
+            parameters=(),
+            mesh_kind="Momentum",
+            mesh_file=Path("mesh.ovm"),
+        )
+        geometry_view = FakeGeometryViewController()
+        project_view = FakeProjectView(geometry_view)
+        gui = FakeCaptureGui(project_view)
+        empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+        MODULE.display_mesh_ports_result(empro_module, result, False)
+
+        self.assertEqual(geometry_view.fem_mesh_calls, [])
+        self.assertEqual(geometry_view.momentum_mesh_calls, [simulation_output])
+        self.assertEqual(geometry_view.zoom_calls, 0)
 
     def test_export_image_action_is_found_recursively_in_the_view_menu(self) -> None:
         export_action = FakeAction("&Export Image...")
@@ -560,6 +813,10 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             MODULE.default_geometry_report_filename("My RF/Analysis"),
             "My_RF_Analysis_geometry_validation.pdf",
         )
+        self.assertEqual(
+            MODULE.default_mesh_ports_report_filename("My RF/Analysis"),
+            "My_RF_Analysis_mesh_ports_validation.pdf",
+        )
 
     def test_empty_report_image_directory_is_removed_safely(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -623,6 +880,33 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             ),
             "101.6 um",
         )
+
+    def test_mesh_ports_report_has_specific_title_and_status(self) -> None:
+        point = MODULE.SweepPoint(
+            0,
+            0,
+            0,
+            (MODULE.SweepValue("W", 1.0e-3, "1 mm"),),
+        )
+        page = MODULE.GeometryReportPage(
+            point=point,
+            valid=True,
+            message="Saved simulation 000001.",
+            image_path=Path("point.png"),
+            status_label="Mesh/Ports loaded",
+        )
+
+        report_html = MODULE._geometry_report_page_html(
+            "Analysis",
+            page,
+            1,
+            1,
+            1,
+            report_title="RFPro Mesh/Ports Validation",
+        )
+
+        self.assertIn("RFPro Mesh/Ports Validation", report_html)
+        self.assertIn("Mesh/Ports loaded", report_html)
 
     def test_report_geometry_decimal_setting_is_validated(self) -> None:
         value = MODULE.SweepValue("W", 1.0e-6, "1 um")

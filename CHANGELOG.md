@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.0 - 2026-08-17
+
+- Filter CSV headings against the active project's exact editable parameter
+  names and ignore all other metadata columns, including blank cells.
+- Add `DEFAULT_VALUE_SCALE` and `--scale` to apply one dimensionless
+  CSV-to-RFPro multiplier while preserving RFPro expressions and units.
+- Detect existing independent sweep groups from their evaluated RFPro values
+  with configurable relative and absolute tolerances.
+- Make append add only genuinely new conditions and perform no sequence-list
+  mutation or project save when every CSV condition already exists.
+- Make replace retain matching native sequence objects, add new cases, remove
+  stale cases, and skip duplicate rows within the CSV.
+
+## 0.10.0 - 2026-08-17
+
+- Add a **Mesh/Ports** result-status column and **Load Mesh/Ports** action to
+  the sweep geometry inspector.
+- Discover saved FEM and Momentum `*.ovm` data through public analysis output
+  objects and load it with the RFPro Mesh/Ports geometry-view bindings used by
+  Keysight's `empro.toolkit.analysis.viewMesh()` implementation.
+- Map partial result sets to sweep points by parameter metadata and use result
+  order only for complete result sets, avoiding unsafe shifts across unsolved
+  conditions.
+- Add **Mesh/Ports PDF** export using RFPro's verified **View > Export Image**
+  action, landscape pages, `um` parameter formatting, missing-result
+  diagnostics, and an explicit guarantee that no simulation is started.
+
 ## 0.9.0 - 2026-08-17
 
 - Change geometry-validation reports to landscape Letter pages and compact the
