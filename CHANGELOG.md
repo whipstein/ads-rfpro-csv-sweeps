@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.3 - 2026-08-17
+
+- Default the analysis runner to RFPro's native Auto/reuse launch path by using
+  `waitForConfirmation=True` instead of silently authorizing overwrite.
+- Prevent the legacy/fallback extraction branch from deleting registered
+  results and making saved meshes disappear without a native RFPro warning.
+- Retain explicit scripted reuse/overwrite as an opt-in global mode and show
+  both public submission arguments in the pre-run preview.
+
 ## 0.11.2 - 2026-08-17
 
 - Stop assigning the undocumented per-analysis

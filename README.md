@@ -17,7 +17,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.11.2**.
+The current release is **0.11.3**.
 
 ## Execution model
 
@@ -303,35 +303,46 @@ After confirmation it explicitly saves the active RFPro project, then calls the
 public `empro.toolkit.analysis.runAnalysis()` API. A save failure stops the
 operation before any simulation is submitted.
 
-Result reuse is controlled by this global near the top of the runner:
+The safe default follows RFPro's native analysis launch path, preserving the
+same Auto reuse policy and native confirmation behavior used when starting the
+analysis from the GUI:
 
 ```python
+DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY = True
 DEFAULT_REUSE_EXISTING_RESULTS = True
 ```
 
-With `True`, RFPro skips existing result sets only when it still considers them
-valid; missing or invalidated cases are queued. Set it to `False` to request a
-run regardless of existing results, which may queue every configured instance.
-The selected mode is shown in the final confirmation preview. Before saving,
-the runner sets the required FEM environment. Reuse is passed only through the
-documented run API:
+Keep `DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY=True` for normal use. RFPro then
+owns the final Auto/reuse decision and may display its native confirmation
+after the script's preview. Do not approve an overwrite there unless a full
+rerun is intended. The script still passes the explicit reuse preference as a
+secondary option, but it does not bypass RFPro's native policy:
 
 ```python
 runAnalysis(
     analysis,
-    waitForConfirmation=False,
+    waitForConfirmation=DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
     saveProject=True,
     reuseExistingIfPossible=DEFAULT_REUSE_EXISTING_RESULTS,
 )
 ```
+
+Setting `DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY=False` restores direct scripted
+submission. With that setting, `DEFAULT_REUSE_EXISTING_RESULTS=True` requests
+reuse and `False` requests overwrite. Direct submission is not the safe
+default: in RFPro's legacy/fallback extraction branch,
+`waitForConfirmation=False` authorizes overwrite and the branch does not
+consume `reuseExistingIfPossible`. That path can remove registered results and
+make their saved meshes disappear from the geometry inspector.
 
 The script deliberately does not assign
 `analysis.simulationSettings.reuseExistingResults`. Although that attribute
 appears in generated `SimulationData` reference output, it is undocumented and
 is not the control consumed by the RFPro extraction run flow. In some RFPro
 analysis bindings it also cannot be assigned. The supported
-`reuseExistingIfPossible` submission argument is explicit on every run, so the
-editable global still controls whether RFPro may reuse valid results.
+`reuseExistingIfPossible` submission argument remains explicit on every run,
+while the native-policy global controls whether RFPro gets the final
+Auto/overwrite decision.
 
 The runner applies these required private FEM environment controls to the
 current RFPro process before submission:

@@ -4,9 +4,10 @@ This script is intentionally separate from the CSV importer. Importing sweep
 cases never launches a simulation. Run this file inside RFPro only when the
 analysis is ready to be queued. The active project is saved immediately before
 the public ``runAnalysis`` API is called. Existing-result reuse is controlled
-by an editable global option passed through the public submission API. Required
-private FEM environment overrides are applied to the RFPro process before
-submission and remain set for the rest of the current RFPro session so
+by editable global options. The safe default preserves RFPro's native
+Auto/reuse launch policy instead of silently authorizing overwrite behavior.
+Required private FEM environment overrides are applied to the RFPro process
+before submission and remain set for the rest of the current RFPro session so
 asynchronously launched solvers inherit them.
 """
 
@@ -24,6 +25,9 @@ from typing import Any, Callable, Mapping, Sequence
 # Edit these defaults when RFPro's Run Script command cannot pass arguments.
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_REUSE_EXISTING_RESULTS = True
+# Keep this True to follow the same native RFPro reuse/confirmation path used
+# when starting an analysis from the GUI with its reuse policy set to Auto.
+DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY = True
 DEFAULT_RUN_ENVIRONMENT = {
     "FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR": "0.5",
     "FEMIZER_WAVEGUIDE_VERTICAL_FACTOR": "2.0",
@@ -292,19 +296,27 @@ def build_run_preview(
     configured_count: int,
     result_count: int,
     reuse_existing: bool,
+    use_native_reuse_policy: bool = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
 ) -> str:
     environment_preview = "\n".join(
         f"  {name}={value}" for name, value in DEFAULT_RUN_ENVIRONMENT.items()
     )
-    if reuse_existing:
+    if use_native_reuse_policy:
         reuse_preview = (
-            "Existing-result reuse: enabled",
+            "Existing-result policy: RFPro native Auto/dialog",
+            "RFPro's native analysis launch path will make the final reuse decision.",
+            "An additional native RFPro confirmation may appear; do not approve "
+            "an overwrite unless a full rerun is intended.",
+        )
+    elif reuse_existing:
+        reuse_preview = (
+            "Existing-result policy: scripted reuse",
             "RFPro will be asked to reuse valid existing results.",
             "Missing or invalidated instances may be queued for simulation.",
         )
     else:
         reuse_preview = (
-            "Existing-result reuse: disabled",
+            "Existing-result policy: scripted overwrite",
             "RFPro will be asked to run regardless of existing results.",
             "All configured instances may be queued for simulation.",
         )
@@ -315,6 +327,7 @@ def build_run_preview(
             f"Existing result sets: {result_count}",
             f"Potentially missing instances: {max(configured_count - result_count, 0)}",
             reuse_preview[0],
+            f"Submission option: waitForConfirmation={bool(use_native_reuse_policy)}",
             f"Submission option: reuseExistingIfPossible={bool(reuse_existing)}",
             "",
             "FEM run environment:",
@@ -343,22 +356,30 @@ def _confirm_run(preview: str) -> bool:
 
 
 def run_analysis_reusing_results(
-    run_analysis: Callable[..., Any], analysis: Any, reuse_existing: bool
+    run_analysis: Callable[..., Any],
+    analysis: Any,
+    reuse_existing: bool,
+    use_native_reuse_policy: bool = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
 ) -> Any:
     """Apply persistent FEM settings and submit with the requested reuse mode."""
 
     apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
-    return _submit_analysis(run_analysis, analysis, reuse_existing)
+    return _submit_analysis(
+        run_analysis, analysis, reuse_existing, use_native_reuse_policy
+    )
 
 
 def _submit_analysis(
-    run_analysis: Callable[..., Any], analysis: Any, reuse_existing: bool
+    run_analysis: Callable[..., Any],
+    analysis: Any,
+    reuse_existing: bool,
+    use_native_reuse_policy: bool,
 ) -> Any:
     """Submit an already prepared analysis through the public RFPro API."""
 
     return run_analysis(
         analysis,
-        waitForConfirmation=False,
+        waitForConfirmation=use_native_reuse_policy,
         saveProject=True,
         reuseExistingIfPossible=reuse_existing,
     )
@@ -369,12 +390,15 @@ def save_and_run_analysis(
     run_analysis: Callable[..., Any],
     analysis: Any,
     reuse_existing: bool,
+    use_native_reuse_policy: bool = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
 ) -> Any:
     """Prepare and save synchronously, then submit the requested reuse mode."""
 
     apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
     project.saveActiveProject()
-    return _submit_analysis(run_analysis, analysis, reuse_existing)
+    return _submit_analysis(
+        run_analysis, analysis, reuse_existing, use_native_reuse_policy
+    )
 
 
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -422,11 +446,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     configured_count = _configured_instance_count(analysis)
     result_count = len(_available_result_ids(empro, analysis))
     reuse_existing = DEFAULT_REUSE_EXISTING_RESULTS
+    use_native_reuse_policy = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY
     preview = build_run_preview(
         analysis,
         configured_count,
         result_count,
         reuse_existing,
+        use_native_reuse_policy,
     )
     print(preview)
     if not arguments.yes and not _confirm_run(preview):
@@ -438,11 +464,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         runAnalysis,
         analysis,
         reuse_existing,
+        use_native_reuse_policy,
     )
     reuse_summary = "enabled" if reuse_existing else "disabled"
+    policy_summary = (
+        "RFPro native Auto/dialog"
+        if use_native_reuse_policy
+        else f"scripted reuse {reuse_summary}"
+    )
     summary = (
         f"Saved the active project and started analysis {analysis.name!r} "
-        f"with submission-time existing-result reuse {reuse_summary}. "
+        f"with existing-result policy {policy_summary}. "
         "Required FEM settings remain active for the current RFPro session."
     )
     print(summary)

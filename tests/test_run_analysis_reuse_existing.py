@@ -49,9 +49,11 @@ class ReuseRunnerTests(unittest.TestCase):
     def test_preview_makes_manual_start_and_reuse_explicit(self) -> None:
         preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, True)
         self.assertIn("Potentially missing instances: 2", preview)
-        self.assertIn("Existing-result reuse: enabled", preview)
+        self.assertIn("Existing-result policy: RFPro native Auto/dialog", preview)
+        self.assertIn("Submission option: waitForConfirmation=True", preview)
         self.assertIn("Submission option: reuseExistingIfPossible=True", preview)
-        self.assertIn("reuse valid existing results", preview)
+        self.assertIn("native analysis launch path", preview)
+        self.assertIn("do not approve an overwrite", preview)
         self.assertIn("will be saved before submission", preview)
         self.assertIn("remain set for the current RFPro session", preview)
         self.assertIn("starts the analysis now", preview)
@@ -60,8 +62,9 @@ class ReuseRunnerTests(unittest.TestCase):
         self.assertIn("FEM_ALWAYS_SOLVE_ON_FINEST_MESH=on", preview)
 
     def test_preview_warns_when_reuse_is_disabled(self) -> None:
-        preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, False)
-        self.assertIn("Existing-result reuse: disabled", preview)
+        preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, False, False)
+        self.assertIn("Existing-result policy: scripted overwrite", preview)
+        self.assertIn("Submission option: waitForConfirmation=False", preview)
         self.assertIn("run regardless of existing results", preview)
         self.assertIn("All configured instances may be queued", preview)
 
@@ -83,13 +86,30 @@ class ReuseRunnerTests(unittest.TestCase):
                 (
                     analysis,
                     {
-                        "waitForConfirmation": False,
+                        "waitForConfirmation": True,
                         "saveProject": True,
                         "reuseExistingIfPossible": True,
                     },
                 )
             ],
         )
+
+    def test_scripted_reuse_must_be_explicitly_selected(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run(_analysis: object, **kwargs: object) -> str:
+            calls.append(kwargs)
+            return "queued"
+
+        MODULE.run_analysis_reusing_results(
+            fake_run,
+            FakeAnalysis(),
+            reuse_existing=True,
+            use_native_reuse_policy=False,
+        )
+
+        self.assertEqual(calls[0]["waitForConfirmation"], False)
+        self.assertEqual(calls[0]["reuseExistingIfPossible"], True)
 
     def test_confirmation_is_enabled_by_default(self) -> None:
         arguments = MODULE._parse_arguments([])
@@ -106,6 +126,7 @@ class ReuseRunnerTests(unittest.TestCase):
         def fake_run(_analysis: object, **kwargs: object) -> str:
             events.append("run")
             self.assertFalse(kwargs["reuseExistingIfPossible"])
+            self.assertTrue(kwargs["waitForConfirmation"])
             self.assertTrue(kwargs["saveProject"])
             return "queued"
 
