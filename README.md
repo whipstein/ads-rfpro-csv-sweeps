@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.8.5**.
+The current release is **0.9.0**.
 
 ## Execution model
 
@@ -173,6 +173,13 @@ name>_images` directory, and creates one PDF page per checked point. Each page
 includes the analysis name, point/sequence/combination number, parameter
 values, validity result, and RFPro's failure reason when available. Existing
 image directories are never replaced; a numeric suffix is used instead.
+
+Reports use landscape Letter pages with a compact metadata header so the RFPro
+geometry image receives most of the printable area. Geometry parameters in the
+PDF are converted to `um` and rounded using
+`DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES` near the top of
+`preview_sweep_geometries.py`; the default is three decimal places. Trailing
+zeros are removed for a cleaner presentation.
 
 For every point, the report invokes RFPro's actual **View > Export Image** menu
 action and supplies the numbered PNG path to the save dialog. The file must

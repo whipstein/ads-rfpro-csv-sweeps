@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0 - 2026-08-17
+
+- Change geometry-validation reports to landscape Letter pages and compact the
+  metadata, margins, spacing, and footer so the RFPro geometry occupies most
+  of each page.
+- Convert PDF geometry parameters from their evaluated reference length or
+  explicit display unit to `um`.
+- Add `DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES` near the script settings for
+  configurable rounding; default to three decimal places and trim trailing
+  zeros from the rendered values.
+
 ## 0.8.5 - 2026-08-17
 
 - Complete RFPro's **Enter Name for Geometry Image** `QFileDialog` by setting

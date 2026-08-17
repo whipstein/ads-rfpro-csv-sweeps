@@ -579,7 +579,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             point_index=2,
             sequence_index=1,
             combination_index=4,
-            values=(MODULE.SweepValue("W<1", 1.0, "2 & 3 mm"),),
+            values=(MODULE.SweepValue("W<1", 0.002000003, "2.000003 mm"),),
         )
         page = MODULE.GeometryReportPage(
             point=point,
@@ -595,10 +595,41 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         self.assertIn("Analysis &lt;A&gt;", report_html)
         self.assertIn("W&lt;1", report_html)
-        self.assertIn("2 &amp; 3 mm", report_html)
+        self.assertIn("2000.003 um", report_html)
+        self.assertIn("Geometry parameters (um)", report_html)
         self.assertIn("Sweep point:</b> 3 of 10", report_html)
         self.assertIn("INVALID", report_html)
         self.assertIn("no image &amp; retry", report_html)
+
+    def test_report_geometry_values_are_scaled_and_rounded_in_um(self) -> None:
+        self.assertEqual(
+            MODULE.format_geometry_report_value(
+                MODULE.SweepValue("W", 0.000123456789, "0.123456789 mm"),
+                3,
+            ),
+            "123.457 um",
+        )
+        self.assertEqual(
+            MODULE.format_geometry_report_value(
+                MODULE.SweepValue("Gap", 2.5e-6, "parameter_formula"),
+                4,
+            ),
+            "2.5 um",
+        )
+        self.assertEqual(
+            MODULE.format_geometry_report_value(
+                MODULE.SweepValue("Pitch", 1.0, "4 mil"),
+                2,
+            ),
+            "101.6 um",
+        )
+
+    def test_report_geometry_decimal_setting_is_validated(self) -> None:
+        value = MODULE.SweepValue("W", 1.0e-6, "1 um")
+        with self.assertRaisesRegex(ValueError, "integer from 0 through 12"):
+            MODULE.format_geometry_report_value(value, -1)
+        with self.assertRaisesRegex(ValueError, "integer from 0 through 12"):
+            MODULE.format_geometry_report_value(value, True)
 
     def test_pdf_report_rejects_an_empty_page_set_before_loading_qt(self) -> None:
         with self.assertRaisesRegex(ValueError, "At least one"):

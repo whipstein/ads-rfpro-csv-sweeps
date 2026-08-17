@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import html
 import itertools
+import math
 import os
 import re
 import subprocess
@@ -27,6 +28,8 @@ from typing import Any, Iterable, Sequence
 # Edit this when RFPro's Run Script command cannot pass arguments.
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_ZOOM_TO_EXTENTS = False
+# Number of digits after the decimal point for PDF geometry values in um.
+DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES = 3
 _INSPECTOR_REGISTRY_ATTRIBUTE = "_rfpro_sweep_geometry_inspectors"
 
 
@@ -1316,19 +1319,94 @@ def remove_empty_image_directory(image_directory: Path | None) -> bool:
     return True
 
 
+_REPORT_LENGTH_PATTERN = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"\s*([A-Za-z\u00b5\u03bc\"]*)\s*$"
+)
+_REPORT_LENGTH_TO_UM = {
+    "": 1.0e6,
+    "m": 1.0e6,
+    "cm": 1.0e4,
+    "mm": 1.0e3,
+    "um": 1.0,
+    "micron": 1.0,
+    "microns": 1.0,
+    "nm": 1.0e-3,
+    "pm": 1.0e-6,
+    "mil": 25.4,
+    "mils": 25.4,
+    "in": 25400.0,
+    "inch": 25400.0,
+    "inches": 25400.0,
+    '"': 25400.0,
+}
+
+
+def geometry_report_value_micrometers(value: SweepValue) -> float:
+    """Convert one evaluated length value to micrometers for the PDF."""
+
+    display = str(value.display).replace("\u00b5", "u").replace("\u03bc", "u")
+    match = _REPORT_LENGTH_PATTERN.fullmatch(display)
+    if match is not None:
+        unit = match.group(2).casefold()
+        factor = _REPORT_LENGTH_TO_UM.get(unit)
+        if factor is not None:
+            scaled = float(match.group(1)) * factor
+            if math.isfinite(scaled):
+                return scaled
+    try:
+        reference_value = float(value.value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Geometry parameter {value.parameter_name!r} value "
+            f"{value.display!r} could not be converted to um."
+        ) from error
+    scaled = reference_value * 1.0e6
+    if not math.isfinite(scaled):
+        raise ValueError(
+            f"Geometry parameter {value.parameter_name!r} is not finite."
+        )
+    return scaled
+
+
+def format_geometry_report_value(
+    value: SweepValue,
+    decimal_places: int = DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES,
+) -> str:
+    """Format one geometry length as a rounded, compact ASCII um value."""
+
+    if (
+        isinstance(decimal_places, bool)
+        or not isinstance(decimal_places, int)
+        or not 0 <= decimal_places <= 12
+    ):
+        raise ValueError(
+            "PDF geometry decimal places must be an integer from 0 through 12."
+        )
+    scaled = geometry_report_value_micrometers(value)
+    rounded = round(scaled, decimal_places)
+    if rounded == 0:
+        rounded = 0.0
+    text = f"{rounded:.{decimal_places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text} um"
+
+
 def _geometry_report_page_html(
     analysis_name: str,
     page: GeometryReportPage,
     page_number: int,
     report_page_count: int,
     total_point_count: int,
+    parameter_decimal_places: int = DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES,
 ) -> str:
     """Render the wrapped metadata header used on one PDF page."""
 
     point = page.point
     parameters = " &nbsp; | &nbsp; ".join(
         f"<b>{html.escape(value.parameter_name)}</b>="
-        f"{html.escape(value.display)}"
+        f"{html.escape(format_geometry_report_value(value, parameter_decimal_places))}"
         for value in point.values
     ) or "(baseline parameters)"
     if page.valid is True:
@@ -1346,20 +1424,19 @@ def _geometry_report_page_html(
 
     return f"""
 <style>
-  body {{ font-family: sans-serif; font-size: 9pt; color: #202124; }}
-  h1 {{ font-size: 18pt; margin: 0 0 6px 0; }}
-  p {{ margin: 2px 0; }}
+  body {{ font-family: sans-serif; font-size: 8.5pt; color: #202124; }}
+  h1 {{ font-size: 15pt; margin: 0 0 3px 0; }}
+  p {{ margin: 1px 0; }}
 </style>
 <h1>RFPro Geometry Validation</h1>
-<p><b>Analysis:</b> {html.escape(str(analysis_name))}</p>
-<p><b>Sweep point:</b> {point.point_index + 1} of {total_point_count}
+<p><b>Analysis:</b> {html.escape(str(analysis_name))}
+   &nbsp;&nbsp; <b>Sweep point:</b> {point.point_index + 1} of {total_point_count}
    &nbsp;&nbsp; <b>Sequence:</b> {point.sequence_index + 1}
    &nbsp;&nbsp; <b>Combination:</b> {point.combination_index + 1}</p>
-<p style="margin-top: 6px;"><b>Parameters:</b> {parameters}</p>
-<p style="color: {status_color}; margin-top: 6px;">
+<p style="margin-top: 3px;"><b>Geometry parameters (um):</b> {parameters}</p>
+<p style="color: {status_color}; margin-top: 3px;">
   <b>{status}:</b> {html.escape(details)}
 </p>
-<p style="color: #5f6368;">Report page {page_number} of {report_page_count}</p>
 """.strip()
 
 
@@ -1368,6 +1445,7 @@ def write_geometry_pdf_report(
     analysis_name: str,
     pages: Sequence[GeometryReportPage],
     total_point_count: int,
+    parameter_decimal_places: int = DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES,
 ) -> None:
     """Create a fitted multi-page PDF using RFPro's existing PySide6 runtime."""
 
@@ -1378,6 +1456,7 @@ def write_geometry_pdf_report(
     from PySide6.QtGui import (
         QColor,
         QImage,
+        QPageLayout,
         QPageSize,
         QPainter,
         QPdfWriter,
@@ -1389,11 +1468,14 @@ def write_geometry_pdf_report(
     writer.setTitle(f"RFPro Geometry Validation - {analysis_name}")
     writer.setResolution(150)
     writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
+    if not writer.setPageOrientation(QPageLayout.Orientation.Landscape):
+        raise RuntimeError("Qt could not set the PDF report to landscape mode.")
 
     painter = QPainter()
     if not painter.begin(writer):
         raise RuntimeError(f"Qt could not create the PDF report at {output_path}.")
     try:
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         for page_index, report_page in enumerate(pages):
             if page_index and not writer.newPage():
                 raise RuntimeError(
@@ -1402,9 +1484,9 @@ def write_geometry_pdf_report(
 
             page_width = float(writer.width())
             page_height = float(writer.height())
-            margin = float(writer.resolution()) * 0.45
-            spacing = float(writer.resolution()) * 0.12
-            footer_height = float(writer.resolution()) * 0.22
+            margin = float(writer.resolution()) * 0.22
+            spacing = float(writer.resolution()) * 0.05
+            footer_height = float(writer.resolution()) * 0.16
             content_width = page_width - 2.0 * margin
 
             header = QTextDocument()
@@ -1415,11 +1497,12 @@ def write_geometry_pdf_report(
                     page_index + 1,
                     len(pages),
                     total_point_count,
+                    parameter_decimal_places,
                 )
             )
             header.setTextWidth(content_width)
             natural_header_height = float(header.size().height())
-            maximum_header_height = page_height * 0.42
+            maximum_header_height = page_height * 0.25
             header_scale = min(
                 1.0, maximum_header_height / max(1.0, natural_header_height)
             )
