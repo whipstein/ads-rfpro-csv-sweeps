@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2 - 2026-08-17
+
+- Derive resampled MDIF frequency regions from the selected analysis's enabled
+  `femFrequencyPlanList()` entries instead of circuit-result sample locations.
+- Preserve configured single-frequency plans such as DC and independently
+  sample each configured range without filling gaps between plans.
+- Print the exact enabled analysis frequency regions before exporting.
+
 ## 0.7.1 - 2026-08-17
 
 - Preserve a simulated DC sample as a standalone export point instead of

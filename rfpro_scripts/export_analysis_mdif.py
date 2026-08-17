@@ -64,6 +64,14 @@ class FrequencyGridRequest:
     step_hz: float | None = None
 
 
+@dataclass(frozen=True)
+class FrequencyRegion:
+    """One enabled frequency-plan region from the selected RFPro analysis."""
+
+    start_hz: float
+    stop_hz: float
+
+
 def _expected_qt_platform_plugin() -> str:
     if sys.platform.startswith("linux"):
         return "libqxcb.so"
@@ -552,60 +560,98 @@ def frequency_grid_description(request: FrequencyGridRequest) -> str:
         return "native result frequencies"
     if request.mode == "points":
         return (
-            f"{request.point_count:,} uniformly spaced non-DC points "
-            "(plus DC when present)"
+            f"{request.point_count:,} uniformly spaced points per configured range "
+            "(configured single points retained)"
         )
     return (
-        f"{request.step_hz:.16g} Hz maximum non-DC step "
-        "(plus DC when present)"
+        f"{request.step_hz:.16g} Hz maximum step per configured range "
+        "(configured single points retained)"
     )
 
 
-def build_frequency_grid(
-    native_frequencies_hz: Sequence[float], request: FrequencyGridRequest
-) -> tuple[float, ...]:
-    """Resample the positive native span while preserving an isolated DC point."""
+def configured_frequency_regions(settings: Any) -> tuple[FrequencyRegion, ...]:
+    """Read and normalize enabled FEM frequency plans from an analysis."""
 
-    native = tuple(float(value) for value in native_frequencies_hz)
-    if not native:
-        raise ValueError("S-parameter data is empty.")
-    if any(not math.isfinite(value) for value in native):
-        raise ValueError("Native frequency data contains NaN or infinity.")
-
-    request = validate_frequency_grid_request(request)
-    if request.mode == "native":
-        return native
-
-    if any(value < 0.0 for value in native):
-        raise ValueError("Cannot resample negative native frequencies.")
-
-    dc_prefix = (0.0,) if 0.0 in native else ()
-    positive_frequencies = tuple(value for value in native if value > 0.0)
-    if not positive_frequencies:
-        return dc_prefix
-
-    start = min(positive_frequencies)
-    stop = max(positive_frequencies)
-    if start == stop:
-        return (*dc_prefix, start)
-
-    if request.mode == "points":
-        assert request.point_count is not None
-        denominator = request.point_count - 1
-        span = stop - start
-        grid = tuple(
-            start + span * index / denominator
-            for index in range(request.point_count)
+    plan_list_method = getattr(settings, "femFrequencyPlanList", None)
+    if not callable(plan_list_method):
+        raise RuntimeError(
+            "The selected analysis does not expose femFrequencyPlanList()."
         )
-        return (*dc_prefix, *grid[:-1], stop)
+    try:
+        plans = list(plan_list_method())
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not read the selected analysis frequency plans: {error}"
+        ) from error
 
-    assert request.step_hz is not None
+    regions: list[FrequencyRegion] = []
+    for index, plan in enumerate(plans):
+        if not bool(getattr(plan, "enabled", True)):
+            continue
+        try:
+            start_hz = float(plan.startFrequency)
+            stop_hz = float(plan.stopFrequency)
+        except Exception as error:
+            raise ValueError(
+                f"Enabled frequency plan {index + 1} has unreadable endpoints: {error}"
+            ) from error
+        if not math.isfinite(start_hz) or not math.isfinite(stop_hz):
+            raise ValueError(
+                f"Enabled frequency plan {index + 1} has a non-finite endpoint."
+            )
+        if start_hz < 0.0 or stop_hz < 0.0:
+            raise ValueError(
+                f"Enabled frequency plan {index + 1} has a negative endpoint."
+            )
+        if stop_hz < start_hz:
+            raise ValueError(
+                f"Enabled frequency plan {index + 1} stops below its start "
+                f"({start_hz:.16g} Hz > {stop_hz:.16g} Hz)."
+            )
+        regions.append(FrequencyRegion(start_hz, stop_hz))
+
+    if not regions:
+        raise RuntimeError(
+            "The selected analysis has no enabled FEM frequency plans."
+        )
+
+    normalized: list[FrequencyRegion] = []
+    for region in sorted(regions, key=lambda item: (item.start_hz, item.stop_hz)):
+        if not normalized or region != normalized[-1]:
+            normalized.append(region)
+    return tuple(normalized)
+
+
+def frequency_regions_description(regions: Sequence[FrequencyRegion]) -> str:
+    descriptions = []
+    for region in regions:
+        if region.start_hz == region.stop_hz:
+            descriptions.append(f"{region.start_hz:.16g} Hz")
+        else:
+            descriptions.append(
+                f"{region.start_hz:.16g}..{region.stop_hz:.16g} Hz"
+            )
+    return ", ".join(descriptions)
+
+
+def _grid_by_point_count(start: float, stop: float, point_count: int) -> list[float]:
+    denominator = point_count - 1
     span = stop - start
-    quotient = span / request.step_hz
+    grid = [
+        start + span * index / denominator
+        for index in range(point_count)
+    ]
+    grid[-1] = stop
+    return grid
+
+
+def _grid_by_step(start: float, stop: float, step_hz: float) -> list[float]:
+    span = stop - start
+    quotient = span / step_hz
     if not math.isfinite(quotient) or quotient > MAX_FREQUENCY_POINTS:
         raise ValueError(
             "The requested frequency step would exceed the safety limit of "
-            f"{MAX_FREQUENCY_POINTS:,} points."
+            f"{MAX_FREQUENCY_POINTS:,} points in one configured range."
         )
     nearest_integer = round(quotient)
     exact_multiple = nearest_integer >= 1 and math.isclose(
@@ -618,15 +664,61 @@ def build_frequency_grid(
     point_count = int(full_intervals) + 1 + (0 if exact_multiple else 1)
     if point_count > MAX_FREQUENCY_POINTS:
         raise ValueError(
-            f"The requested frequency step would create {point_count:,} points; "
-            f"the safety limit is {MAX_FREQUENCY_POINTS:,}."
+            f"The requested frequency step would create {point_count:,} points "
+            f"in one configured range; the safety limit is {MAX_FREQUENCY_POINTS:,}."
         )
-    grid = [start + index * request.step_hz for index in range(int(full_intervals) + 1)]
+    grid = [start + index * step_hz for index in range(int(full_intervals) + 1)]
     if exact_multiple:
         grid[-1] = stop
     else:
         grid.append(stop)
-    return (*dc_prefix, *grid)
+    return grid
+
+
+def build_frequency_grid(
+    native_frequencies_hz: Sequence[float],
+    request: FrequencyGridRequest,
+    configured_regions: Sequence[FrequencyRegion] | None = None,
+) -> tuple[float, ...]:
+    """Build a grid within the selected analysis's configured frequency plans."""
+
+    native = tuple(float(value) for value in native_frequencies_hz)
+    if not native:
+        raise ValueError("S-parameter data is empty.")
+    if any(not math.isfinite(value) for value in native):
+        raise ValueError("Native frequency data contains NaN or infinity.")
+
+    request = validate_frequency_grid_request(request)
+    if request.mode == "native":
+        return native
+
+    if not configured_regions:
+        raise ValueError(
+            "Configured analysis frequency regions are required for resampling."
+        )
+
+    frequencies: list[float] = []
+    for region in configured_regions:
+        start = float(region.start_hz)
+        stop = float(region.stop_hz)
+        if start == stop:
+            region_grid = [start]
+        elif request.mode == "points":
+            assert request.point_count is not None
+            region_grid = _grid_by_point_count(start, stop, request.point_count)
+        else:
+            assert request.step_hz is not None
+            region_grid = _grid_by_step(start, stop, request.step_hz)
+
+        prospective_count = len(frequencies) + len(region_grid)
+        if prospective_count > MAX_FREQUENCY_POINTS:
+            raise ValueError(
+                f"The configured plans would export at least {prospective_count:,} "
+                "points; "
+                f"the safety limit is {MAX_FREQUENCY_POINTS:,}."
+            )
+        frequencies.extend(region_grid)
+    return tuple(sorted(set(frequencies)))
 
 
 def circuit_matrix_to_block(
@@ -634,6 +726,7 @@ def circuit_matrix_to_block(
     simulation_id: str,
     parameters: Mapping[str, str],
     frequency_grid_request: FrequencyGridRequest | None = None,
+    configured_regions: Sequence[FrequencyRegion] | None = None,
 ) -> MDIFBlock:
     """Convert a file-backed RFPro ``CircuitMatrix`` into an MDIF block."""
 
@@ -647,6 +740,7 @@ def circuit_matrix_to_block(
         frequencies = build_frequency_grid(
             native_frequencies,
             frequency_grid_request or FrequencyGridRequest("native"),
+            configured_regions=configured_regions,
         )
     except ValueError as error:
         raise ValueError(f"Simulation {simulation_id}: {error}") from error
@@ -718,6 +812,7 @@ def collect_analysis_blocks(
     parameter_names: Sequence[str],
     skip_errors: bool,
     frequency_grid_request: FrequencyGridRequest | None = None,
+    configured_regions: Sequence[FrequencyRegion] | None = None,
 ) -> list[MDIFBlock]:
     """Walk public RFPro analysis outputs and extract every usable S-matrix."""
 
@@ -783,6 +878,7 @@ def collect_analysis_blocks(
                 simulation_id=str(simulation_id),
                 parameters=selected,
                 frequency_grid_request=frequency_grid_request,
+                configured_regions=configured_regions,
             )
             if blocks and block.labels != blocks[0].labels:
                 raise ValueError(
@@ -980,8 +1076,8 @@ def _choose_frequency_grid_request(
         point_count, accepted = QInputDialog.getInt(
             None,
             "RFPro MDIF Frequency Grid",
-            "Number of non-DC points, including both range endpoints:\n"
-            "(A simulated DC point is added separately.)",
+            "Number of points in each configured range, including endpoints:\n"
+            "(Configured single-frequency plans are retained separately.)",
             max(2, min(int(DEFAULT_FREQUENCY_POINTS), MAX_FREQUENCY_POINTS)),
             2,
             MAX_FREQUENCY_POINTS,
@@ -1046,15 +1142,15 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--frequency-points",
         type=int,
         help=(
-            "export this many uniformly spaced points over each result's "
-            "inclusive native frequency span"
+            "export this many uniformly spaced points over each configured "
+            "analysis range; retain configured single frequencies"
         ),
     )
     frequency_group.add_argument(
         "--frequency-step",
         help=(
-            "export with this maximum step over each result's inclusive native "
-            "span; accepts Hz, kHz, MHz, GHz, or THz"
+            "export with this maximum step inside each configured analysis "
+            "range; accepts Hz, kHz, MHz, GHz, or THz"
         ),
     )
     parser.add_argument(
@@ -1111,6 +1207,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     analysis = _choose_analysis(empro.activeProject, arguments.analysis)
     frequency_grid_request = _choose_frequency_grid_request(requested_frequency_grid)
     print("Frequency grid: " + frequency_grid_description(frequency_grid_request))
+    frequency_regions: tuple[FrequencyRegion, ...] | None = None
+    if frequency_grid_request.mode != "native":
+        frequency_regions = configured_frequency_regions(analysis.simulationSettings)
+        print(
+            "Enabled analysis frequency plans: "
+            + frequency_regions_description(frequency_regions)
+        )
     output_path = _choose_output_path(arguments.output, str(analysis.name))
     if output_path.exists() and not arguments.overwrite and not _confirm_overwrite(output_path):
         print("Export cancelled; the existing MDIF was not changed.")
@@ -1122,6 +1225,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parameter_names=parameter_names,
         skip_errors=arguments.skip_errors,
         frequency_grid_request=frequency_grid_request,
+        configured_regions=frequency_regions,
     )
     write_mdif_atomic(output_path, blocks, arguments.reference_impedance)
     summary = (

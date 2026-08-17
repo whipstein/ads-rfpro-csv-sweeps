@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.7.1**.
+The current release is **0.7.2**.
 
 ## Execution model
 
@@ -325,18 +325,20 @@ Use exactly one of these frequency-grid options:
 --frequency-step "25 MHz"
 ```
 
-Point-count mode includes both positive-range endpoints and spaces the
-requested number of points uniformly from the first positive native frequency
-through the native maximum. Step mode starts at that same first positive
-frequency, retains the requested spacing, and always includes the native
-maximum; its final interval is shorter when the range is not an exact multiple
-of the step.
+For point-count and step-size modes, the exporter reads the enabled
+`FrequencyPlan` entries from the selected analysis's
+`simulationSettings.femFrequencyPlanList()`. It does not infer range boundaries
+from the circuit result's internal sample frequencies.
 
-When a result also contains a DC sample at 0 Hz, the exporter preserves it as
-one additional standalone point. It does not generate artificial frequencies
-between DC and the first positive simulated frequency. Thus
-`--frequency-points 401` means 401 points across the positive frequency range,
-plus DC when present.
+Each configured single-frequency plan is emitted once. Each configured range
+is sampled independently, including both of its configured endpoints, so no
+data is generated across gaps between plans. For example, plans for `0..0 Hz`
+and `1..20 GHz` produce one DC row followed by the requested sampling from
+exactly 1 GHz through 20 GHz. With `--frequency-points 401`, each configured
+non-single range receives 401 points; configured single points such as DC are
+additional. Step mode retains the requested spacing inside every configured
+range and uses a shorter final interval when necessary to include its exact
+stop frequency.
 
 Unitless step values are hertz, and `Hz`, `kHz`, `MHz`, `GHz`, and `THz` are
 accepted. RFPro evaluates every requested S-matrix through the public
@@ -458,6 +460,9 @@ Update 2.1 and EMPro 2026 corpus:
   `SimulationOutput.metadata`, `SimulationOutput.simulationPath`,
   `DataSetMatrix`, `empro.toolkit.getCircuitMatrix()`, and
   `CircuitMatrix.Smatrix(frequency)` for frequency-grid evaluation.
+- `SimulationData.femFrequencyPlanList()` and the public `FrequencyPlan`
+  `enabled`, `startFrequency`, and `stopFrequency` properties for deriving the
+  selected analysis's exact configured frequency regions.
 - `empro.toolkit.analysis.runAnalysis()` and its
   `reuseExistingIfPossible=True` option for explicitly starting only after the
   user confirms.

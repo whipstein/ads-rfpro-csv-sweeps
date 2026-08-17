@@ -17,6 +17,12 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+POSITIVE_RANGE = (MODULE.FrequencyRegion(1.0e9, 2.0e9),)
+DC_AND_POSITIVE_RANGE = (
+    MODULE.FrequencyRegion(0.0, 0.0),
+    MODULE.FrequencyRegion(1.0e9, 2.0e9),
+)
+
 
 class FakeDimension:
     def __init__(self, values: list[float]) -> None:
@@ -113,11 +119,14 @@ class FakeCircuitMatrix:
 class FakeDcCircuitMatrix(FakeCircuitMatrix):
     def __init__(self) -> None:
         super().__init__()
-        self._frequencies = [0.0, 1.0e9, 2.0e9]
+        # RFPro's circuit sampling may represent a configured DC solve with a
+        # small positive internal sample. The analysis plan remains exactly DC.
+        self._frequencies = [1.0e-6, 1.0e9, 2.0e9]
         self._values[0.0] = [
             [0.0 + 0.0j, 0.0 + 0.0j],
             [0.0 + 0.0j, 0.0 + 0.0j],
         ]
+        self._values[1.0e-6] = self._values[0.0]
 
 
 class FakeSweep:
@@ -127,6 +136,21 @@ class FakeSweep:
 
     def getParameterValues(self, mode: str = "") -> list[str]:
         return self.values
+
+
+class FakeFrequencyPlan:
+    def __init__(self, start: float, stop: float, enabled: bool = True) -> None:
+        self.startFrequency = start
+        self.stopFrequency = stop
+        self.enabled = enabled
+
+
+class FakeFrequencySettings:
+    def __init__(self, plans: list[FakeFrequencyPlan]) -> None:
+        self._plans = plans
+
+    def femFrequencyPlanList(self) -> list[FakeFrequencyPlan]:
+        return self._plans
 
 
 class FakeSettings:
@@ -218,6 +242,7 @@ class MDIFExportTests(unittest.TestCase):
         grid = MODULE.build_frequency_grid(
             [1.0e9, 2.0e9],
             MODULE.FrequencyGridRequest("points", point_count=5),
+            configured_regions=POSITIVE_RANGE,
         )
         self.assertEqual(
             grid,
@@ -228,37 +253,60 @@ class MDIFExportTests(unittest.TestCase):
         grid = MODULE.build_frequency_grid(
             [1.0e9, 2.0e9],
             MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+            configured_regions=POSITIVE_RANGE,
         )
         self.assertEqual(grid, (1.0e9, 1.4e9, 1.8e9, 2.0e9))
         exact_grid = MODULE.build_frequency_grid(
             [1.0e9, 2.0e9],
             MODULE.FrequencyGridRequest("step", step_hz=500.0e6),
+            configured_regions=POSITIVE_RANGE,
         )
         self.assertEqual(exact_grid, (1.0e9, 1.5e9, 2.0e9))
         wider_than_span = MODULE.build_frequency_grid(
             [1.0e9, 2.0e9],
             MODULE.FrequencyGridRequest("step", step_hz=10.0e12),
+            configured_regions=POSITIVE_RANGE,
         )
         self.assertEqual(wider_than_span, (1.0e9, 2.0e9))
 
     def test_step_grid_preserves_dc_without_filling_the_gap(self) -> None:
         grid = MODULE.build_frequency_grid(
-            [0.0, 1.0e9, 1.5e9, 2.0e9],
+            [1.0e-6, 1.0e9, 1.5e9, 2.0e9],
             MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+            configured_regions=DC_AND_POSITIVE_RANGE,
         )
         self.assertEqual(grid, (0.0, 1.0e9, 1.4e9, 1.8e9, 2.0e9))
         self.assertNotIn(400.0e6, grid)
         self.assertNotIn(800.0e6, grid)
 
-    def test_point_count_applies_to_non_dc_range_and_dc_is_additional(self) -> None:
+    def test_each_configured_range_is_sampled_without_filling_gaps(self) -> None:
+        regions = (
+            MODULE.FrequencyRegion(0.0, 0.0),
+            MODULE.FrequencyRegion(1.0e9, 2.0e9),
+            MODULE.FrequencyRegion(3.0e9, 4.0e9),
+        )
         grid = MODULE.build_frequency_grid(
-            [0.0, 1.0e9, 2.0e9],
+            [1.0e-6, 1.0e9, 4.0e9],
+            MODULE.FrequencyGridRequest("step", step_hz=600.0e6),
+            configured_regions=regions,
+        )
+        self.assertEqual(
+            grid,
+            (0.0, 1.0e9, 1.6e9, 2.0e9, 3.0e9, 3.6e9, 4.0e9),
+        )
+        self.assertNotIn(2.6e9, grid)
+
+    def test_point_count_applies_per_configured_range(self) -> None:
+        grid = MODULE.build_frequency_grid(
+            [1.0e-6, 1.0e9, 2.0e9],
             MODULE.FrequencyGridRequest("points", point_count=3),
+            configured_regions=DC_AND_POSITIVE_RANGE,
         )
         self.assertEqual(grid, (0.0, 1.0e9, 1.5e9, 2.0e9))
         dc_only = MODULE.build_frequency_grid(
-            [0.0],
+            [1.0e-6],
             MODULE.FrequencyGridRequest("points", point_count=3),
+            configured_regions=(MODULE.FrequencyRegion(0.0, 0.0),),
         )
         self.assertEqual(dc_only, (0.0,))
 
@@ -269,6 +317,7 @@ class MDIFExportTests(unittest.TestCase):
             "000001",
             {"W": "1 mm"},
             MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+            configured_regions=DC_AND_POSITIVE_RANGE,
         )
         expected = (0.0, 1.0e9, 1.4e9, 1.8e9, 2.0e9)
         self.assertEqual(block.frequencies_hz, expected)
@@ -281,11 +330,32 @@ class MDIFExportTests(unittest.TestCase):
             "000001",
             {"W": "1 mm"},
             MODULE.FrequencyGridRequest("points", point_count=3),
+            configured_regions=POSITIVE_RANGE,
         )
         self.assertEqual(block.frequencies_hz, (1.0e9, 1.5e9, 2.0e9))
         self.assertEqual(matrix.sampled_frequencies, [1.0e9, 1.5e9, 2.0e9])
         self.assertAlmostEqual(block.values[1][0].real, 0.15)
         self.assertAlmostEqual(block.values[1][0].imag, 0.25)
+
+    def test_enabled_analysis_frequency_plans_define_export_regions(self) -> None:
+        settings = FakeFrequencySettings(
+            [
+                FakeFrequencyPlan(0.0, 0.0),
+                FakeFrequencyPlan(1.0e9, 2.0e9),
+                FakeFrequencyPlan(100.0e6, 200.0e6, enabled=False),
+            ]
+        )
+        self.assertEqual(
+            MODULE.configured_frequency_regions(settings),
+            DC_AND_POSITIVE_RANGE,
+        )
+
+    def test_resampling_requires_analysis_frequency_regions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "required"):
+            MODULE.build_frequency_grid(
+                [1.0e-6, 1.0e9, 2.0e9],
+                MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+            )
 
     def test_frequency_options_create_the_requested_mode(self) -> None:
         point_arguments = MODULE._parse_arguments(["--frequency-points", "101"])
