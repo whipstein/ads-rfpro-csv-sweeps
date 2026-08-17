@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.8.0**.
+The current release is **0.8.1**.
 
 ## Execution model
 
@@ -147,6 +147,19 @@ View** only fits the geometry that is currently displayed; it does not change
 the project parameters. Use **Load Selected** to explicitly regenerate and
 display the highlighted table row, including when that row was already
 selected and therefore did not emit another selection-change event.
+
+Setting `activeProject.parameters` changes the values shown in RFPro's
+Parameters dialog, but that alone does not regenerate the layout PCell. After
+loading the OA design-spec parameter metadata, the inspector therefore resets
+and assigns the point formulas and submits only the swept parameter mapping to
+the active layout's native `_updateDesignParameters(Mapping[str, str])`
+binding. It pumps RFPro's event loop before repainting and fitting the model.
+The same path restores the baseline geometry when the inspector closes.
+
+This targeted ADS 2026 Update 2.1 binding is not part of the public EMPro
+Python API, but is the required live RFPro geometry-update path established in
+`ads-rfpro-pcell-recovery`. The inspector deliberately does not call
+`layout.refresh()`, replace the RFPro view, or clear `.adsPcells`.
 
 **Check All** regenerates every point and records the result of RFPro's public
 `activeProject.geometry.isValid()` check. Invalid points are highlighted and
@@ -500,6 +513,13 @@ Update 2.1 and EMPro 2026 corpus:
 - Qt for Python's public `QOpenGLWidget.grabFramebuffer()`, `QWidget.grab()`,
   `QImage.save()`, and `QPdfWriter`/`QPainter` APIs for in-session image capture
   and multi-page PDF generation without an additional PDF dependency.
+
+The inspector's `_loadOaParametersFromDesignSpec()` and
+`layout._updateDesignParameters()` calls are intentional implementation-level
+exceptions. ADS 2026 Update 2.1 does not expose a public equivalent that
+regenerates the active RFPro PCell after `ParameterList.setFormula()`; the
+targeted call signature and lifecycle are carried over from the verified
+`ads-rfpro-pcell-recovery` runtime helper.
 
 The three private FEM environment variables used by the explicit runner are
 intentional project requirements supplied for the target RFPro installation;

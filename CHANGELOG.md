@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1 - 2026-08-17
+
+- Submit every loaded sweep point through the active RFPro layout's targeted
+  `_updateDesignParameters(Mapping[str, str])` binding after loading the OA
+  design-spec parameters, so visible formula changes regenerate PCell artwork.
+- Use the same targeted geometry update when restoring the original parameter
+  formulas, keeping the displayed model consistent with the Parameters dialog.
+- Pump the RFPro event loop before and after repainting the geometry view and
+  before fitting the regenerated model.
+- Continue to avoid `layout.refresh()` and workspace-wide `.adsPcells` changes.
+
 ## 0.8.0 - 2026-08-17
 
 - Add an explicit **Load Selected** inspector action that regenerates the

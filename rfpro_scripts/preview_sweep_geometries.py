@@ -419,6 +419,76 @@ def restore_parameter_formulas(project: Any, baseline_formulas: dict[str, Any]) 
         project.parameters.setFormula(name, formula)
 
 
+def _native_geometry_update_bindings(project: Any) -> tuple[Any, Any]:
+    """Resolve the targeted RFPro PCell update path before changing formulas."""
+
+    load_design_parameters = getattr(
+        project, "_loadOaParametersFromDesignSpec", None
+    )
+    if not callable(load_design_parameters):
+        raise RuntimeError(
+            "The active RFPro project does not expose the ADS 2026 design-spec "
+            "parameter loader _loadOaParametersFromDesignSpec()."
+        )
+
+    layout = getattr(project, "layout", None)
+    native_update = getattr(layout, "_updateDesignParameters", None)
+    if not callable(native_update):
+        raise RuntimeError(
+            "The active RFPro layout does not expose the targeted PCell geometry "
+            "updater _updateDesignParameters(Mapping[str, str])."
+        )
+    return load_design_parameters, native_update
+
+
+def _current_parameter_formula_strings(
+    project: Any, parameter_names: Iterable[str]
+) -> dict[str, str]:
+    """Read the formulas that will be passed to RFPro's layout updater."""
+
+    formula_method = getattr(project.parameters, "formula", None)
+    if not callable(formula_method):
+        raise RuntimeError(
+            "The active RFPro project does not expose ParameterList.formula()."
+        )
+
+    updates: dict[str, str] = {}
+    for name in parameter_names:
+        formula = str(formula_method(name))
+        if not formula:
+            raise ValueError(f"RFPro parameter {name!r} has an empty formula.")
+        updates[name] = formula
+    if not updates:
+        raise ValueError("At least one RFPro geometry parameter is required.")
+    return updates
+
+
+def apply_sweep_point_to_geometry(
+    project: Any, baseline_formulas: dict[str, Any], point: SweepPoint
+) -> dict[str, Any]:
+    """Set one point and submit its formulas to the active layout updater."""
+
+    load_design_parameters, native_update = _native_geometry_update_bindings(project)
+    load_design_parameters()
+    apply_sweep_point(project, baseline_formulas, point)
+    updates = _current_parameter_formula_strings(project, baseline_formulas)
+    native_status = native_update(updates)
+    return {"updates": updates, "native_status": str(native_status)}
+
+
+def restore_parameter_formulas_and_geometry(
+    project: Any, baseline_formulas: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore baseline formulas and regenerate their active-layout geometry."""
+
+    load_design_parameters, native_update = _native_geometry_update_bindings(project)
+    load_design_parameters()
+    restore_parameter_formulas(project, baseline_formulas)
+    updates = _current_parameter_formula_strings(project, baseline_formulas)
+    native_status = native_update(updates)
+    return {"updates": updates, "native_status": str(native_status)}
+
+
 def geometry_validity(project: Any) -> tuple[bool | None, str]:
     """Return the public project-geometry validity result when available."""
 
@@ -449,11 +519,13 @@ def refresh_geometry_view(empro_module: Any, zoom_to_extents: bool = False) -> N
 
     project_view = empro_module.gui.activeProjectView()
     project_view.showGeometryView()
+    empro_module.gui.processEvents()
     geometry_view = project_view.geometryView()
     geometry_view.updateView()
+    empro_module.gui.processEvents()
     if zoom_to_extents:
         geometry_view.zoomGeometryViewToExtents()
-    empro_module.gui.processEvents()
+        empro_module.gui.processEvents()
 
 
 def _usable_capture_image(value: Any) -> Any | None:
@@ -953,17 +1025,28 @@ def create_inspector_dialog(
             self.next_button.setEnabled(current_row + 1 < len(points))
 
         def _apply_row(
-            self, row: int, force_fit: bool | None = None
+            self,
+            row: int,
+            force_fit: bool | None = None,
+            log_native_status: bool = True,
         ) -> bool:
             if self._applying or row < 0 or row >= len(points):
                 return False
             self._applying = True
             try:
-                apply_sweep_point(project, baseline_formulas, points[row])
+                update_report = apply_sweep_point_to_geometry(
+                    project, baseline_formulas, points[row]
+                )
+                empro_module.gui.processEvents()
                 fit_view = zoom_to_extents if force_fit is None else force_fit
                 refresh_geometry_view(empro_module, fit_view)
                 valid, message = geometry_validity(project)
                 self._set_status(row, valid, message)
+                if log_native_status:
+                    print(
+                        f"Loaded geometry point {row + 1}: RFPro native update "
+                        f"status={update_report['native_status']!r}."
+                    )
                 return True
             except Exception as error:
                 message = f"Could not generate geometry: {error}"
@@ -1057,7 +1140,9 @@ def create_inspector_dialog(
                 progress.setValue(row)
                 empro_module.gui.processEvents()
                 generated = self._apply_row(
-                    row, force_fit=True if pdf_path is not None else None
+                    row,
+                    force_fit=True if pdf_path is not None else None,
+                    log_native_status=False,
                 )
                 if pdf_path is not None:
                     status = self._statuses[row]
@@ -1149,9 +1234,16 @@ def create_inspector_dialog(
                 return
             self._restored = True
             try:
-                restore_parameter_formulas(project, baseline_formulas)
+                update_report = restore_parameter_formulas_and_geometry(
+                    project, baseline_formulas
+                )
+                empro_module.gui.processEvents()
                 refresh_geometry_view(empro_module, zoom_to_extents)
-                print("Restored original RFPro project-parameter formulas.")
+                print(
+                    "Restored original RFPro project-parameter formulas and "
+                    "geometry: native update status="
+                    f"{update_report['native_status']!r}."
+                )
             except Exception as error:
                 print(f"WARNING: could not restore original parameter formulas: {error}")
 
@@ -1237,7 +1329,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         _show_modeless(qt_runtime.application, dialog)
     except Exception:
         try:
-            restore_parameter_formulas(project, baseline_formulas)
+            restore_parameter_formulas_and_geometry(project, baseline_formulas)
+            empro.gui.processEvents()
             refresh_geometry_view(empro, arguments.zoom_to_extents)
         except Exception as restore_error:
             print(

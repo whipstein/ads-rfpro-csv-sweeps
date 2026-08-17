@@ -61,12 +61,26 @@ class FakeGeometry:
         return self.reason
 
 
+class FakeLayout:
+    def __init__(self) -> None:
+        self.received_updates: list[dict[str, str]] = []
+
+    def _updateDesignParameters(self, updates: dict[str, str]) -> str:
+        self.received_updates.append(dict(updates))
+        return "native update accepted"
+
+
 class FakeProject:
     def __init__(
         self, formulas: dict[str, object], valid: bool = True, reason: str = ""
     ) -> None:
         self.parameters = FakeParameters(formulas)
         self.geometry = FakeGeometry(valid, reason)
+        self.layout = FakeLayout()
+        self.load_design_parameter_calls = 0
+
+    def _loadOaParametersFromDesignSpec(self) -> None:
+        self.load_design_parameter_calls += 1
 
 
 class FakeSignal:
@@ -234,6 +248,40 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             project, {"W": "base-W", "L": "base-L"}
         )
         self.assertEqual(project.parameters.formulas["L"], "base-L")
+
+    def test_sweep_point_is_submitted_to_rfpro_native_geometry_updater(self) -> None:
+        project = FakeProject(
+            {"W": "base-W", "L": "base-L", "unrelated": "7 mm"}
+        )
+        point = MODULE.SweepPoint(
+            point_index=0,
+            sequence_index=0,
+            combination_index=0,
+            values=(MODULE.SweepValue("L", "3 mm", "3 mm"),),
+        )
+
+        report = MODULE.apply_sweep_point_to_geometry(
+            project, {"W": "base-W", "L": "base-L"}, point
+        )
+
+        expected = {"W": "base-W", "L": "3 mm"}
+        self.assertEqual(project.load_design_parameter_calls, 1)
+        self.assertEqual(project.layout.received_updates, [expected])
+        self.assertEqual(report["updates"], expected)
+        self.assertEqual(report["native_status"], "native update accepted")
+        self.assertNotIn("unrelated", report["updates"])
+
+    def test_baseline_geometry_is_restored_through_native_updater(self) -> None:
+        project = FakeProject({"W": "changed", "L": "changed"})
+
+        report = MODULE.restore_parameter_formulas_and_geometry(
+            project, {"W": "base-W", "L": "base-L"}
+        )
+
+        expected = {"W": "base-W", "L": "base-L"}
+        self.assertEqual(project.parameters.formulas, expected)
+        self.assertEqual(project.layout.received_updates, [expected])
+        self.assertEqual(report["updates"], expected)
 
     def test_snapshot_requires_every_sweep_parameter(self) -> None:
         project = FakeProject({"W": "1 mm"})
