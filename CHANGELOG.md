@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.5 - 2026-08-17
+
+- Complete RFPro's **Enter Name for Geometry Image** `QFileDialog` by setting
+  an absolute path and clicking its Save/default button on the next Qt event
+  turn instead of calling `accept()` immediately after `selectFile()`.
+- Record the dialog's actual `selectedFiles()`, directory, filters, acceptance
+  signal, and button path in export diagnostics.
+- Keep processing RFPro events for up to 12 seconds after the action returns
+  so an asynchronously written image is not rejected prematurely.
+- Recognize and normalize RFPro-appended `.png` filename variants before
+  deciding that the native export failed.
+
 ## 0.8.4 - 2026-08-17
 
 - Retain the complete RFPro `QMenuBar`/`QMenu`/submenu/`QAction` ownership

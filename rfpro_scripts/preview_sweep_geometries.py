@@ -829,8 +829,9 @@ class QtSaveDialogAutomation:
         from PySide6.QtWidgets import QComboBox, QFileDialog, QLineEdit, QPushButton
 
         self.application = application
-        self.output_path = output_path
+        self.output_path = output_path.expanduser().resolve()
         self.timeout_seconds = timeout_seconds
+        self.output_wait_seconds = 12.0
         self.timer_type = QTimer
         self.dont_use_native_dialogs_attribute = (
             Qt.ApplicationAttribute.AA_DontUseNativeDialogs
@@ -844,6 +845,14 @@ class QtSaveDialogAutomation:
         self.timer.timeout.connect(self._poll)
         self.started_at = 0.0
         self.file_dialog_was_accepted = False
+        self.file_dialog_accept_requested = False
+        self.file_dialog_accept_scheduled = False
+        self.file_dialog_accept_method = "not requested"
+        self.file_dialog: Any = None
+        self.file_dialog_selected_files: list[str] = []
+        self.file_dialog_directory = ""
+        self.file_dialog_name_filters: list[str] = []
+        self.file_dialog_selected_name_filter = ""
         self.custom_dialog_was_advanced = False
         self.custom_filename_was_set = False
         self.timed_out = False
@@ -871,7 +880,13 @@ class QtSaveDialogAutomation:
     def diagnostics(self) -> str:
         details = ", ".join(self.observed_dialogs) or "no modal dialog was exposed"
         return (
-            f"save dialog accepted={self.file_dialog_was_accepted}; "
+            f"save requested={self.file_dialog_accept_requested}; "
+            f"accepted signal={self.file_dialog_was_accepted}; "
+            f"accept method={self.file_dialog_accept_method}; "
+            f"selected files={self.file_dialog_selected_files!r}; "
+            f"directory={self.file_dialog_directory!r}; "
+            f"selected filter={self.file_dialog_selected_name_filter!r}; "
+            f"filters={self.file_dialog_name_filters!r}; "
             f"custom dialog advanced={self.custom_dialog_was_advanced}; "
             f"custom filename set={self.custom_filename_was_set}; "
             f"timed out={self.timed_out}; observed={details}"
@@ -898,7 +913,100 @@ class QtSaveDialogAutomation:
         )
         return f"{type(dialog).__name__}({title!r})"
 
+    def _capture_file_dialog_state(self, dialog: Any) -> None:
+        selected_files = _call_or_value(
+            _getattr_or_default(dialog, "selectedFiles"), []
+        ) or []
+        if selected_files:
+            self.file_dialog_selected_files = [
+                str(path) for path in selected_files
+            ]
+        directory = _call_or_value(
+            _getattr_or_default(dialog, "directory"), None
+        )
+        captured_directory = str(
+            _call_or_value(
+                _getattr_or_default(directory, "absolutePath"), directory or ""
+            )
+            or ""
+        )
+        if captured_directory:
+            self.file_dialog_directory = captured_directory
+        name_filters = _call_or_value(
+            _getattr_or_default(dialog, "nameFilters"), []
+        ) or []
+        if name_filters:
+            self.file_dialog_name_filters = [
+                str(value) for value in name_filters
+            ]
+        selected_name_filter = str(
+            _call_or_value(
+                _getattr_or_default(dialog, "selectedNameFilter"), ""
+            )
+            or ""
+        )
+        if selected_name_filter:
+            self.file_dialog_selected_name_filter = selected_name_filter
+
+    def _file_dialog_accepted(self, dialog: Any) -> None:
+        self.file_dialog_was_accepted = True
+        self._capture_file_dialog_state(dialog)
+
+    def _activate_file_dialog_save(self) -> None:
+        dialog = self.file_dialog
+        if dialog is None or not _qt_object_is_valid(dialog):
+            self.file_dialog_accept_method = "dialog was deleted before Save"
+            return
+        self._capture_file_dialog_state(dialog)
+        find_children = _getattr_or_default(dialog, "findChildren")
+        buttons = (
+            find_children(self.push_button_type)
+            if callable(find_children)
+            else []
+        )
+        ranked_buttons: list[tuple[int, Any, str]] = []
+        for button in buttons:
+            button_text = _normalized_action_text(
+                str(
+                    _call_or_value(_getattr_or_default(button, "text"), "")
+                    or ""
+                )
+            )
+            is_default = bool(
+                _call_or_value(
+                    _getattr_or_default(button, "isDefault"), False
+                )
+            )
+            rank = {"save": 40, "export": 30, "ok": 20}.get(
+                button_text, 10 if is_default else 0
+            )
+            if rank:
+                ranked_buttons.append((rank, button, button_text or "default"))
+        if ranked_buttons:
+            _rank, button, button_text = max(
+                ranked_buttons, key=lambda item: item[0]
+            )
+            self.file_dialog_accept_requested = True
+            self.file_dialog_accept_method = f"clicked {button_text!r} button"
+            try:
+                button.click()
+            except Exception as error:
+                self.file_dialog_accept_method += f"; click failed: {error}"
+            return
+        accept = _getattr_or_default(dialog, "accept")
+        if callable(accept):
+            self.file_dialog_accept_requested = True
+            self.file_dialog_accept_method = "direct accept() fallback"
+            try:
+                accept()
+            except Exception as error:
+                self.file_dialog_accept_method += f"; call failed: {error}"
+            return
+        self.file_dialog_accept_method = "no Save button or accept() method"
+
     def _poll(self) -> None:
+        if self.file_dialog_was_accepted:
+            return
         dialogs = self._visible_dialogs()
         for dialog in dialogs:
             visible = _call_or_value(getattr(dialog, "isVisible", None), True)
@@ -908,6 +1016,8 @@ class QtSaveDialogAutomation:
             if description not in self.observed_dialogs:
                 self.observed_dialogs.append(description)
             if isinstance(dialog, self.file_dialog_type):
+                if self.file_dialog_accept_scheduled:
+                    continue
                 try:
                     dialog.setAcceptMode(
                         self.file_dialog_type.AcceptMode.AcceptSave
@@ -919,11 +1029,45 @@ class QtSaveDialogAutomation:
                         if "png" in str(name_filter).casefold():
                             dialog.selectNameFilter(name_filter)
                             break
-                    dialog.selectFile(self.output_path.name)
-                    dialog.accept()
-                except Exception:
+                    dialog.selectFile(str(self.output_path))
+                    find_children = _getattr_or_default(
+                        dialog, "findChildren"
+                    )
+                    line_edits = (
+                        find_children(self.line_edit_type)
+                        if callable(find_children)
+                        else []
+                    )
+                    for line_edit in line_edits:
+                        object_name = _normalized_action_text(
+                            str(
+                                _call_or_value(
+                                    _getattr_or_default(
+                                        line_edit, "objectName"
+                                    ),
+                                    "",
+                                )
+                                or ""
+                            )
+                        )
+                        if object_name == "filenameedit":
+                            line_edit.setText(self.output_path.name)
+                            break
+                    accepted_signal = _getattr_or_default(dialog, "accepted")
+                    connect = _getattr_or_default(accepted_signal, "connect")
+                    if callable(connect):
+                        connect(lambda: self._file_dialog_accepted(dialog))
+                    self.file_dialog = dialog
+                    self.file_dialog_accept_scheduled = True
+                    self._capture_file_dialog_state(dialog)
+                    self.timer_type.singleShot(
+                        0, self._activate_file_dialog_save
+                    )
+                except Exception as error:
+                    self.file_dialog_accept_method = (
+                        f"dialog setup failed: {error}"
+                    )
                     continue
-                self.file_dialog_was_accepted = True
                 return
 
             title = _normalized_action_text(
@@ -1012,6 +1156,84 @@ class QtSaveDialogAutomation:
                     reject()
 
 
+def _rfpro_export_candidate_paths(
+    output_path: Path,
+    automation: Any,
+) -> list[Path]:
+    """Return exact and RFPro-suffixed paths that may contain the export."""
+
+    expected = output_path.expanduser().resolve()
+    raw_paths: list[Path] = [expected]
+    for selected in getattr(automation, "file_dialog_selected_files", []):
+        try:
+            selected_path = Path(str(selected)).expanduser()
+            if not selected_path.is_absolute():
+                selected_path = expected.parent / selected_path
+            raw_paths.append(selected_path.resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+    candidates: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for raw_path in raw_paths:
+        add(raw_path)
+        if raw_path.suffix.casefold() == ".png":
+            add(raw_path.with_suffix(""))
+            add(Path(str(raw_path) + ".png"))
+        else:
+            add(raw_path.with_suffix(".png"))
+            add(Path(str(raw_path) + ".png"))
+    try:
+        for sibling in expected.parent.glob(f"{expected.stem}*"):
+            if sibling.suffix.casefold() == ".png":
+                add(sibling.resolve())
+    except OSError:
+        pass
+    return candidates
+
+
+def _wait_for_rfpro_exported_png(
+    empro_module: Any,
+    application: Any,
+    output_path: Path,
+    automation: Any,
+) -> Path | None:
+    """Pump RFPro until its dialog-selected PNG is completely materialized."""
+
+    expected = output_path.expanduser().resolve()
+    timeout_seconds = max(
+        0.0, float(getattr(automation, "output_wait_seconds", 0.0))
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        for candidate in _rfpro_export_candidate_paths(expected, automation):
+            try:
+                if not candidate.is_file() or candidate.stat().st_size <= 0:
+                    continue
+                if candidate != expected:
+                    if expected.exists():
+                        raise FileExistsError(
+                            f"Refusing to replace existing image: {expected}"
+                        )
+                    candidate.replace(expected)
+                return expected
+            except (FileNotFoundError, OSError):
+                continue
+        if time.monotonic() >= deadline:
+            return None
+        process_application_events = _getattr_or_default(
+            application, "processEvents"
+        )
+        if callable(process_application_events):
+            process_application_events()
+        empro_module.gui.processEvents()
+        time.sleep(0.025)
+
+
 def export_geometry_view_png(
     empro_module: Any,
     application: Any,
@@ -1021,6 +1243,7 @@ def export_geometry_view_png(
 ) -> str:
     """Invoke RFPro's View > Export Image command and verify its PNG."""
 
+    output_path = output_path.expanduser().resolve()
     if output_path.exists():
         raise FileExistsError(f"Refusing to replace existing image: {output_path}")
     project_view = empro_module.gui.activeProjectView()
@@ -1037,17 +1260,27 @@ def export_geometry_view_png(
     automation.start()
     try:
         _action_trigger(action)
+        exported_path = _wait_for_rfpro_exported_png(
+            empro_module,
+            application,
+            output_path,
+            automation,
+        )
     finally:
         automation.stop()
     # Keep the QMenu/QAction owner chain alive until the blocking export and
     # its save dialog have completely returned.
     _ = owner_references
     empro_module.gui.processEvents()
-    if not output_path.is_file() or output_path.stat().st_size <= 0:
+    if exported_path is None:
         diagnostics = getattr(automation, "diagnostics", lambda: "unavailable")()
+        candidates = ", ".join(
+            str(path)
+            for path in _rfpro_export_candidate_paths(output_path, automation)
+        )
         raise RuntimeError(
             f"{description} was triggered, but RFPro did not create {output_path}. "
-            f"Save-dialog diagnostics: {diagnostics}"
+            f"Save-dialog diagnostics: {diagnostics}; checked paths={candidates}"
         )
     return description
 
@@ -1535,7 +1768,7 @@ def create_inspector_dialog(
             )
             if not selected_path:
                 return
-            pdf_path = Path(selected_path)
+            pdf_path = Path(selected_path).expanduser().resolve()
             if pdf_path.suffix.casefold() != ".pdf":
                 pdf_path = pdf_path.with_suffix(".pdf")
             self._run_check_all(pdf_path)

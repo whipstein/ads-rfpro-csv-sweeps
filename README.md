@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.8.4**.
+The current release is **0.8.5**.
 
 ## Execution model
 
@@ -189,6 +189,11 @@ The action lookup prefers the live RFPro main-window **View** menu and retains
 its `QMenuBar`, `QMenu`, submenu, and `QAction` wrappers until the export dialog
 has finished. Deleted PySide wrappers are rejected with `shiboken6.isValid()`
 instead of being triggered after their underlying C++ action has disappeared.
+The RFPro filename dialog is completed by selecting an absolute PNG path and
+clicking its Save/default button after Qt has committed the selection. The
+script records `selectedFiles()`, keeps processing RFPro events while the image
+is written, and recognizes RFPro-appended PNG suffixes before verifying the
+numbered output file.
 
 The script never saves the project and never creates, queues, reruns, or
 deletes a simulation. It captures the original formulas before opening and

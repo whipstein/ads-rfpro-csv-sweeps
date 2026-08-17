@@ -195,6 +195,10 @@ class GarbageCollectingSaveDialogAutomation(FakeSaveDialogAutomation):
         gc.collect()
 
 
+class WaitingSaveDialogAutomation(FakeSaveDialogAutomation):
+    output_wait_seconds = 0.25
+
+
 class FakeProjectView:
     def __init__(self, geometry_view, view_menu=None) -> None:
         self.geometry_view = geometry_view
@@ -475,6 +479,55 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             )
 
             self.assertEqual(output.read_bytes(), b"rfpro png")
+
+    def test_export_waits_for_rfpro_to_write_after_the_action_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "point_0001.png"
+
+            class DelayedImageApplication(FakeApplication):
+                def processEvents(self) -> None:
+                    super().processEvents()
+                    if self.process_events_calls == 2:
+                        output.write_bytes(b"delayed rfpro png")
+
+            export_action = FakeAction("Export Image...")
+            project_view = FakeProjectView(
+                FakeGeometryViewController(), FakeMenu([export_action])
+            )
+            gui = FakeCaptureGui(project_view)
+            empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+            MODULE.export_geometry_view_png(
+                empro_module,
+                DelayedImageApplication(),
+                output,
+                automation_factory=WaitingSaveDialogAutomation,
+            )
+
+            self.assertEqual(output.read_bytes(), b"delayed rfpro png")
+
+    def test_export_normalizes_an_rfpro_appended_png_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "point_0001.png"
+            appended = Path(str(output) + ".png")
+            export_action = FakeAction(
+                "Export Image...", lambda: appended.write_bytes(b"rfpro png")
+            )
+            project_view = FakeProjectView(
+                FakeGeometryViewController(), FakeMenu([export_action])
+            )
+            gui = FakeCaptureGui(project_view)
+            empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+            MODULE.export_geometry_view_png(
+                empro_module,
+                FakeApplication(),
+                output,
+                automation_factory=FakeSaveDialogAutomation,
+            )
+
+            self.assertEqual(output.read_bytes(), b"rfpro png")
+            self.assertFalse(appended.exists())
 
     def test_export_fails_when_rfpro_does_not_create_the_png(self) -> None:
         export_action = FakeAction("Export Image...")
