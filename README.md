@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.7.0**.
+The current release is **0.7.1**.
 
 ## Execution model
 
@@ -325,14 +325,23 @@ Use exactly one of these frequency-grid options:
 --frequency-step "25 MHz"
 ```
 
-Point-count mode includes both endpoints and spaces the requested number of
-points uniformly over each result's native minimum-to-maximum frequency span.
-Step mode starts at the native minimum, retains the requested spacing, and
-always includes the native maximum; its final interval is shorter when the
-span is not an exact multiple of the step. Unitless step values are hertz, and
-`Hz`, `kHz`, `MHz`, `GHz`, and `THz` are accepted. RFPro evaluates every
-requested S-matrix through the public `CircuitMatrix.Smatrix(frequency)` API;
-this resamples existing results and does not run another simulation.
+Point-count mode includes both positive-range endpoints and spaces the
+requested number of points uniformly from the first positive native frequency
+through the native maximum. Step mode starts at that same first positive
+frequency, retains the requested spacing, and always includes the native
+maximum; its final interval is shorter when the range is not an exact multiple
+of the step.
+
+When a result also contains a DC sample at 0 Hz, the exporter preserves it as
+one additional standalone point. It does not generate artificial frequencies
+between DC and the first positive simulated frequency. Thus
+`--frequency-points 401` means 401 points across the positive frequency range,
+plus DC when present.
+
+Unitless step values are hertz, and `Hz`, `kHz`, `MHz`, `GHz`, and `THz` are
+accepted. RFPro evaluates every requested S-matrix through the public
+`CircuitMatrix.Smatrix(frequency)` API; this resamples existing results and
+does not run another simulation.
 
 For direct RFPro launches that cannot pass arguments, configure these globals
 near the top of the exporter:

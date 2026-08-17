@@ -110,6 +110,16 @@ class FakeCircuitMatrix:
         return FakeEvaluatedCircuitMatrix(interpolated)
 
 
+class FakeDcCircuitMatrix(FakeCircuitMatrix):
+    def __init__(self) -> None:
+        super().__init__()
+        self._frequencies = [0.0, 1.0e9, 2.0e9]
+        self._values[0.0] = [
+            [0.0 + 0.0j, 0.0 + 0.0j],
+            [0.0 + 0.0j, 0.0 + 0.0j],
+        ]
+
+
 class FakeSweep:
     def __init__(self, name: str, values: list[str]) -> None:
         self.parameterName = name
@@ -230,6 +240,39 @@ class MDIFExportTests(unittest.TestCase):
             MODULE.FrequencyGridRequest("step", step_hz=10.0e12),
         )
         self.assertEqual(wider_than_span, (1.0e9, 2.0e9))
+
+    def test_step_grid_preserves_dc_without_filling_the_gap(self) -> None:
+        grid = MODULE.build_frequency_grid(
+            [0.0, 1.0e9, 1.5e9, 2.0e9],
+            MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+        )
+        self.assertEqual(grid, (0.0, 1.0e9, 1.4e9, 1.8e9, 2.0e9))
+        self.assertNotIn(400.0e6, grid)
+        self.assertNotIn(800.0e6, grid)
+
+    def test_point_count_applies_to_non_dc_range_and_dc_is_additional(self) -> None:
+        grid = MODULE.build_frequency_grid(
+            [0.0, 1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("points", point_count=3),
+        )
+        self.assertEqual(grid, (0.0, 1.0e9, 1.5e9, 2.0e9))
+        dc_only = MODULE.build_frequency_grid(
+            [0.0],
+            MODULE.FrequencyGridRequest("points", point_count=3),
+        )
+        self.assertEqual(dc_only, (0.0,))
+
+    def test_circuit_export_does_not_evaluate_inside_dc_to_range_gap(self) -> None:
+        matrix = FakeDcCircuitMatrix()
+        block = MODULE.circuit_matrix_to_block(
+            matrix,
+            "000001",
+            {"W": "1 mm"},
+            MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+        )
+        expected = (0.0, 1.0e9, 1.4e9, 1.8e9, 2.0e9)
+        self.assertEqual(block.frequencies_hz, expected)
+        self.assertEqual(matrix.sampled_frequencies, list(expected))
 
     def test_circuit_matrix_can_be_resampled_by_point_count(self) -> None:
         matrix = FakeCircuitMatrix()

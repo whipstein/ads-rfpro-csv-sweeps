@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1 - 2026-08-17
+
+- Preserve a simulated DC sample as a standalone export point instead of
+  treating 0 Hz as the start of a continuous resampling span.
+- Apply point-count and step-size sampling only to the positive native
+  frequency range, preventing invented data between DC and that range.
+- Treat the configured point count as the number of non-DC range points; DC is
+  one additional point when present.
+
 ## 0.7.0 - 2026-08-17
 
 - Add interactive native, point-count, and step-size frequency-grid selection

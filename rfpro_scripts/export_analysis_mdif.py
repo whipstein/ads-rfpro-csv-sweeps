@@ -551,14 +551,20 @@ def frequency_grid_description(request: FrequencyGridRequest) -> str:
     if request.mode == "native":
         return "native result frequencies"
     if request.mode == "points":
-        return f"{request.point_count:,} uniformly spaced points"
-    return f"{request.step_hz:.16g} Hz maximum step"
+        return (
+            f"{request.point_count:,} uniformly spaced non-DC points "
+            "(plus DC when present)"
+        )
+    return (
+        f"{request.step_hz:.16g} Hz maximum non-DC step "
+        "(plus DC when present)"
+    )
 
 
 def build_frequency_grid(
     native_frequencies_hz: Sequence[float], request: FrequencyGridRequest
 ) -> tuple[float, ...]:
-    """Build a requested grid over the inclusive native result frequency span."""
+    """Resample the positive native span while preserving an isolated DC point."""
 
     native = tuple(float(value) for value in native_frequencies_hz)
     if not native:
@@ -570,13 +576,18 @@ def build_frequency_grid(
     if request.mode == "native":
         return native
 
-    start = min(native)
-    stop = max(native)
+    if any(value < 0.0 for value in native):
+        raise ValueError("Cannot resample negative native frequencies.")
+
+    dc_prefix = (0.0,) if 0.0 in native else ()
+    positive_frequencies = tuple(value for value in native if value > 0.0)
+    if not positive_frequencies:
+        return dc_prefix
+
+    start = min(positive_frequencies)
+    stop = max(positive_frequencies)
     if start == stop:
-        raise ValueError(
-            "Cannot resample a result whose native frequency span contains only "
-            f"{start:.16g} Hz."
-        )
+        return (*dc_prefix, start)
 
     if request.mode == "points":
         assert request.point_count is not None
@@ -586,7 +597,7 @@ def build_frequency_grid(
             start + span * index / denominator
             for index in range(request.point_count)
         )
-        return (*grid[:-1], stop)
+        return (*dc_prefix, *grid[:-1], stop)
 
     assert request.step_hz is not None
     span = stop - start
@@ -615,7 +626,7 @@ def build_frequency_grid(
         grid[-1] = stop
     else:
         grid.append(stop)
-    return tuple(grid)
+    return (*dc_prefix, *grid)
 
 
 def circuit_matrix_to_block(
@@ -969,7 +980,8 @@ def _choose_frequency_grid_request(
         point_count, accepted = QInputDialog.getInt(
             None,
             "RFPro MDIF Frequency Grid",
-            "Number of points, including both endpoints:",
+            "Number of non-DC points, including both range endpoints:\n"
+            "(A simulated DC point is added separately.)",
             max(2, min(int(DEFAULT_FREQUENCY_POINTS), MAX_FREQUENCY_POINTS)),
             2,
             MAX_FREQUENCY_POINTS,
