@@ -29,6 +29,17 @@ class FakeParameterSequence(list):
     pass
 
 
+class FakeNativeParameterSequence(FakeParameterSequence):
+    def __init__(self, values=()) -> None:
+        super().__init__(values)
+        self.invalidated = False
+
+    def __iter__(self):
+        if self.invalidated:
+            raise TypeError("Trying to dereference null-PyObject of type ParameterSequence")
+        return super().__iter__()
+
+
 class FakeSimulationModule:
     ParameterSequence = FakeParameterSequence
     SingleParameterSweep = FakeSingleParameterSweep
@@ -46,10 +57,26 @@ class FakeParameterSequenceList(list):
 
     def clear(self) -> None:
         self.clear_calls += 1
+        for sequence in self:
+            if isinstance(sequence, FakeNativeParameterSequence):
+                sequence.invalidated = True
         super().clear()
 
     def append(self, value) -> None:
         self.append_calls += 1
+        super().append(value)
+
+
+class FailingAppendParameterSequenceList(FakeParameterSequenceList):
+    def __init__(self, values, fail_value) -> None:
+        super().__init__(values)
+        self.fail_value = fail_value
+        self.failed = False
+
+    def append(self, value) -> None:
+        if value is self.fail_value and not self.failed:
+            self.failed = True
+            raise TypeError("synthetic replacement append failure")
         super().append(value)
 
 
@@ -64,9 +91,12 @@ class FakeEvaluatedSweep:
         self.parameterName = name
         self.parameterValues = list(values)
 
+    def getParameterValues(self, *_arguments):
+        return [repr(value) for value in self.parameterValues]
+
 
 def evaluated_sequence(**parameters):
-    return FakeParameterSequence(
+    return FakeNativeParameterSequence(
         FakeEvaluatedSweep(name, values) for name, values in parameters.items()
     )
 
@@ -228,8 +258,9 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual(plan.added_count, 1)
         self.assertEqual(plan.duplicate_csv_count, 1)
         self.assertEqual(plan.removed_existing_count, 0)
-        self.assertIs(plan.final_sequences[0], existing)
-        self.assertIs(plan.final_sequences[1], new)
+        self.assertEqual(plan.operation, "append")
+        self.assertEqual(plan.append_sequences, (new,))
+        self.assertEqual(plan.replacement_sequences, ())
 
         before, after = MODULE.apply_parameter_sequence_import_plan(settings, plan)
         self.assertEqual((before, after), (1, 2))
@@ -256,7 +287,29 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual(settings.parameterSequences.append_calls, 0)
         self.assertIs(settings.parameterSequences[0], existing)
 
-    def test_replace_plan_reuses_matching_native_objects(self) -> None:
+    def test_replace_that_only_adds_points_uses_append_without_clear(self) -> None:
+        existing = evaluated_sequence(W=[1.0e-3])
+        matching = evaluated_sequence(W=[1.0e-3 + 5.0e-13])
+        new = evaluated_sequence(W=[3.0e-3])
+        settings = FakeSettings([existing], enabled=True)
+
+        plan = MODULE.plan_parameter_sequence_import(
+            settings,
+            [matching, new],
+            "replace",
+            relative_tolerance=1.0e-9,
+            absolute_tolerance=1.0e-15,
+        )
+        MODULE.apply_parameter_sequence_import_plan(settings, plan)
+
+        self.assertEqual(plan.operation, "append")
+        self.assertEqual(settings.parameterSequences.clear_calls, 0)
+        self.assertEqual(settings.parameterSequences.append_calls, 1)
+        self.assertFalse(existing.invalidated)
+        self.assertIs(settings.parameterSequences[0], existing)
+        self.assertIs(settings.parameterSequences[1], new)
+
+    def test_destructive_replace_is_blocked_before_mutation_by_default(self) -> None:
         retained = evaluated_sequence(W=[1.0e-3])
         stale = evaluated_sequence(W=[2.0e-3])
         matching = evaluated_sequence(W=[1.0e-3 + 5.0e-13])
@@ -274,8 +327,68 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual(plan.reused_existing_count, 1)
         self.assertEqual(plan.added_count, 1)
         self.assertEqual(plan.removed_existing_count, 1)
-        self.assertIs(plan.final_sequences[0], retained)
-        self.assertIs(plan.final_sequences[1], new)
+        self.assertEqual(plan.operation, "blocked")
+        self.assertTrue(plan.blocked)
+        with self.assertRaisesRegex(RuntimeError, "blocked before any mutation"):
+            MODULE.apply_parameter_sequence_import_plan(settings, plan)
+        self.assertEqual(settings.parameterSequences.clear_calls, 0)
+        self.assertEqual(settings.parameterSequences.append_calls, 0)
+        self.assertFalse(retained.invalidated)
+        self.assertFalse(stale.invalidated)
+
+    def test_opted_in_destructive_replace_uses_only_detached_objects(self) -> None:
+        retained = evaluated_sequence(W=[1.0e-3])
+        stale = evaluated_sequence(W=[2.0e-3])
+        matching = evaluated_sequence(W=[1.0e-3 + 5.0e-13])
+        new = evaluated_sequence(W=[3.0e-3])
+        settings = FakeSettings([retained, stale], enabled=True)
+        plan = MODULE.plan_parameter_sequence_import(
+            settings,
+            [matching, new],
+            "replace",
+            relative_tolerance=1.0e-9,
+            absolute_tolerance=1.0e-15,
+            allow_destructive_replace=True,
+        )
+        backups = MODULE.clone_parameter_sequences(
+            FakeEmpro, list(settings.parameterSequences)
+        )
+
+        MODULE.apply_parameter_sequence_import_plan(settings, plan, backups)
+
+        self.assertEqual(plan.operation, "rebuild")
+        self.assertEqual(settings.parameterSequences.clear_calls, 1)
+        self.assertTrue(retained.invalidated)
+        self.assertTrue(stale.invalidated)
+        self.assertIs(settings.parameterSequences[0], matching)
+        self.assertIs(settings.parameterSequences[1], new)
+
+    def test_failed_destructive_replace_restores_detached_backup(self) -> None:
+        retained = evaluated_sequence(W=[1.0e-3])
+        stale = evaluated_sequence(W=[2.0e-3])
+        matching = evaluated_sequence(W=[1.0e-3])
+        failing_new = evaluated_sequence(W=[3.0e-3])
+        settings = FakeSettings([retained, stale], enabled=True)
+        settings.parameterSequences = FailingAppendParameterSequenceList(
+            [retained, stale], failing_new
+        )
+        plan = MODULE.plan_parameter_sequence_import(
+            settings,
+            [matching, failing_new],
+            "replace",
+            allow_destructive_replace=True,
+        )
+        backups = MODULE.clone_parameter_sequences(
+            FakeEmpro, list(settings.parameterSequences)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "restored from detached copies"):
+            MODULE.apply_parameter_sequence_import_plan(settings, plan, backups)
+
+        self.assertEqual(settings.parameterSequences.clear_calls, 2)
+        self.assertEqual(len(settings.parameterSequences), 2)
+        self.assertIs(settings.parameterSequences[0], backups[0])
+        self.assertIs(settings.parameterSequences[1], backups[1])
 
     def test_match_tolerances_must_be_finite_and_nonnegative(self) -> None:
         with self.assertRaisesRegex(ValueError, "finite nonnegative"):
@@ -289,6 +402,10 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual(MODULE._choose_import_mode(settings, "append"), "append")
         self.assertEqual(MODULE._parse_arguments([]).mode, "ask")
         self.assertEqual(MODULE._parse_arguments(["--scale", "1e-6"]).scale, 1.0e-6)
+        self.assertTrue(
+            MODULE._parse_arguments(["--allow-destructive-replace"])
+            .allow_destructive_replace
+        )
         with self.assertRaisesRegex(ValueError, "Unknown import mode"):
             MODULE._choose_import_mode(settings, "invalid")
 

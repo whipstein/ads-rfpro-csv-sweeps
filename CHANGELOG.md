@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.1 - 2026-08-17
+
+- Fix replace-mode reuse of borrowed `ParameterSequence` wrappers: RFPro
+  invalidates those wrappers as soon as their owning list is cleared, causing
+  a null-PyObject dereference and leaving the sweep list empty.
+- Convert replace to append-only whenever the CSV retains every existing
+  condition, so matching native sequences and their ordering are untouched.
+- Block a replace that would remove/change existing conditions before any
+  mutation unless destructive replacement is explicitly enabled.
+- Make an opted-in destructive replace use only newly constructed sequences
+  plus detached pre-clear backups that are restored if installation fails.
+- Add a regression fake that invalidates borrowed wrappers on `clear()`,
+  matching RFPro's observed object-lifetime behavior.
+
 ## 0.11.0 - 2026-08-17
 
 - Filter CSV headings against the active project's exact editable parameter
@@ -10,8 +24,9 @@
   with configurable relative and absolute tolerances.
 - Make append add only genuinely new conditions and perform no sequence-list
   mutation or project save when every CSV condition already exists.
-- Make replace retain matching native sequence objects, add new cases, remove
-  stale cases, and skip duplicate rows within the CSV.
+- Attempt replace-mode reuse of matching native sequence wrappers while adding
+  new cases, removing stale cases, and skipping duplicate CSV rows; corrected
+  in 0.11.1 after RFPro lifetime testing exposed wrapper invalidation.
 
 ## 0.10.0 - 2026-08-17
 

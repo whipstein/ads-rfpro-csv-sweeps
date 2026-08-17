@@ -17,7 +17,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.11.0**.
+The current release is **0.11.1**.
 
 ## Execution model
 
@@ -118,11 +118,24 @@ CSV cases matching an existing independent parameter group are skipped and
 only new conditions are appended. This is the recommended mode when rows were
 added to a previously imported CSV.
 
-In `replace` mode, the final sequence list follows the CSV. Matching native
-sequence objects are retained, new conditions are created, and existing
-conditions absent from the CSV are removed. Duplicate CSV rows are skipped in
-both modes. If append finds that every condition already exists, the importer
-does not mutate the sequence list and does not save the unchanged project.
+In `replace` mode, a CSV that contains every existing condition plus new points
+is handled through the same append-only path, preserving the owning RFPro list
+and every existing native sequence. If the CSV omits or changes an existing
+condition, replacement would require clearing RFPro's owning
+`ParameterSequenceList`. That operation is blocked by default because clearing
+the list immediately invalidates Python wrappers borrowed from it and because
+rebuilding the sweep definitions can invalidate result reuse.
+
+An intentional destructive synchronization requires both `--mode replace` and
+`--allow-destructive-replace`, or
+`DEFAULT_ALLOW_DESTRUCTIVE_REPLACE = True`. It rebuilds the list exclusively
+from newly constructed sequences, never from invalidated borrowed wrappers.
+Before clearing, it creates detached copies of the prior definitions and uses
+them for rollback if installation fails. Treat this opt-in operation as likely
+to require result revalidation or simulation. Duplicate CSV rows are skipped
+in both modes. If append finds that every condition already exists, the
+importer does not mutate the sequence list and does not save the unchanged
+project.
 
 Matching uses the public evaluated `SingleParameterSweep.parameterValues`, so
 equivalent unit expressions compare in RFPro reference units. It uses
@@ -145,6 +158,7 @@ Useful importer options:
 --scale FACTOR
 --match-rel-tol FACTOR
 --match-abs-tol REFERENCE_VALUE
+--allow-destructive-replace
 --no-save
 --yes
 ```

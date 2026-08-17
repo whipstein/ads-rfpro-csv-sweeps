@@ -4,6 +4,11 @@ Run this file inside the open RFPro project.  Every enabled CSV row becomes
 one independent ``ParameterSequence``.  A row's parameter values therefore
 remain correlated and are not expanded into a Cartesian product.
 
+Existing conditions are compared before mutation. Append-only updates never
+clear RFPro's owning ``ParameterSequenceList``. A replace that would remove an
+existing condition is blocked unless destructive rebuilding is explicitly
+enabled, in which case only detached/new native objects are installed.
+
 The Qt bootstrap is intentionally self-contained.  It reuses RFPro's existing
 QApplication without changing the process environment.  Only a standalone
 launcher that does not yet own QApplication receives a temporary, restored
@@ -33,6 +38,8 @@ DEFAULT_VALUE_SCALE = 1.0
 # Evaluated RFPro sweep values are compared in reference units with math.isclose().
 DEFAULT_MATCH_REL_TOLERANCE = 1.0e-9
 DEFAULT_MATCH_ABS_TOLERANCE = 1.0e-15
+# A destructive replace can invalidate result reuse, so it requires opt-in.
+DEFAULT_ALLOW_DESTRUCTIVE_REPLACE = False
 
 _RESERVED_COLUMNS = {"__case__", "__comment__", "__enabled__"}
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
@@ -61,25 +68,34 @@ class SweepCSVData:
 
 @dataclass(frozen=True)
 class SequenceImportPlan:
-    """A non-mutating plan that preserves matching native sweep objects."""
+    """A lifecycle-safe plan that never owns borrowed existing sequences."""
 
     mode: str
+    operation: str
     before_count: int
-    final_sequences: tuple[Any, ...]
+    after_count: int
+    append_sequences: tuple[Any, ...]
+    replacement_sequences: tuple[Any, ...]
     reused_existing_count: int
     added_count: int
     duplicate_csv_count: int
     removed_existing_count: int
-    sequences_changed: bool
     sweep_was_enabled: bool
+    blocked_reason: str = ""
 
     @property
-    def after_count(self) -> int:
-        return len(self.final_sequences)
+    def blocked(self) -> bool:
+        return bool(self.blocked_reason)
+
+    @property
+    def sequences_changed(self) -> bool:
+        return self.operation in {"append", "rebuild"}
 
     @property
     def mutation_required(self) -> bool:
-        return self.sequences_changed or not self.sweep_was_enabled
+        return not self.blocked and (
+            self.sequences_changed or not self.sweep_was_enabled
+        )
 
 
 @dataclass(frozen=True)
@@ -547,8 +563,9 @@ def plan_parameter_sequence_import(
     mode: str,
     relative_tolerance: float = DEFAULT_MATCH_REL_TOLERANCE,
     absolute_tolerance: float = DEFAULT_MATCH_ABS_TOLERANCE,
+    allow_destructive_replace: bool = DEFAULT_ALLOW_DESTRUCTIVE_REPLACE,
 ) -> SequenceImportPlan:
-    """Plan append/replace while retaining equivalent existing sequences."""
+    """Plan a safe append or an explicitly authorized all-new rebuild."""
 
     if mode not in {"replace", "append"}:
         raise ValueError(f"Unknown import mode: {mode!r}")
@@ -563,7 +580,7 @@ def plan_parameter_sequence_import(
     candidates = list(candidate_sequences)
     existing_values = [_evaluated_sequence_values(value) for value in existing]
     accepted_values: list[dict[str, tuple[float, ...]] | None] = []
-    selected_for_replace: list[Any] = []
+    accepted_candidates: list[Any] = []
     additions: list[Any] = []
     used_existing_indices: set[int] = set()
     reused_existing_count = 0
@@ -598,51 +615,134 @@ def plan_parameter_sequence_import(
             None,
         )
         if matching_existing_index is not None:
-            selected = existing[matching_existing_index]
             used_existing_indices.add(matching_existing_index)
             reused_existing_count += 1
         else:
-            selected = candidate
             additions.append(candidate)
-        selected_for_replace.append(selected)
+        accepted_candidates.append(candidate)
         accepted_values.append(candidate_values)
 
-    if mode == "append":
-        final_sequences = [*existing, *additions]
+    blocked_reason = ""
+    if mode == "append" or len(used_existing_indices) == len(existing):
+        operation = "append" if additions else "noop"
+        append_sequences = tuple(additions)
+        replacement_sequences: tuple[Any, ...] = ()
+        after_count = len(existing) + len(additions)
         removed_existing_count = 0
     else:
-        final_sequences = selected_for_replace
         removed_existing_count = len(existing) - len(used_existing_indices)
+        after_count = len(accepted_candidates)
+        append_sequences = ()
+        if allow_destructive_replace:
+            operation = "rebuild"
+            replacement_sequences = tuple(accepted_candidates)
+        else:
+            operation = "blocked"
+            replacement_sequences = ()
+            blocked_reason = (
+                "Replace would remove or change existing sweep conditions and "
+                "therefore requires rebuilding the native ParameterSequenceList. "
+                "The operation was blocked before any mutation. Use append for a "
+                "CSV that only adds points. To intentionally perform a destructive "
+                "rebuild, set DEFAULT_ALLOW_DESTRUCTIVE_REPLACE=True or pass "
+                "--allow-destructive-replace; existing result reuse may be lost."
+            )
 
-    sequences_changed = len(existing) != len(final_sequences) or any(
-        before is not after for before, after in zip(existing, final_sequences)
-    )
     return SequenceImportPlan(
         mode=mode,
+        operation=operation,
         before_count=len(existing),
-        final_sequences=tuple(final_sequences),
+        after_count=after_count,
+        append_sequences=append_sequences,
+        replacement_sequences=replacement_sequences,
         reused_existing_count=reused_existing_count,
         added_count=len(additions),
         duplicate_csv_count=duplicate_csv_count,
         removed_existing_count=removed_existing_count,
-        sequences_changed=sequences_changed,
         sweep_was_enabled=bool(settings.parameterSweepEnabled),
+        blocked_reason=blocked_reason,
     )
 
 
-def apply_parameter_sequence_import_plan(
-    settings: Any, plan: SequenceImportPlan
-) -> tuple[int, int]:
-    """Apply a confirmed plan, avoiding any list mutation when unchanged."""
+def clone_parameter_sequences(empro_module: Any, sequences: Iterable[Any]) -> list[Any]:
+    """Create detached Values-type backups before clearing an owning list."""
 
-    if plan.sequences_changed:
-        if plan.mode == "replace":
-            settings.parameterSequences.clear()
-            sequences_to_append = plan.final_sequences
-        else:
-            sequences_to_append = plan.final_sequences[plan.before_count :]
-        for sequence in sequences_to_append:
+    clones: list[Any] = []
+    for sequence_index, sequence in enumerate(sequences):
+        clone = empro_module.simulation.ParameterSequence()
+        try:
+            sweeps = list(sequence)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"Could not snapshot existing sequence {sequence_index + 1}."
+            ) from error
+        for sweep_index, source_sweep in enumerate(sweeps):
+            name = str(getattr(source_sweep, "parameterName", "") or "")
+            get_values = getattr(source_sweep, "getParameterValues", None)
+            if not name or not callable(get_values):
+                raise RuntimeError(
+                    f"Could not snapshot existing sequence {sequence_index + 1}, "
+                    f"sweep {sweep_index + 1}."
+                )
+            try:
+                raw_values = get_values("ValueAndFrontendUnit")
+            except Exception as error:
+                raise RuntimeError(
+                    f"Could not snapshot values for existing sequence "
+                    f"{sequence_index + 1}, parameter {name!r}."
+                ) from error
+            values = [str(raw_values)] if isinstance(raw_values, str) else [
+                str(value) for value in raw_values
+            ]
+            if not values:
+                raise RuntimeError(
+                    f"Existing sequence {sequence_index + 1}, parameter {name!r} "
+                    "has no values to snapshot."
+                )
+            clone_sweep = empro_module.simulation.SingleParameterSweep()
+            clone_sweep.parameterName = name
+            clone_sweep.setParameterValues(",".join(values))
+            clone.append(clone_sweep)
+        clones.append(clone)
+    return clones
+
+
+def apply_parameter_sequence_import_plan(
+    settings: Any,
+    plan: SequenceImportPlan,
+    backup_sequences: Sequence[Any] = (),
+) -> tuple[int, int]:
+    """Apply without dereferencing owner-invalidated existing wrappers."""
+
+    if plan.blocked:
+        raise RuntimeError(plan.blocked_reason)
+    if plan.operation == "append":
+        for sequence in plan.append_sequences:
             settings.parameterSequences.append(sequence)
+    elif plan.operation == "rebuild":
+        if len(backup_sequences) != plan.before_count:
+            raise RuntimeError(
+                "Destructive replace requires a complete detached backup before "
+                "the existing sequence list can be cleared."
+            )
+        try:
+            settings.parameterSequences.clear()
+            for sequence in plan.replacement_sequences:
+                settings.parameterSequences.append(sequence)
+        except Exception as replace_error:
+            try:
+                settings.parameterSequences.clear()
+                for sequence in backup_sequences:
+                    settings.parameterSequences.append(sequence)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Destructive replace failed and the detached sweep backup "
+                    f"could not be restored: {rollback_error}"
+                ) from replace_error
+            raise RuntimeError(
+                "Destructive replace failed; the previous sweep definitions "
+                "were restored from detached copies."
+            ) from replace_error
     if not plan.sweep_was_enabled:
         settings.parameterSweepEnabled = True
     return plan.before_count, plan.after_count
@@ -766,6 +866,7 @@ def _preview_text(
     if import_plan is not None:
         lines.extend(
             [
+                f"Planned operation: {import_plan.operation}",
                 f"Matching existing cases retained: "
                 f"{import_plan.reused_existing_count}",
                 f"New cases to add: {import_plan.added_count}",
@@ -775,6 +876,13 @@ def _preview_text(
                 f"Analysis mutation required: {import_plan.mutation_required}",
             ]
         )
+        if import_plan.operation == "rebuild":
+            lines.append(
+                "WARNING: destructive rebuild explicitly enabled; all native "
+                "sequence objects will be recreated and result reuse may be lost."
+            )
+        if import_plan.blocked:
+            lines.append("BLOCKED: " + import_plan.blocked_reason)
     lines.append("")
     for case in cases[:8]:
         values = ", ".join(f"{name}={value}" for name, value in case.parameters)
@@ -829,6 +937,12 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_MATCH_ABS_TOLERANCE,
         help="absolute reference-unit tolerance for matching sweep values",
+    )
+    parser.add_argument(
+        "--allow-destructive-replace",
+        action="store_true",
+        default=DEFAULT_ALLOW_DESTRUCTIVE_REPLACE,
+        help="allow replace to rebuild all sequences when existing cases are removed",
     )
     parser.add_argument(
         "--no-save",
@@ -889,6 +1003,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         validated_match_tolerance(
             arguments.match_abs_tol, "Duplicate-match absolute tolerance"
         ),
+        arguments.allow_destructive_replace,
     )
 
     preview = _preview_text(
@@ -901,12 +1016,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         import_plan,
     )
     print(preview)
+    if import_plan.blocked:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.warning(
+            None,
+            "RFPro sweep replacement blocked",
+            preview,
+        )
+        return
     if not arguments.yes and not _confirm_import(preview):
         print("Import cancelled; the RFPro analysis was not changed.")
         return
 
+    backup_sequences = (
+        clone_parameter_sequences(
+            empro,
+            list(analysis.simulationSettings.parameterSequences),
+        )
+        if import_plan.operation == "rebuild"
+        else ()
+    )
     before, after = apply_parameter_sequence_import_plan(
-        analysis.simulationSettings, import_plan
+        analysis.simulationSettings,
+        import_plan,
+        backup_sequences,
     )
     should_save = (
         import_plan.mutation_required
@@ -922,6 +1056,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"existing case(s), added {import_plan.added_count}, skipped "
         f"{import_plan.duplicate_csv_count} duplicate CSV row(s), and removed "
         f"{import_plan.removed_existing_count} existing sequence(s). "
+        f"Operation: {import_plan.operation}. "
         f"Parameter sequences: {before} -> {after}. "
         f"Analysis changed: {import_plan.mutation_required}. "
         f"Project saved: {should_save}. No simulation was started."
