@@ -139,10 +139,21 @@ class FakeSweep:
 
 
 class FakeFrequencyPlan:
-    def __init__(self, start: float, stop: float, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        start: float,
+        stop: float,
+        enabled: bool = True,
+        sweep_type: str | None = None,
+        legacy_type: str | None = None,
+        compute_type: str = "Simulated",
+    ) -> None:
         self.startFrequency = start
         self.stopFrequency = stop
         self.enabled = enabled
+        self.sweepType = sweep_type or ("Single" if start == stop else "Linear")
+        self.type = legacy_type or self.sweepType
+        self.computeType = compute_type
 
 
 class FakeFrequencySettings:
@@ -340,7 +351,8 @@ class MDIFExportTests(unittest.TestCase):
     def test_enabled_analysis_frequency_plans_define_export_regions(self) -> None:
         settings = FakeFrequencySettings(
             [
-                FakeFrequencyPlan(0.0, 0.0),
+                # A Single plan may retain an irrelevant hidden stop value.
+                FakeFrequencyPlan(0.0, 900.0e6, sweep_type="Single"),
                 FakeFrequencyPlan(1.0e9, 2.0e9),
                 FakeFrequencyPlan(100.0e6, 200.0e6, enabled=False),
             ]
@@ -349,6 +361,25 @@ class MDIFExportTests(unittest.TestCase):
             MODULE.configured_frequency_regions(settings),
             DC_AND_POSITIVE_RANGE,
         )
+
+    def test_single_plan_hidden_stop_does_not_create_phantom_sweep(self) -> None:
+        settings = FakeFrequencySettings(
+            [
+                FakeFrequencyPlan(0.0, 900.0e6, sweep_type="Single"),
+                FakeFrequencyPlan(1.0e9, 2.0e9, sweep_type="Linear"),
+            ]
+        )
+        regions = MODULE.configured_frequency_regions(settings)
+        grid = MODULE.build_frequency_grid(
+            [1.0e-6, 1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("points", point_count=10),
+            configured_regions=regions,
+        )
+        self.assertEqual(len(grid), 11)
+        self.assertEqual(grid[0], 0.0)
+        self.assertEqual(grid[1], 1.0e9)
+        self.assertEqual(grid[-1], 2.0e9)
+        self.assertFalse(any(0.0 < frequency < 1.0e9 for frequency in grid))
 
     def test_resampling_requires_analysis_frequency_regions(self) -> None:
         with self.assertRaisesRegex(ValueError, "required"):

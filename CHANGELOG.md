@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.3 - 2026-08-17
+
+- Honor each enabled frequency plan's `sweepType` or legacy `type` when
+  deriving export regions.
+- Treat a `Single` plan as exactly its `startFrequency`, ignoring an unrelated
+  or stale hidden `stopFrequency` that previously created a phantom sweep.
+- Print raw frequency-plan properties and the effective region used for
+  resampling.
+
 ## 0.7.2 - 2026-08-17
 
 - Derive resampled MDIF frequency regions from the selected analysis's enabled

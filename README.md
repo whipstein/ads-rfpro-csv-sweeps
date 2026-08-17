@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.7.2**.
+The current release is **0.7.3**.
 
 ## Execution model
 
@@ -340,6 +340,13 @@ additional. Step mode retains the requested spacing inside every configured
 range and uses a shorter final interval when necessary to include its exact
 stop frequency.
 
+RFPro's `Single` plan uses only `startFrequency`; its stored `stopFrequency`
+can contain a stale value that is not shown in the analysis options. The
+exporter therefore honors `sweepType` (and the legacy `type` property) and
+forces a Single plan's effective stop to equal its start. It prints each
+plan's raw properties and effective export region so the interpreted setup is
+visible before result blocks are written.
+
 Unitless step values are hertz, and `Hz`, `kHz`, `MHz`, `GHz`, and `THz` are
 accepted. RFPro evaluates every requested S-matrix through the public
 `CircuitMatrix.Smatrix(frequency)` API; this resamples existing results and
@@ -461,8 +468,9 @@ Update 2.1 and EMPro 2026 corpus:
   `DataSetMatrix`, `empro.toolkit.getCircuitMatrix()`, and
   `CircuitMatrix.Smatrix(frequency)` for frequency-grid evaluation.
 - `SimulationData.femFrequencyPlanList()` and the public `FrequencyPlan`
-  `enabled`, `startFrequency`, and `stopFrequency` properties for deriving the
-  selected analysis's exact configured frequency regions.
+  `enabled`, `sweepType` (legacy `type`), `startFrequency`, and `stopFrequency`
+  properties for deriving the selected analysis's exact configured frequency
+  regions.
 - `empro.toolkit.analysis.runAnalysis()` and its
   `reuseExistingIfPossible=True` option for explicitly starting only after the
   user confirms.

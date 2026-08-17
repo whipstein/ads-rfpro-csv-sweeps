@@ -569,6 +569,16 @@ def frequency_grid_description(request: FrequencyGridRequest) -> str:
     )
 
 
+def _frequency_plan_attribute_text(plan: Any, name: str) -> str:
+    """Return a printable frequency-plan attribute without requiring it."""
+
+    try:
+        value = getattr(plan, name)
+    except Exception:
+        return ""
+    return str(value).strip()
+
+
 def configured_frequency_regions(settings: Any) -> tuple[FrequencyRegion, ...]:
     """Read and normalize enabled FEM frequency plans from an analysis."""
 
@@ -587,14 +597,43 @@ def configured_frequency_regions(settings: Any) -> tuple[FrequencyRegion, ...]:
     regions: list[FrequencyRegion] = []
     for index, plan in enumerate(plans):
         if not bool(getattr(plan, "enabled", True)):
+            print(f"Frequency plan {index + 1}: enabled=False; ignored.")
             continue
+
+        sweep_type = _frequency_plan_attribute_text(plan, "sweepType")
+        legacy_type = _frequency_plan_attribute_text(plan, "type")
+        compute_type = _frequency_plan_attribute_text(plan, "computeType")
+        is_single = any(
+            "single" in value.casefold()
+            for value in (sweep_type, legacy_type)
+            if value
+        )
+
         try:
             start_hz = float(plan.startFrequency)
-            stop_hz = float(plan.stopFrequency)
         except Exception as error:
             raise ValueError(
-                f"Enabled frequency plan {index + 1} has unreadable endpoints: {error}"
+                f"Enabled frequency plan {index + 1} has an unreadable start "
+                f"frequency: {error}"
             ) from error
+        try:
+            raw_stop_hz: float | None = float(plan.stopFrequency)
+            raw_stop_description = f"{raw_stop_hz:.16g}"
+        except Exception as error:
+            raw_stop_hz = None
+            raw_stop_description = f"unreadable ({error})"
+            if not is_single:
+                raise ValueError(
+                    f"Enabled frequency plan {index + 1} has an unreadable stop "
+                    f"frequency: {error}"
+                ) from error
+
+        # RFPro's Single plan only uses startFrequency. Its stopFrequency may
+        # retain a stale value from another plan or a prior edit and must not
+        # be interpreted as an additional export range.
+        stop_hz = start_hz if is_single else raw_stop_hz
+        assert stop_hz is not None
+
         if not math.isfinite(start_hz) or not math.isfinite(stop_hz):
             raise ValueError(
                 f"Enabled frequency plan {index + 1} has a non-finite endpoint."
@@ -608,6 +647,20 @@ def configured_frequency_regions(settings: Any) -> tuple[FrequencyRegion, ...]:
                 f"Enabled frequency plan {index + 1} stops below its start "
                 f"({start_hz:.16g} Hz > {stop_hz:.16g} Hz)."
             )
+
+        effective_description = (
+            f"{start_hz:.16g} Hz"
+            if start_hz == stop_hz
+            else f"{start_hz:.16g}..{stop_hz:.16g} Hz"
+        )
+        print(
+            f"Frequency plan {index + 1}: enabled=True, "
+            f"sweepType={sweep_type or '(unavailable)'!r}, "
+            f"type={legacy_type or '(unavailable)'!r}, "
+            f"computeType={compute_type or '(unavailable)'!r}, "
+            f"raw={start_hz:.16g}..{raw_stop_description} Hz, "
+            f"effective={effective_description}."
+        )
         regions.append(FrequencyRegion(start_hz, stop_hz))
 
     if not regions:
