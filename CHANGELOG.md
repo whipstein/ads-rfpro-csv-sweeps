@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.4 - 2026-08-17
+
+- Retain the complete RFPro `QMenuBar`/`QMenu`/submenu/`QAction` ownership
+  chain until each **View > Export Image** save operation has returned.
+- Prefer traversal of the live RFPro main-window **View** menu over a broad
+  Qt child-action search that can include stale actions from transient views.
+- Validate PySide wrappers with `shiboken6.isValid()` during discovery and
+  immediately before triggering, skipping any action whose C++ object was
+  already deleted.
+
 ## 0.8.3 - 2026-08-17
 
 - Replace all framebuffer, widget-grab, and native-window screenshot attempts

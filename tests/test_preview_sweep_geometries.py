@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 
 
@@ -116,11 +118,15 @@ class FakeDialog:
 
 
 class FakeApplication:
-    def __init__(self) -> None:
+    def __init__(self, top_levels=None) -> None:
         self.process_events_calls = 0
+        self.top_levels = list(top_levels or [])
 
     def processEvents(self) -> None:
         self.process_events_calls += 1
+
+    def topLevelWidgets(self):
+        return list(self.top_levels)
 
 
 class FakeGeometryViewController:
@@ -153,6 +159,21 @@ class FakeMenu:
         return list(self._actions)
 
 
+class FakeWindow:
+    def __init__(self, title: str, menu_bar: FakeMenu) -> None:
+        self.title = title
+        self.menu_bar = menu_bar
+
+    def windowTitle(self) -> str:
+        return self.title
+
+    def menuBar(self) -> FakeMenu:
+        return self.menu_bar
+
+    def findChildren(self, _child_type):
+        return []
+
+
 class FakeSaveDialogAutomation:
     def __init__(self, _application, _output_path: Path) -> None:
         self.started = False
@@ -166,6 +187,12 @@ class FakeSaveDialogAutomation:
 
     def diagnostics(self) -> str:
         return "fake automation"
+
+
+class GarbageCollectingSaveDialogAutomation(FakeSaveDialogAutomation):
+    def start(self) -> None:
+        super().start()
+        gc.collect()
 
 
 class FakeProjectView:
@@ -321,7 +348,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             FakeGeometryViewController(), FakeMenu([submenu_action])
         )
 
-        action, description = MODULE.find_rfpro_export_image_action(
+        action, description, owners = MODULE.find_rfpro_export_image_action(
             project_view,
             FakeApplication(),
             qt_action_type=None,
@@ -329,6 +356,45 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         self.assertIs(action, export_action)
         self.assertEqual(description, "RFPro View menu > &Export Image...")
+        self.assertIn(project_view, owners)
+        self.assertIn(project_view.view_menu, owners)
+        self.assertIn(submenu_action.menu, owners)
+        self.assertIn(export_action, owners)
+
+    def test_live_qt_view_menu_is_preferred_and_its_owners_are_retained(self) -> None:
+        wrapper_action = FakeAction("Export Image...")
+        live_action = FakeAction("Export Image...")
+        view_action = FakeAction("&View", menu=FakeMenu([live_action]))
+        window = FakeWindow("RFPro", FakeMenu([view_action]))
+        project_view = FakeProjectView(
+            FakeGeometryViewController(), FakeMenu([wrapper_action])
+        )
+
+        action, description, owners = MODULE.find_rfpro_export_image_action(
+            project_view,
+            FakeApplication([window]),
+            qt_action_type=FakeAction,
+        )
+
+        self.assertIs(action, live_action)
+        self.assertEqual(
+            description, "Qt window 'RFPro' View menu > Export Image..."
+        )
+        self.assertIn(window, owners)
+        self.assertIn(window.menu_bar, owners)
+        self.assertIn(view_action.menu, owners)
+
+    def test_deleted_export_action_is_rejected_before_trigger(self) -> None:
+        action = FakeAction("Export Image...")
+        original_validator = MODULE._qt_object_is_valid
+        MODULE._qt_object_is_valid = lambda candidate: candidate is not action
+        try:
+            with self.assertRaisesRegex(RuntimeError, "deleted before"):
+                MODULE._action_trigger(action)
+        finally:
+            MODULE._qt_object_is_valid = original_validator
+
+        self.assertEqual(action.trigger_calls, 0)
 
     def test_missing_export_action_reports_the_view_menu_contents(self) -> None:
         project_view = FakeProjectView(
@@ -369,6 +435,46 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             self.assertEqual(export_action.trigger_calls, 1)
             self.assertEqual(project_view.show_calls, 1)
             self.assertEqual(geometry_view.update_calls, 1)
+
+    def test_export_keeps_a_transient_view_menu_alive_until_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "point_0001.png"
+            geometry_view = FakeGeometryViewController()
+
+            class OwnerSensitiveAction(FakeAction):
+                def __init__(self, owner) -> None:
+                    super().__init__("Export Image...")
+                    self.owner_reference = weakref.ref(owner)
+
+                def trigger(self) -> None:
+                    if self.owner_reference() is None:
+                        raise RuntimeError("menu owner was already deleted")
+                    output.write_bytes(b"rfpro png")
+
+            class TransientMenuProjectView(FakeProjectView):
+                def __init__(self) -> None:
+                    super().__init__(geometry_view)
+
+                def menu(self, name: str):
+                    if name != "view":
+                        raise KeyError(name)
+                    owner = FakeMenu([])
+                    owner._actions.append(OwnerSensitiveAction(owner))
+                    return owner
+
+            project_view = TransientMenuProjectView()
+            gui = FakeCaptureGui(project_view)
+            empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+            MODULE.export_geometry_view_png(
+                empro_module,
+                FakeApplication(),
+                output,
+                automation_factory=GarbageCollectingSaveDialogAutomation,
+                qt_action_type=None,
+            )
+
+            self.assertEqual(output.read_bytes(), b"rfpro png")
 
     def test_export_fails_when_rfpro_does_not_create_the_png(self) -> None:
         export_action = FakeAction("Export Image...")

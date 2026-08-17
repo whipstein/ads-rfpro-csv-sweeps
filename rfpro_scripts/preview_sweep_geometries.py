@@ -540,8 +540,42 @@ def _call_or_value(value: Any, default: Any = None) -> Any:
         return default
 
 
+def _getattr_or_default(value: Any, name: str, default: Any = None) -> Any:
+    """Read an attribute without propagating a deleted PySide-wrapper error."""
+
+    try:
+        return getattr(value, name, default)
+    except (RuntimeError, ReferenceError):
+        return default
+
+
+def _qt_object_is_valid(value: Any) -> bool:
+    """Return whether a Shiboken wrapper still owns a callable C++ object."""
+
+    try:
+        import shiboken6
+    except ImportError:
+        return True
+
+    validator = getattr(shiboken6, "isValid", None)
+    if not callable(validator):
+        shiboken_type = getattr(shiboken6, "Shiboken", None)
+        validator = getattr(shiboken_type, "isValid", None)
+    if not callable(validator):
+        return True
+    try:
+        return bool(validator(value))
+    except TypeError:
+        # Portable tests and EMPro wrapper objects need not be Shiboken types.
+        return True
+    except (RuntimeError, ReferenceError):
+        return False
+
+
 def _action_text(action: Any) -> str:
-    return str(_call_or_value(getattr(action, "text", None), "") or "")
+    return str(
+        _call_or_value(_getattr_or_default(action, "text"), "") or ""
+    )
 
 
 def _normalized_action_text(text: str) -> str:
@@ -549,46 +583,59 @@ def _normalized_action_text(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", without_mnemonics.casefold()))
 
 
-def _iter_empro_menu_actions(menu: Any) -> Iterable[Any]:
-    """Yield actions recursively from an EMPro menu wrapper."""
+def _iter_menu_actions_with_owners(
+    menu: Any,
+    owner_prefix: tuple[Any, ...] = (),
+) -> Iterable[tuple[Any, tuple[Any, ...]]]:
+    """Yield menu actions together with the wrappers that keep them alive."""
 
-    pending = [menu]
+    pending = [(menu, owner_prefix + (menu,))]
     seen_menus: set[int] = set()
     while pending:
-        current = pending.pop()
+        current, owners = pending.pop()
         if current is None or id(current) in seen_menus:
             continue
         seen_menus.add(id(current))
-        actions = _call_or_value(getattr(current, "actions", None), []) or []
+        actions = _call_or_value(
+            _getattr_or_default(current, "actions"), []
+        ) or []
         for action in actions:
-            yield action
-            submenu = _call_or_value(getattr(action, "menu", None), None)
+            action_owners = owners + (action,)
+            yield action, action_owners
+            submenu = _call_or_value(
+                _getattr_or_default(action, "menu"), None
+            )
             if submenu is not None:
-                pending.append(submenu)
+                pending.append((submenu, action_owners + (submenu,)))
 
 
 def _action_is_enabled(action: Any) -> bool:
     enabled = _call_or_value(
-        getattr(action, "isEnabled", None),
-        _call_or_value(getattr(action, "enabled", None), True),
+        _getattr_or_default(action, "isEnabled"),
+        _call_or_value(_getattr_or_default(action, "enabled"), True),
     )
     return bool(enabled)
 
 
 def _action_can_trigger(action: Any) -> bool:
-    return callable(getattr(action, "trigger", None)) or callable(
-        getattr(action, "onTriggered", None)
+    return callable(_getattr_or_default(action, "trigger")) or callable(
+        _getattr_or_default(action, "onTriggered")
     )
 
 
 def _action_trigger(action: Any) -> None:
     """Activate the same QAction slot used by a manual menu click."""
 
-    trigger = getattr(action, "trigger", None)
+    if not _qt_object_is_valid(action):
+        raise RuntimeError(
+            "RFPro's resolved Export Image QAction was deleted before it "
+            "could be triggered."
+        )
+    trigger = _getattr_or_default(action, "trigger")
     if callable(trigger):
         trigger()
         return
-    on_triggered = getattr(action, "onTriggered", None)
+    on_triggered = _getattr_or_default(action, "onTriggered")
     if callable(on_triggered):
         try:
             on_triggered(False)
@@ -604,31 +651,48 @@ def find_rfpro_export_image_action(
     project_view: Any,
     application: Any,
     qt_action_type: type[Any] | None = None,
-) -> tuple[Any, str]:
+) -> tuple[Any, str, tuple[Any, ...]]:
     """Find RFPro's View > Export Image action without invoking it."""
 
-    records: list[tuple[int, Any, str]] = []
+    records: list[tuple[int, Any, str, tuple[Any, ...]]] = []
     discovered: list[str] = []
+
+    def record_menu_candidates(
+        menu: Any,
+        owner_prefix: tuple[Any, ...],
+        source: str,
+        base_score: int,
+    ) -> None:
+        for action, owners in _iter_menu_actions_with_owners(
+            menu, owner_prefix
+        ):
+            text = _action_text(action)
+            if text:
+                discovered.append(f"{source}: {text}")
+            normalized = _normalized_action_text(text)
+            if "export" not in normalized or "image" not in normalized:
+                continue
+            if not _qt_object_is_valid(action):
+                discovered.append(f"{source} action is already deleted: {text}")
+                continue
+            if not _action_can_trigger(action):
+                discovered.append(
+                    f"{source} action cannot be triggered from Python: {text}"
+                )
+                continue
+            score = base_score + (50 if normalized == "export image" else 0)
+            score += 20 if _action_is_enabled(action) else 0
+            records.append((score, action, f"{source} > {text}", owners))
+
     try:
         view_menu = project_view.menu("view")
     except Exception as error:
         view_menu = None
         discovered.append(f"RFPro View menu unavailable: {error}")
     if view_menu is not None:
-        for action in _iter_empro_menu_actions(view_menu):
-            text = _action_text(action)
-            if text:
-                discovered.append(f"View menu: {text}")
-            normalized = _normalized_action_text(text)
-            if "export" in normalized and "image" in normalized:
-                if not _action_can_trigger(action):
-                    discovered.append(
-                        f"View menu action cannot be triggered from Python: {text}"
-                    )
-                    continue
-                score = 300 if normalized == "export image" else 250
-                score += 20 if _action_is_enabled(action) else 0
-                records.append((score, action, f"RFPro View menu > {text}"))
+        record_menu_candidates(
+            view_menu, (project_view,), "RFPro View menu", 300
+        )
 
     if qt_action_type is None:
         try:
@@ -640,13 +704,64 @@ def find_rfpro_export_image_action(
     if qt_action_type is not None:
         seen_actions: set[int] = set()
         top_levels = _call_or_value(
-            getattr(application, "topLevelWidgets", None), []
+            _getattr_or_default(application, "topLevelWidgets"), []
         ) or []
         for top_level in top_levels:
             window_title = str(
-                _call_or_value(getattr(top_level, "windowTitle", None), "") or ""
+                _call_or_value(
+                    _getattr_or_default(top_level, "windowTitle"), ""
+                )
+                or ""
             )
-            find_children = getattr(top_level, "findChildren", None)
+            title_normalized = window_title.casefold()
+            title_score = (
+                20
+                if "rfpro" in title_normalized or "empro" in title_normalized
+                else 0
+            )
+
+            # Prefer the live main-window menu bar. Unlike an unconstrained
+            # findChildren() search, this follows View's current owner chain.
+            menu_bars: list[Any] = []
+            menu_bar = _call_or_value(
+                _getattr_or_default(top_level, "menuBar"), None
+            )
+            if menu_bar is not None:
+                menu_bars.append(menu_bar)
+            try:
+                from PySide6.QtWidgets import QMenuBar
+            except Exception:
+                QMenuBar = None  # type: ignore[assignment,misc]
+            find_children = _getattr_or_default(top_level, "findChildren")
+            if callable(find_children) and QMenuBar is not None:
+                try:
+                    for candidate in find_children(QMenuBar):
+                        if candidate not in menu_bars:
+                            menu_bars.append(candidate)
+                except Exception:
+                    pass
+            for candidate_menu_bar in menu_bars:
+                root_actions = _call_or_value(
+                    _getattr_or_default(candidate_menu_bar, "actions"), []
+                ) or []
+                for root_action in root_actions:
+                    root_text = _action_text(root_action)
+                    if _normalized_action_text(root_text) != "view":
+                        continue
+                    live_view_menu = _call_or_value(
+                        _getattr_or_default(root_action, "menu"), None
+                    )
+                    if live_view_menu is None:
+                        continue
+                    record_menu_candidates(
+                        live_view_menu,
+                        (top_level, candidate_menu_bar, root_action),
+                        f"Qt window {window_title!r} View menu",
+                        400 + title_score,
+                    )
+
+            # Retain the broad lookup only as a compatibility fallback for
+            # RFPro builds whose main window does not expose menuBar().
             if not callable(find_children):
                 continue
             try:
@@ -657,6 +772,8 @@ def find_rfpro_export_image_action(
                 if id(action) in seen_actions:
                     continue
                 seen_actions.add(id(action))
+                if not _qt_object_is_valid(action):
+                    continue
                 text = _action_text(action)
                 normalized = _normalized_action_text(text)
                 if "export" not in normalized or "image" not in normalized:
@@ -665,13 +782,16 @@ def find_rfpro_export_image_action(
                 if not _action_can_trigger(action):
                     continue
                 score = 200 if normalized == "export image" else 150
-                title_normalized = window_title.casefold()
-                if "rfpro" in title_normalized or "empro" in title_normalized:
-                    score += 20
+                score += title_score
                 if _action_is_enabled(action):
                     score += 10
                 records.append(
-                    (score, action, f"Qt window {window_title!r} > {text}")
+                    (
+                        score,
+                        action,
+                        f"Qt window {window_title!r} > {text}",
+                        (top_level, action),
+                    )
                 )
 
     if not records:
@@ -681,10 +801,19 @@ def find_rfpro_export_image_action(
             + details
         )
     records.sort(key=lambda record: record[0], reverse=True)
-    _score, action, description = records[0]
-    if not _action_is_enabled(action):
-        raise RuntimeError(f"{description} is currently disabled.")
-    return action, description
+    for _score, action, description, owners in records:
+        if not _qt_object_is_valid(action):
+            discovered.append(f"Candidate became invalid: {description}")
+            continue
+        if not _action_is_enabled(action):
+            discovered.append(f"Candidate is disabled: {description}")
+            continue
+        return action, description, owners
+    details = "\n  ".join(discovered[-40:])
+    raise RuntimeError(
+        "Every discovered RFPro Export Image action was invalid or disabled:\n  "
+        + details
+    )
 
 
 class QtSaveDialogAutomation:
@@ -899,7 +1028,7 @@ def export_geometry_view_png(
     geometry_view = project_view.geometryView()
     geometry_view.updateView()
     empro_module.gui.processEvents()
-    action, description = find_rfpro_export_image_action(
+    action, description, owner_references = find_rfpro_export_image_action(
         project_view,
         application,
         qt_action_type=qt_action_type,
@@ -910,6 +1039,9 @@ def export_geometry_view_png(
         _action_trigger(action)
     finally:
         automation.stop()
+    # Keep the QMenu/QAction owner chain alive until the blocking export and
+    # its save dialog have completely returned.
+    _ = owner_references
     empro_module.gui.processEvents()
     if not output_path.is_file() or output_path.stat().st_size <= 0:
         diagnostics = getattr(automation, "diagnostics", lambda: "unavailable")()
