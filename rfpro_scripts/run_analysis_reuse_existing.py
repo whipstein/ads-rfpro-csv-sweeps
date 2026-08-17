@@ -4,10 +4,10 @@ This script is intentionally separate from the CSV importer. Importing sweep
 cases never launches a simulation. Run this file inside RFPro only when the
 analysis is ready to be queued. The active project is saved immediately before
 the public ``runAnalysis`` API is called. Existing-result reuse is controlled
-by an editable global option that is applied both to the saved analysis setting
-and to the submission API. Required private FEM environment overrides are
-applied to the RFPro process before submission and remain set for the rest of
-the current RFPro session so asynchronously launched solvers inherit them.
+by an editable global option passed through the public submission API. Required
+private FEM environment overrides are applied to the RFPro process before
+submission and remain set for the rest of the current RFPro session so
+asynchronously launched solvers inherit them.
 """
 
 from __future__ import annotations
@@ -269,27 +269,6 @@ def apply_session_environment(overrides: Mapping[str, str]) -> None:
         print(f"  {name}={value}")
 
 
-def apply_analysis_reuse_setting(analysis: Any, reuse_existing: bool) -> None:
-    """Persist RFPro's analysis-level reuse setting and verify the assignment."""
-
-    requested = bool(reuse_existing)
-    settings = analysis.simulationSettings
-    try:
-        settings.reuseExistingResults = requested
-        applied = bool(settings.reuseExistingResults)
-    except Exception as error:
-        raise RuntimeError(
-            "Could not set analysis.simulationSettings.reuseExistingResults. "
-            "Nothing was started."
-        ) from error
-    if applied != requested:
-        raise RuntimeError(
-            "RFPro did not retain the requested reuseExistingResults value. "
-            "Nothing was started."
-        )
-    print(f"Persistent analysis reuse setting applied: reuseExistingResults={applied}")
-
-
 def validate_reuse_supported(empro_module: Any, analysis: Any) -> None:
     """Reject analysis types for which the public reuse flag is not defined."""
 
@@ -336,7 +315,7 @@ def build_run_preview(
             f"Existing result sets: {result_count}",
             f"Potentially missing instances: {max(configured_count - result_count, 0)}",
             reuse_preview[0],
-            f"Persisted analysis reuse setting: {bool(reuse_existing)}",
+            f"Submission option: reuseExistingIfPossible={bool(reuse_existing)}",
             "",
             "FEM run environment:",
             environment_preview,
@@ -366,9 +345,8 @@ def _confirm_run(preview: str) -> bool:
 def run_analysis_reusing_results(
     run_analysis: Callable[..., Any], analysis: Any, reuse_existing: bool
 ) -> Any:
-    """Apply persistent analysis/FEM settings and submit with one reuse mode."""
+    """Apply persistent FEM settings and submit with the requested reuse mode."""
 
-    apply_analysis_reuse_setting(analysis, reuse_existing)
     apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
     return _submit_analysis(run_analysis, analysis, reuse_existing)
 
@@ -392,9 +370,8 @@ def save_and_run_analysis(
     analysis: Any,
     reuse_existing: bool,
 ) -> Any:
-    """Prepare and save synchronously, then submit the same reuse setting."""
+    """Prepare and save synchronously, then submit the requested reuse mode."""
 
-    apply_analysis_reuse_setting(analysis, reuse_existing)
     apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
     project.saveActiveProject()
     return _submit_analysis(run_analysis, analysis, reuse_existing)
@@ -465,7 +442,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     reuse_summary = "enabled" if reuse_existing else "disabled"
     summary = (
         f"Saved the active project and started analysis {analysis.name!r} "
-        f"with persisted and submission-time existing-result reuse {reuse_summary}. "
+        f"with submission-time existing-result reuse {reuse_summary}. "
         "Required FEM settings remain active for the current RFPro session."
     )
     print(summary)

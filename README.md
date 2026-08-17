@@ -12,12 +12,12 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
   point, displays its regenerated geometry, and loads or exports available
   saved Mesh/Ports results in RFPro for inspection.
-- `rfpro_scripts/diagnose_analysis_reuse.py` reports an analysis's saved reuse
-  setting, result mappings, per-condition cache files, and reuse-related logs.
+- `rfpro_scripts/diagnose_analysis_reuse.py` reports an analysis's result
+  mappings, per-condition cache files, and reuse-related logs.
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.11.1**.
+The current release is **0.11.2**.
 
 ## Execution model
 
@@ -313,16 +313,25 @@ With `True`, RFPro skips existing result sets only when it still considers them
 valid; missing or invalidated cases are queued. Set it to `False` to request a
 run regardless of existing results, which may queue every configured instance.
 The selected mode is shown in the final confirmation preview. Before saving,
-the runner also assigns and verifies the same value on the analysis:
+the runner sets the required FEM environment. Reuse is passed only through the
+documented run API:
 
 ```python
-analysis.simulationSettings.reuseExistingResults = DEFAULT_REUSE_EXISTING_RESULTS
+runAnalysis(
+    analysis,
+    waitForConfirmation=False,
+    saveProject=True,
+    reuseExistingIfPossible=DEFAULT_REUSE_EXISTING_RESULTS,
+)
 ```
 
-The saved `reuseExistingResults` setting and the submission-time
-`reuseExistingIfPossible` argument therefore cannot silently disagree. If the
-saved setting cannot be assigned or read back, the project is not saved and no
-simulation is submitted.
+The script deliberately does not assign
+`analysis.simulationSettings.reuseExistingResults`. Although that attribute
+appears in generated `SimulationData` reference output, it is undocumented and
+is not the control consumed by the RFPro extraction run flow. In some RFPro
+analysis bindings it also cannot be assigned. The supported
+`reuseExistingIfPossible` submission argument is explicit on every run, so the
+editable global still controls whether RFPro may reuse valid results.
 
 The runner applies these required private FEM environment controls to the
 current RFPro process before submission:
@@ -590,7 +599,7 @@ Update 2.1 and EMPro 2026 corpus:
   `activeProjectView().menu(name)`, recursive menu actions, and the native
   action objects used by RFPro.
 - EMPro public Python documentation for `Analysis.simulationSettings`,
-  `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
+  `AnalysisList.names/index`,
   `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,
   `SimulationOutput.metadata`, `SimulationOutput.simulationPath`,
   `DataSetMatrix`, `empro.toolkit.getCircuitMatrix()`, and
@@ -599,9 +608,9 @@ Update 2.1 and EMPro 2026 corpus:
   `enabled`, `sweepType` (legacy `type`), `startFrequency`, and `stopFrequency`
   properties for deriving the selected analysis's exact configured frequency
   regions.
-- `empro.toolkit.analysis.runAnalysis()` and its
-  `reuseExistingIfPossible=True` option for explicitly starting only after the
-  user confirms.
+- `empro.toolkit.analysis.runAnalysis()` and its documented `saveProject=True`
+  and `reuseExistingIfPossible=True` options for saving and explicitly starting
+  only after the user confirms.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
 - Qt for Python's public `QAction.trigger()`, `QFileDialog.selectFile()`,

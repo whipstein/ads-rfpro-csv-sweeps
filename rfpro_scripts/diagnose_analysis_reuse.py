@@ -127,8 +127,8 @@ def print_analysis_reuse_report(empro_module: Any, analysis: Any, log_limit: int
     print(f"Configured parameter instances: {int(settings.numberOfParameterInstances)}")
     print(f"Configured parameter sequences: {len(settings.parameterSequences)}")
     print(
-        "Stored reuseExistingResults: "
-        + str(getattr(settings, "reuseExistingResults", "unavailable"))
+        "Run reuse control: pass reuseExistingIfPossible to "
+        "empro.toolkit.analysis.runAnalysis()"
     )
     print(
         "Simulation-flow V2: "

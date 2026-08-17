@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.2 - 2026-08-17
+
+- Stop assigning the undocumented per-analysis
+  `simulationSettings.reuseExistingResults` attribute, which is not writable in
+  some RFPro analysis bindings and is not consumed by the extraction run flow.
+- Keep the editable reuse global and pass it explicitly through the documented
+  `runAnalysis(..., reuseExistingIfPossible=...)` argument.
+- Preserve the explicit pre-run project save and persistent RFPro-session FEM
+  environment overrides.
+
 ## 0.11.1 - 2026-08-17
 
 - Fix replace-mode reuse of borrowed `ParameterSequence` wrappers: RFPro

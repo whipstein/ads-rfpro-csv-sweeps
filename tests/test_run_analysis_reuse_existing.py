@@ -20,7 +20,6 @@ SPEC.loader.exec_module(MODULE)
 class FakeSettings:
     def __init__(self) -> None:
         self.numberOfParameterInstances = 5
-        self.reuseExistingResults = False
 
 
 class FakeAnalysis:
@@ -51,7 +50,7 @@ class ReuseRunnerTests(unittest.TestCase):
         preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, True)
         self.assertIn("Potentially missing instances: 2", preview)
         self.assertIn("Existing-result reuse: enabled", preview)
-        self.assertIn("Persisted analysis reuse setting: True", preview)
+        self.assertIn("Submission option: reuseExistingIfPossible=True", preview)
         self.assertIn("reuse valid existing results", preview)
         self.assertIn("will be saved before submission", preview)
         self.assertIn("remain set for the current RFPro session", preview)
@@ -78,7 +77,6 @@ class ReuseRunnerTests(unittest.TestCase):
             fake_run, analysis, reuse_existing=True
         )
         self.assertEqual(result, "queued")
-        self.assertTrue(analysis.simulationSettings.reuseExistingResults)
         self.assertEqual(
             calls,
             [
@@ -116,27 +114,22 @@ class ReuseRunnerTests(unittest.TestCase):
             FakeProject(), fake_run, analysis, reuse_existing=False
         )
         self.assertEqual(result, "queued")
-        self.assertFalse(analysis.simulationSettings.reuseExistingResults)
         self.assertEqual(events, ["save", "run"])
 
-    def test_persisted_reuse_setting_is_applied_before_save(self) -> None:
+    def test_unsupported_persistent_reuse_attribute_is_never_accessed(self) -> None:
         events: list[str] = []
 
-        class TrackedSettings:
-            def __init__(self) -> None:
-                self._reuse = False
-
+        class GuardedSettings:
             @property
             def reuseExistingResults(self) -> bool:
-                return self._reuse
+                raise AssertionError("run script must not read this attribute")
 
             @reuseExistingResults.setter
-            def reuseExistingResults(self, value: bool) -> None:
-                self._reuse = value
-                events.append(f"reuse={value}")
+            def reuseExistingResults(self, _value: bool) -> None:
+                raise AssertionError("run script must not write this attribute")
 
-        class TrackedAnalysis:
-            simulationSettings = TrackedSettings()
+        class GuardedAnalysis:
+            simulationSettings = GuardedSettings()
 
         class FakeProject:
             @staticmethod
@@ -148,39 +141,10 @@ class ReuseRunnerTests(unittest.TestCase):
             return "queued"
 
         MODULE.save_and_run_analysis(
-            FakeProject(), fake_run, TrackedAnalysis(), reuse_existing=True
+            FakeProject(), fake_run, GuardedAnalysis(), reuse_existing=True
         )
 
-        self.assertEqual(events, ["reuse=True", "save", "run"])
-
-    def test_reuse_setting_failure_prevents_save_and_submission(self) -> None:
-        events: list[str] = []
-
-        class BadSettings:
-            @property
-            def reuseExistingResults(self) -> bool:
-                return False
-
-            @reuseExistingResults.setter
-            def reuseExistingResults(self, _value: bool) -> None:
-                raise RuntimeError("unsupported")
-
-        class BadAnalysis:
-            simulationSettings = BadSettings()
-
-        class FakeProject:
-            @staticmethod
-            def saveActiveProject() -> None:
-                events.append("save")
-
-        def fake_run(_analysis: object, **_kwargs: object) -> None:
-            events.append("run")
-
-        with self.assertRaisesRegex(RuntimeError, "Nothing was started"):
-            MODULE.save_and_run_analysis(
-                FakeProject(), fake_run, BadAnalysis(), reuse_existing=True
-            )
-        self.assertEqual(events, [])
+        self.assertEqual(events, ["save", "run"])
 
     def test_save_failure_prevents_submission(self) -> None:
         run_called = False
