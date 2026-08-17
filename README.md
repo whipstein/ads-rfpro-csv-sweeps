@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.8.1**.
+The current release is **0.8.2**.
 
 ## Execution model
 
@@ -174,12 +174,15 @@ includes the analysis name, point/sequence/combination number, parameter
 values, validity result, and RFPro's failure reason when available. Existing
 image directories are never replaced; a numeric suffix is used instead.
 
-The report first tries the geometry view's OpenGL framebuffer, then its normal
-Qt widget capture, with a native-window capture as a final fallback. If one
+The report captures `activeProjectView().geometryViewWidget()`, the visible
+RFPro layout widget used by Keysight's own application setup code. It first
+tries that widget's OpenGL framebuffer and normal Qt capture, then falls back
+to the scene controller and native-window capture for older builds. If one
 point cannot be generated or captured, checking continues and its PDF page
-records the error. Canceling after at least one point writes a partial PDF and
-keeps every PNG captured up to that point. The row that was selected before
-the batch is loaded again when the operation finishes.
+records the error. If no image is captured, the unused empty image directory
+is removed. Canceling after at least one point writes a partial PDF and keeps
+every PNG captured up to that point. The row that was selected before the
+batch is loaded again when the operation finishes.
 
 The script never saves the project and never creates, queues, reruns, or
 deletes a simulation. It captures the original formulas before opening and
@@ -495,6 +498,9 @@ Update 2.1 and EMPro 2026 corpus:
 - `python_scripts/startup.py` and `python_scripts/addons/ScaleViewZ.py` for
   `activeProjectView()`, `showGeometryView()`, `geometryView()`, `updateView()`,
   and fitting the active RFPro 3-D view.
+- EMPro's shipped `empro/toolkit/analysis/gui.py` for
+  `activeProjectView().geometryViewWidget()` as the visible RFPro layout
+  widget.
 - EMPro public Python documentation for `Analysis.simulationSettings`,
   `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
   `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,

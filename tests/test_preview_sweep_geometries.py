@@ -163,9 +163,28 @@ class FakeGeometryView:
         return self.image
 
 
+class FakeGeometryViewController:
+    def __init__(self) -> None:
+        self.update_calls = 0
+
+    def updateView(self) -> None:
+        self.update_calls += 1
+
+
+class FakeGeometryViewWidget:
+    def __init__(self, image: FakeCaptureImage) -> None:
+        self.image = image
+        self.grab_calls = 0
+
+    def grab(self) -> FakeCapturePixmap:
+        self.grab_calls += 1
+        return FakeCapturePixmap(self.image)
+
+
 class FakeProjectView:
-    def __init__(self, geometry_view: FakeGeometryView) -> None:
+    def __init__(self, geometry_view, geometry_widget=None) -> None:
         self.geometry_view = geometry_view
+        self.geometry_widget = geometry_widget
         self.show_calls = 0
 
     def showGeometryView(self) -> None:
@@ -173,6 +192,9 @@ class FakeProjectView:
 
     def geometryView(self) -> FakeGeometryView:
         return self.geometry_view
+
+    def geometryViewWidget(self):
+        return self.geometry_widget
 
 
 class FakeCaptureGui:
@@ -303,7 +325,26 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             (False, "self-intersection"),
         )
 
-    def test_geometry_capture_prefers_the_opengl_framebuffer(self) -> None:
+    def test_geometry_capture_uses_the_rfpro_geometry_view_widget(self) -> None:
+        image = FakeCaptureImage()
+        geometry_view = FakeGeometryViewController()
+        geometry_widget = FakeGeometryViewWidget(image)
+        project_view = FakeProjectView(geometry_view, geometry_widget)
+        gui = FakeCaptureGui(project_view)
+        empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+        captured, method = MODULE.capture_geometry_view_image(
+            empro_module, application=object()
+        )
+
+        self.assertIs(captured, image)
+        self.assertEqual(method, "geometry view widget.grab()")
+        self.assertEqual(project_view.show_calls, 1)
+        self.assertEqual(geometry_view.update_calls, 1)
+        self.assertEqual(geometry_widget.grab_calls, 1)
+        self.assertEqual(gui.process_events_calls, 1)
+
+    def test_geometry_capture_falls_back_to_the_scene_controller(self) -> None:
         image = FakeCaptureImage()
         geometry_view = FakeGeometryView(image)
         project_view = FakeProjectView(geometry_view)
@@ -315,10 +356,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         )
 
         self.assertIs(captured, image)
-        self.assertEqual(method, "geometry view.grabFramebuffer()")
-        self.assertEqual(project_view.show_calls, 1)
-        self.assertEqual(geometry_view.update_calls, 1)
-        self.assertEqual(gui.process_events_calls, 1)
+        self.assertEqual(method, "geometry view controller.grabFramebuffer()")
 
     def test_pixmap_capture_is_normalized_to_an_image(self) -> None:
         image = FakeCaptureImage()
@@ -348,6 +386,19 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             MODULE.default_geometry_report_filename("My RF/Analysis"),
             "My_RF_Analysis_geometry_validation.pdf",
         )
+
+    def test_empty_report_image_directory_is_removed_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            empty = Path(directory) / "empty"
+            empty.mkdir()
+            self.assertTrue(MODULE.remove_empty_image_directory(empty))
+            self.assertFalse(empty.exists())
+
+            nonempty = Path(directory) / "nonempty"
+            nonempty.mkdir()
+            (nonempty / "point_0001.png").write_bytes(b"png")
+            self.assertFalse(MODULE.remove_empty_image_directory(nonempty))
+            self.assertTrue(nonempty.is_dir())
 
     def test_pdf_page_metadata_is_escaped_and_complete(self) -> None:
         point = MODULE.SweepPoint(

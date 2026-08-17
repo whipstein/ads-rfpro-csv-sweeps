@@ -549,7 +549,7 @@ def _usable_capture_image(value: Any) -> Any | None:
 def capture_geometry_view_image(
     empro_module: Any, application: Any
 ) -> tuple[Any, str]:
-    """Capture RFPro's active 3-D view through supported Qt widget methods."""
+    """Capture RFPro's active 3-D view through its GUI widget."""
 
     project_view = empro_module.gui.activeProjectView()
     project_view.showGeometryView()
@@ -557,19 +557,38 @@ def capture_geometry_view_image(
     geometry_view.updateView()
     empro_module.gui.processEvents()
 
-    candidates: list[tuple[str, Any]] = [("geometry view", geometry_view)]
-    seen = {id(geometry_view)}
-    for attribute_name in ("viewport", "widget", "glWidget", "openGLWidget"):
-        try:
-            attribute = getattr(geometry_view, attribute_name)
-            candidate = attribute() if callable(attribute) else attribute
-        except Exception:
-            continue
+    failures: list[str] = []
+    candidates: list[tuple[str, Any]] = []
+    seen: set[int] = set()
+
+    def add_candidate(candidate_name: str, candidate: Any) -> None:
         if candidate is not None and id(candidate) not in seen:
             seen.add(id(candidate))
-            candidates.append((f"geometry view {attribute_name}", candidate))
+            candidates.append((candidate_name, candidate))
 
-    failures: list[str] = []
+    # Keysight's shipped EMPro/RFPro initialization code obtains the visible
+    # layout with ProjectView.geometryViewWidget().  geometryView() is the
+    # scene/controller API; it is not necessarily a QWidget and therefore did
+    # not expose capture methods in RFPro.
+    geometry_widget_accessor = getattr(project_view, "geometryViewWidget", None)
+    if callable(geometry_widget_accessor):
+        try:
+            add_candidate("geometry view widget", geometry_widget_accessor())
+        except Exception as error:
+            failures.append(f"geometryViewWidget(): {error}")
+    else:
+        failures.append("geometryViewWidget() is not exposed by this RFPro build")
+
+    add_candidate("geometry view controller", geometry_view)
+    for parent_name, parent in tuple(candidates):
+        for attribute_name in ("viewport", "widget", "glWidget", "openGLWidget"):
+            try:
+                attribute = getattr(parent, attribute_name)
+                candidate = attribute() if callable(attribute) else attribute
+            except Exception:
+                continue
+            add_candidate(f"{parent_name} {attribute_name}", candidate)
+
     for candidate_name, candidate in candidates:
         for method_name in ("grabFramebuffer", "grab"):
             method = getattr(candidate, method_name, None)
@@ -606,7 +625,7 @@ def capture_geometry_view_image(
 
     details = "\n  ".join(failures) if failures else "no capture method was exposed"
     raise RuntimeError(
-        "RFPro's active geometry view could not be captured through Qt. "
+        "RFPro's active geometry-view widget could not be captured through Qt. "
         "The geometry checks can continue, but no image is available.\n  " + details
     )
 
@@ -638,6 +657,18 @@ def next_available_image_directory(pdf_path: Path) -> Path:
         candidate = base.with_name(f"{base.name}_{suffix}")
         suffix += 1
     return candidate
+
+
+def remove_empty_image_directory(image_directory: Path | None) -> bool:
+    """Remove a report image directory only when it contains no files."""
+
+    if image_directory is None or not image_directory.is_dir():
+        return False
+    try:
+        image_directory.rmdir()
+    except OSError:
+        return False
+    return True
 
 
 def _geometry_report_page_html(
@@ -1117,6 +1148,7 @@ def create_inspector_dialog(
 
             report_pages: list[GeometryReportPage] = []
             capture_failures = 0
+            captured_image_count = 0
             progress = QProgressDialog(
                 (
                     "Generating, checking, and capturing every geometry point..."
@@ -1158,6 +1190,7 @@ def create_inspector_dialog(
                                 empro_module, QApplication.instance()
                             )
                             save_geometry_image(image, image_path)
+                            captured_image_count += 1
                             print(
                                 f"Captured point {row + 1} via "
                                 f"{capture_method}: {image_path}"
@@ -1189,7 +1222,10 @@ def create_inspector_dialog(
             self.table.blockSignals(False)
             self._apply_row(selected_row)
 
-            if pdf_path is None or not report_pages:
+            if pdf_path is None:
+                return
+            if not report_pages:
+                remove_empty_image_directory(image_directory)
                 return
             try:
                 write_geometry_pdf_report(
@@ -1199,17 +1235,36 @@ def create_inspector_dialog(
                     len(points),
                 )
             except Exception as error:
+                removed_empty_directory = (
+                    captured_image_count == 0
+                    and remove_empty_image_directory(image_directory)
+                )
+                image_note = (
+                    "No geometry images were captured; the empty image "
+                    "directory was removed."
+                    if removed_empty_directory
+                    else f"Captured PNG files remain in:\n{image_directory}"
+                )
                 QMessageBox.warning(
                     self,
                     "Could not create geometry PDF",
-                    f"{error}\n\nCaptured PNG files remain in:\n{image_directory}",
+                    f"{error}\n\n{image_note}",
                 )
                 return
 
+            removed_empty_directory = (
+                captured_image_count == 0
+                and remove_empty_image_directory(image_directory)
+            )
+            image_note = (
+                "No PNG images were captured; the empty image directory was removed."
+                if removed_empty_directory
+                else f"PNG images:\n{image_directory}"
+            )
             completion = (
                 f"Created {len(report_pages)} PDF page(s) from "
                 f"{len(points)} sweep point(s).\n\n"
-                f"PDF:\n{pdf_path}\n\nPNG images:\n{image_directory}"
+                f"PDF:\n{pdf_path}\n\n{image_note}"
             )
             if progress.wasCanceled():
                 completion = (

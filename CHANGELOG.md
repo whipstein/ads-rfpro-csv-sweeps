@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.2 - 2026-08-17
+
+- Capture validation images from the visible RFPro
+  `activeProjectView().geometryViewWidget()` established by Keysight's shipped
+  EMPro application setup code, instead of relying on the non-widget
+  `geometryView()` scene controller.
+- Retain controller and native-window capture paths as compatibility fallbacks
+  for RFPro builds whose geometry widget does not expose a direct Qt capture.
+- Remove the newly created image directory when a report captures no PNGs,
+  while preserving any directory that contains a successful image.
+
 ## 0.8.1 - 2026-08-17
 
 - Submit every loaded sweep point through the active RFPro layout's targeted
