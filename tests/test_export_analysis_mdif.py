@@ -71,6 +71,7 @@ class FakeEvaluatedCircuitMatrix:
 class FakeCircuitMatrix:
     def __init__(self) -> None:
         self._frequencies = [1.0e9, 2.0e9]
+        self.sampled_frequencies: list[float] = []
         self._values = {
             1.0e9: [
                 [0.1 + 0.2j, 0.4 + 0.5j],
@@ -90,7 +91,23 @@ class FakeCircuitMatrix:
         return types.SimpleNamespace(data=self._frequencies)
 
     def Smatrix(self, frequency: float) -> FakeEvaluatedCircuitMatrix:
-        return FakeEvaluatedCircuitMatrix(self._values[frequency])
+        self.sampled_frequencies.append(frequency)
+        if frequency in self._values:
+            return FakeEvaluatedCircuitMatrix(self._values[frequency])
+        ratio = (frequency - self._frequencies[0]) / (
+            self._frequencies[1] - self._frequencies[0]
+        )
+        first = self._values[self._frequencies[0]]
+        last = self._values[self._frequencies[1]]
+        interpolated = [
+            [
+                first[row][column]
+                + (last[row][column] - first[row][column]) * ratio
+                for column in range(2)
+            ]
+            for row in range(2)
+        ]
+        return FakeEvaluatedCircuitMatrix(interpolated)
 
 
 class FakeSweep:
@@ -169,12 +186,77 @@ class MDIFExportTests(unittest.TestCase):
         self.assertEqual(block.values[0][2], 0.7 + 0.8j)
 
     def test_circuit_matrix_is_exported_in_row_major_order(self) -> None:
+        matrix = FakeCircuitMatrix()
         block = MODULE.circuit_matrix_to_block(
-            FakeCircuitMatrix(), "000001", {"W": "1 mm", "L": "2 mm"}
+            matrix, "000001", {"W": "1 mm", "L": "2 mm"}
         )
         self.assertEqual(block.labels, ("S11", "S12", "S21", "S22"))
         self.assertEqual(block.frequencies_hz, (1.0e9, 2.0e9))
         self.assertEqual(block.values[0][2], 0.7 + 0.8j)
+        self.assertEqual(matrix.sampled_frequencies, [1.0e9, 2.0e9])
+
+    def test_frequency_step_parser_accepts_engineering_units(self) -> None:
+        self.assertEqual(MODULE.parse_frequency_step("100 MHz"), 100.0e6)
+        self.assertEqual(MODULE.parse_frequency_step("2.5GHz"), 2.5e9)
+        self.assertEqual(MODULE.parse_frequency_step("1000"), 1000.0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            MODULE.parse_frequency_step("0 MHz")
+        with self.assertRaisesRegex(ValueError, "optionally followed"):
+            MODULE.parse_frequency_step("one GHz")
+
+    def test_point_count_grid_is_uniform_and_includes_endpoints(self) -> None:
+        grid = MODULE.build_frequency_grid(
+            [1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("points", point_count=5),
+        )
+        self.assertEqual(
+            grid,
+            (1.0e9, 1.25e9, 1.5e9, 1.75e9, 2.0e9),
+        )
+
+    def test_step_grid_preserves_requested_steps_and_appends_stop(self) -> None:
+        grid = MODULE.build_frequency_grid(
+            [1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("step", step_hz=400.0e6),
+        )
+        self.assertEqual(grid, (1.0e9, 1.4e9, 1.8e9, 2.0e9))
+        exact_grid = MODULE.build_frequency_grid(
+            [1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("step", step_hz=500.0e6),
+        )
+        self.assertEqual(exact_grid, (1.0e9, 1.5e9, 2.0e9))
+        wider_than_span = MODULE.build_frequency_grid(
+            [1.0e9, 2.0e9],
+            MODULE.FrequencyGridRequest("step", step_hz=10.0e12),
+        )
+        self.assertEqual(wider_than_span, (1.0e9, 2.0e9))
+
+    def test_circuit_matrix_can_be_resampled_by_point_count(self) -> None:
+        matrix = FakeCircuitMatrix()
+        block = MODULE.circuit_matrix_to_block(
+            matrix,
+            "000001",
+            {"W": "1 mm"},
+            MODULE.FrequencyGridRequest("points", point_count=3),
+        )
+        self.assertEqual(block.frequencies_hz, (1.0e9, 1.5e9, 2.0e9))
+        self.assertEqual(matrix.sampled_frequencies, [1.0e9, 1.5e9, 2.0e9])
+        self.assertAlmostEqual(block.values[1][0].real, 0.15)
+        self.assertAlmostEqual(block.values[1][0].imag, 0.25)
+
+    def test_frequency_options_create_the_requested_mode(self) -> None:
+        point_arguments = MODULE._parse_arguments(["--frequency-points", "101"])
+        self.assertEqual(
+            MODULE._frequency_request_from_arguments(point_arguments),
+            MODULE.FrequencyGridRequest("points", point_count=101),
+        )
+        step_arguments = MODULE._parse_arguments(
+            ["--frequency-step", "25 MHz"]
+        )
+        self.assertEqual(
+            MODULE._frequency_request_from_arguments(step_arguments),
+            MODULE.FrequencyGridRequest("step", step_hz=25.0e6),
+        )
 
     def test_inconsistent_sparameter_frequency_grid_is_rejected(self) -> None:
         matrix = FakeMatrix()

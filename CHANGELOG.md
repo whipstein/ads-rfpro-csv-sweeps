@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.0 - 2026-08-17
+
+- Add interactive native, point-count, and step-size frequency-grid selection
+  to generic MDIF export.
+- Add `--frequency-points`, `--frequency-step`, and
+  `--native-frequency-grid` options for explicit RFPro launches.
+- Resample over each result's inclusive native frequency span through the
+  public `CircuitMatrix.Smatrix(frequency)` evaluator without re-simulation.
+- Accept step units from hertz through terahertz and retain the final native
+  endpoint when the requested step does not divide the span exactly.
+
+## 0.6.0 - 2026-08-17
+
+- Add a modeless RFPro sweep-geometry inspector that expands every native
+  parameter combination and previews it in the active 3-D geometry view.
+- Add Previous, Next, Fit View, and Check All controls without creating or
+  queueing simulations.
+- Report `geometry.isValid()` and `reasonWhyInvalid()` for every checked point,
+  while retaining interactive visual inspection for unintended valid shapes.
+- Restore the exact original project-parameter formulas when the inspector
+  closes and never save the temporary preview state.
+
 ## 0.5.0 - 2026-08-16
 
 - Set and verify the saved `SimulationData.reuseExistingResults` value before

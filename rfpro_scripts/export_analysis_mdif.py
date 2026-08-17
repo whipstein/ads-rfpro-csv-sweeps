@@ -31,6 +31,10 @@ DEFAULT_OUTPUT_PATH = ""
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_PARAMETER_NAMES = ""  # Comma-separated; empty exports all metadata.
 DEFAULT_REFERENCE_IMPEDANCE_OHMS = 50.0
+DEFAULT_FREQUENCY_MODE = "ask"  # One of: ask, native, points, step.
+DEFAULT_FREQUENCY_POINTS = 1000
+DEFAULT_FREQUENCY_STEP = "1 GHz"
+MAX_FREQUENCY_POINTS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,15 @@ class MDIFBlock:
     frequencies_hz: tuple[float, ...]
     labels: tuple[str, ...]
     values: tuple[tuple[complex, ...], ...]
+
+
+@dataclass(frozen=True)
+class FrequencyGridRequest:
+    """Requested MDIF frequency sampling across each result's native span."""
+
+    mode: str
+    point_count: int | None = None
+    step_hz: float | None = None
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -482,10 +495,134 @@ def smatrix_to_block(
     )
 
 
+_FREQUENCY_VALUE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
+    r"(Hz|kHz|MHz|GHz|THz)?\s*$",
+    re.IGNORECASE,
+)
+_FREQUENCY_MULTIPLIERS = {
+    "hz": 1.0,
+    "khz": 1.0e3,
+    "mhz": 1.0e6,
+    "ghz": 1.0e9,
+    "thz": 1.0e12,
+}
+
+
+def parse_frequency_step(value: str | float | int) -> float:
+    """Parse an export frequency step; a unitless value is interpreted as Hz."""
+
+    match = _FREQUENCY_VALUE.fullmatch(str(value))
+    if match is None:
+        raise ValueError(
+            "Frequency step must be a number optionally followed by Hz, kHz, "
+            "MHz, GHz, or THz."
+        )
+    magnitude = float(match.group(1))
+    unit = (match.group(2) or "Hz").casefold()
+    step_hz = magnitude * _FREQUENCY_MULTIPLIERS[unit]
+    if not math.isfinite(step_hz) or step_hz <= 0:
+        raise ValueError("Frequency step must be a positive finite value.")
+    return step_hz
+
+
+def validate_frequency_grid_request(request: FrequencyGridRequest) -> FrequencyGridRequest:
+    mode = request.mode.casefold()
+    if mode == "native":
+        return FrequencyGridRequest("native")
+    if mode == "points":
+        if request.point_count is None or not 2 <= request.point_count <= MAX_FREQUENCY_POINTS:
+            raise ValueError(
+                "Frequency point count must be between 2 and "
+                f"{MAX_FREQUENCY_POINTS:,}."
+            )
+        return FrequencyGridRequest("points", point_count=request.point_count)
+    if mode == "step":
+        if request.step_hz is None or not math.isfinite(request.step_hz):
+            raise ValueError("A positive finite frequency step is required.")
+        if request.step_hz <= 0:
+            raise ValueError("Frequency step must be a positive finite value.")
+        return FrequencyGridRequest("step", step_hz=request.step_hz)
+    raise ValueError(f"Unsupported frequency-grid mode: {request.mode!r}.")
+
+
+def frequency_grid_description(request: FrequencyGridRequest) -> str:
+    request = validate_frequency_grid_request(request)
+    if request.mode == "native":
+        return "native result frequencies"
+    if request.mode == "points":
+        return f"{request.point_count:,} uniformly spaced points"
+    return f"{request.step_hz:.16g} Hz maximum step"
+
+
+def build_frequency_grid(
+    native_frequencies_hz: Sequence[float], request: FrequencyGridRequest
+) -> tuple[float, ...]:
+    """Build a requested grid over the inclusive native result frequency span."""
+
+    native = tuple(float(value) for value in native_frequencies_hz)
+    if not native:
+        raise ValueError("S-parameter data is empty.")
+    if any(not math.isfinite(value) for value in native):
+        raise ValueError("Native frequency data contains NaN or infinity.")
+
+    request = validate_frequency_grid_request(request)
+    if request.mode == "native":
+        return native
+
+    start = min(native)
+    stop = max(native)
+    if start == stop:
+        raise ValueError(
+            "Cannot resample a result whose native frequency span contains only "
+            f"{start:.16g} Hz."
+        )
+
+    if request.mode == "points":
+        assert request.point_count is not None
+        denominator = request.point_count - 1
+        span = stop - start
+        grid = tuple(
+            start + span * index / denominator
+            for index in range(request.point_count)
+        )
+        return (*grid[:-1], stop)
+
+    assert request.step_hz is not None
+    span = stop - start
+    quotient = span / request.step_hz
+    if not math.isfinite(quotient) or quotient > MAX_FREQUENCY_POINTS:
+        raise ValueError(
+            "The requested frequency step would exceed the safety limit of "
+            f"{MAX_FREQUENCY_POINTS:,} points."
+        )
+    nearest_integer = round(quotient)
+    exact_multiple = nearest_integer >= 1 and math.isclose(
+        quotient,
+        nearest_integer,
+        rel_tol=1.0e-12,
+        abs_tol=1.0e-12,
+    )
+    full_intervals = nearest_integer if exact_multiple else math.floor(quotient)
+    point_count = int(full_intervals) + 1 + (0 if exact_multiple else 1)
+    if point_count > MAX_FREQUENCY_POINTS:
+        raise ValueError(
+            f"The requested frequency step would create {point_count:,} points; "
+            f"the safety limit is {MAX_FREQUENCY_POINTS:,}."
+        )
+    grid = [start + index * request.step_hz for index in range(int(full_intervals) + 1)]
+    if exact_multiple:
+        grid[-1] = stop
+    else:
+        grid.append(stop)
+    return tuple(grid)
+
+
 def circuit_matrix_to_block(
     circuit_matrix: Any,
     simulation_id: str,
     parameters: Mapping[str, str],
+    frequency_grid_request: FrequencyGridRequest | None = None,
 ) -> MDIFBlock:
     """Convert a file-backed RFPro ``CircuitMatrix`` into an MDIF block."""
 
@@ -494,9 +631,14 @@ def circuit_matrix_to_block(
         raise ValueError(f"Simulation {simulation_id}: S-matrix has no ports.")
 
     frequency_dataset = circuit_matrix.frequencies()
-    frequencies = tuple(float(value) for value in frequency_dataset.data)
-    if not frequencies:
-        raise ValueError(f"Simulation {simulation_id}: S-parameter data is empty.")
+    native_frequencies = tuple(float(value) for value in frequency_dataset.data)
+    try:
+        frequencies = build_frequency_grid(
+            native_frequencies,
+            frequency_grid_request or FrequencyGridRequest("native"),
+        )
+    except ValueError as error:
+        raise ValueError(f"Simulation {simulation_id}: {error}") from error
 
     labels = tuple(
         _sparameter_label(row + 1, column + 1)
@@ -564,6 +706,7 @@ def collect_analysis_blocks(
     analysis: Any,
     parameter_names: Sequence[str],
     skip_errors: bool,
+    frequency_grid_request: FrequencyGridRequest | None = None,
 ) -> list[MDIFBlock]:
     """Walk public RFPro analysis outputs and extract every usable S-matrix."""
 
@@ -628,6 +771,7 @@ def collect_analysis_blocks(
                 circuit_matrix,
                 simulation_id=str(simulation_id),
                 parameters=selected,
+                frequency_grid_request=frequency_grid_request,
             )
             if blocks and block.labels != blocks[0].labels:
                 raise ValueError(
@@ -762,6 +906,99 @@ def _parse_parameter_names(value: str) -> list[str]:
     return names
 
 
+def _frequency_request_from_arguments(arguments: argparse.Namespace) -> FrequencyGridRequest:
+    if arguments.native_frequency_grid:
+        return FrequencyGridRequest("native")
+    if arguments.frequency_points is not None:
+        return validate_frequency_grid_request(
+            FrequencyGridRequest("points", point_count=arguments.frequency_points)
+        )
+    if arguments.frequency_step is not None:
+        return validate_frequency_grid_request(
+            FrequencyGridRequest(
+                "step", step_hz=parse_frequency_step(arguments.frequency_step)
+            )
+        )
+
+    mode = str(DEFAULT_FREQUENCY_MODE).strip().casefold()
+    if mode == "ask":
+        return FrequencyGridRequest("ask")
+    if mode == "native":
+        return FrequencyGridRequest("native")
+    if mode == "points":
+        return validate_frequency_grid_request(
+            FrequencyGridRequest("points", point_count=int(DEFAULT_FREQUENCY_POINTS))
+        )
+    if mode == "step":
+        return validate_frequency_grid_request(
+            FrequencyGridRequest(
+                "step", step_hz=parse_frequency_step(DEFAULT_FREQUENCY_STEP)
+            )
+        )
+    raise ValueError(
+        "DEFAULT_FREQUENCY_MODE must be one of: ask, native, points, or step."
+    )
+
+
+def _choose_frequency_grid_request(
+    requested: FrequencyGridRequest,
+) -> FrequencyGridRequest:
+    if requested.mode.casefold() != "ask":
+        return validate_frequency_grid_request(requested)
+
+    from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
+
+    choices = [
+        "Native result frequencies",
+        "Uniform number of points",
+        "Frequency step size",
+    ]
+    selected, accepted = QInputDialog.getItem(
+        None,
+        "RFPro MDIF Frequency Grid",
+        "Export frequency sampling:",
+        choices,
+        0,
+        False,
+    )
+    if not accepted:
+        raise RuntimeError("Frequency-grid selection was cancelled.")
+    if selected == choices[0]:
+        return FrequencyGridRequest("native")
+    if selected == choices[1]:
+        point_count, accepted = QInputDialog.getInt(
+            None,
+            "RFPro MDIF Frequency Grid",
+            "Number of points, including both endpoints:",
+            max(2, min(int(DEFAULT_FREQUENCY_POINTS), MAX_FREQUENCY_POINTS)),
+            2,
+            MAX_FREQUENCY_POINTS,
+            1,
+        )
+        if not accepted:
+            raise RuntimeError("Frequency point-count entry was cancelled.")
+        return FrequencyGridRequest("points", point_count=point_count)
+
+    initial_step = str(DEFAULT_FREQUENCY_STEP)
+    while True:
+        step_text, accepted = QInputDialog.getText(
+            None,
+            "RFPro MDIF Frequency Grid",
+            "Frequency step (for example, 100 MHz):",
+            QLineEdit.EchoMode.Normal,
+            initial_step,
+        )
+        if not accepted:
+            raise RuntimeError("Frequency-step entry was cancelled.")
+        try:
+            step_hz = parse_frequency_step(str(step_text))
+        except ValueError as error:
+            QMessageBox.warning(None, "Invalid frequency step", str(error))
+            initial_step = str(step_text)
+            continue
+        return FrequencyGridRequest("step", step_hz=step_hz)
+
+
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export one RFPro analysis and all of its sweep results as generic MDIF.",
@@ -785,6 +1022,27 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "single reference impedance declared in the MDIF header; "
             "this option does not renormalize RFPro data"
+        ),
+    )
+    frequency_group = parser.add_mutually_exclusive_group()
+    frequency_group.add_argument(
+        "--native-frequency-grid",
+        action="store_true",
+        help="export the frequencies stored in each RFPro result",
+    )
+    frequency_group.add_argument(
+        "--frequency-points",
+        type=int,
+        help=(
+            "export this many uniformly spaced points over each result's "
+            "inclusive native frequency span"
+        ),
+    )
+    frequency_group.add_argument(
+        "--frequency-step",
+        help=(
+            "export with this maximum step over each result's inclusive native "
+            "span; accepts Hz, kHz, MHz, GHz, or THz"
         ),
     )
     parser.add_argument(
@@ -832,12 +1090,15 @@ def _print_qt_diagnostics(runtime: QtRuntime) -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = _parse_arguments(argv)
     parameter_names = _parse_parameter_names(arguments.parameter_names)
+    requested_frequency_grid = _frequency_request_from_arguments(arguments)
     qt_runtime = create_or_reuse_qapplication()
     _print_qt_diagnostics(qt_runtime)
 
     import empro
 
     analysis = _choose_analysis(empro.activeProject, arguments.analysis)
+    frequency_grid_request = _choose_frequency_grid_request(requested_frequency_grid)
+    print("Frequency grid: " + frequency_grid_description(frequency_grid_request))
     output_path = _choose_output_path(arguments.output, str(analysis.name))
     if output_path.exists() and not arguments.overwrite and not _confirm_overwrite(output_path):
         print("Export cancelled; the existing MDIF was not changed.")
@@ -848,11 +1109,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         analysis,
         parameter_names=parameter_names,
         skip_errors=arguments.skip_errors,
+        frequency_grid_request=frequency_grid_request,
     )
     write_mdif_atomic(output_path, blocks, arguments.reference_impedance)
     summary = (
         f"Exported {len(blocks)} RFPro result cases from analysis {analysis.name!r} "
-        f"to {output_path}."
+        f"to {output_path} using {frequency_grid_description(frequency_grid_request)}."
     )
     print(summary)
     from PySide6.QtWidgets import QMessageBox

@@ -9,18 +9,20 @@ directly in an open Keysight RFPro process:
   S-parameter results from an analysis to one generic MDIF file.
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
   later while requesting reuse of valid existing results.
+- `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
+  point and displays its regenerated geometry in RFPro for inspection.
 - `rfpro_scripts/diagnose_analysis_reuse.py` reports an analysis's saved reuse
   setting, result mappings, per-condition cache files, and reuse-related logs.
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.5.0**.
+The current release is **0.7.0**.
 
 ## Execution model
 
 These are in-application RFPro scripts. They use the active
 `empro.activeProject` and must not be run with an unrelated system Python.
-Each file is self-contained, including Qt startup, so RFPro can load either
+Each file is self-contained, including Qt startup, so RFPro can load any
 file without installing this repository as a Python package.
 
 From RFPro's Python console, run a script with the documented scripting
@@ -120,6 +122,44 @@ Useful importer options:
 --mode {ask,replace,append}
 --no-save
 --yes
+```
+
+## Inspect every sweep geometry
+
+Before launching an analysis, open the modeless sweep-geometry inspector:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(
+    r"C:\path\to\rfpro_scripts\preview_sweep_geometries.py",
+    ["--analysis", "My RF Analysis"],
+)
+```
+
+The inspector expands the selected analysis's native `parameterSequences`.
+Selecting a table row resets all swept parameters to their original formulas,
+applies that row's parameter combination, switches RFPro to the geometry view,
+and refreshes the 3-D model. The dialog is modeless, so the model can still be
+rotated, panned, and zoomed in the main RFPro window. **Previous**, **Next**,
+and **Fit View** support visual review without creating simulations.
+
+**Check All** regenerates every point and records the result of RFPro's public
+`activeProject.geometry.isValid()` check. Invalid points are highlighted and
+show `reasonWhyInvalid()` when RFPro supplies a reason. A `Valid` result only
+means RFPro accepts the geometry; visual review is still necessary for shapes
+that are technically valid but unintended.
+
+The script never saves the project and never creates, queues, reruns, or
+deletes a simulation. It captures the original formulas before opening and
+restores them when the inspector closes, including when a second inspector
+replaces an existing one.
+
+Useful inspector options:
+
+```text
+--analysis NAME
+--zoom-to-extents
 ```
 
 ## Explicitly run with existing-result reuse
@@ -258,6 +298,10 @@ scripting.run(
 )
 ```
 
+The interactive exporter asks whether to keep each result's native frequency
+samples, generate a specified number of uniformly spaced points, or use a
+frequency step size.
+
 For an explicit, non-interactive export:
 
 ```python
@@ -267,9 +311,36 @@ scripting.run(
         "--analysis", "My RF Analysis",
         "--output", r"C:\data\rfpro_sweeps.mdif",
         "--parameter-names", "W,L,Gap",
+        "--frequency-points", "401",
         "--overwrite",
     ],
 )
+```
+
+Use exactly one of these frequency-grid options:
+
+```text
+--native-frequency-grid
+--frequency-points 401
+--frequency-step "25 MHz"
+```
+
+Point-count mode includes both endpoints and spaces the requested number of
+points uniformly over each result's native minimum-to-maximum frequency span.
+Step mode starts at the native minimum, retains the requested spacing, and
+always includes the native maximum; its final interval is shorter when the
+span is not an exact multiple of the step. Unitless step values are hertz, and
+`Hz`, `kHz`, `MHz`, `GHz`, and `THz` are accepted. RFPro evaluates every
+requested S-matrix through the public `CircuitMatrix.Smatrix(frequency)` API;
+this resamples existing results and does not run another simulation.
+
+For direct RFPro launches that cannot pass arguments, configure these globals
+near the top of the exporter:
+
+```python
+DEFAULT_FREQUENCY_MODE = "ask"  # ask, native, points, or step
+DEFAULT_FREQUENCY_POINTS = 201
+DEFAULT_FREQUENCY_STEP = "100 MHz"
 ```
 
 The exporter uses `empro.output.AnalysisOutput` to enumerate analysis result
@@ -310,6 +381,9 @@ Useful exporter options:
 --analysis NAME
 --parameter-names W,L,Gap
 --reference-impedance 50
+--native-frequency-grid
+--frequency-points 401
+--frequency-step "25 MHz"
 --skip-errors
 --overwrite
 ```
@@ -373,7 +447,8 @@ Update 2.1 and EMPro 2026 corpus:
   `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
   `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,
   `SimulationOutput.metadata`, `SimulationOutput.simulationPath`,
-  `DataSetMatrix`, and `empro.toolkit.getCircuitMatrix()`.
+  `DataSetMatrix`, `empro.toolkit.getCircuitMatrix()`, and
+  `CircuitMatrix.Smatrix(frequency)` for frequency-grid evaluation.
 - `empro.toolkit.analysis.runAnalysis()` and its
   `reuseExistingIfPossible=True` option for explicitly starting only after the
   user confirms.
