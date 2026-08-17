@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.7.3**.
+The current release is **0.8.0**.
 
 ## Execution model
 
@@ -142,13 +142,31 @@ Selecting a table row resets all swept parameters to their original formulas,
 applies that row's parameter combination, switches RFPro to the geometry view,
 and refreshes the 3-D model. The dialog is modeless, so the model can still be
 rotated, panned, and zoomed in the main RFPro window. **Previous**, **Next**,
-and **Fit View** support visual review without creating simulations.
+and **Fit View** support visual review without creating simulations. **Fit
+View** only fits the geometry that is currently displayed; it does not change
+the project parameters. Use **Load Selected** to explicitly regenerate and
+display the highlighted table row, including when that row was already
+selected and therefore did not emit another selection-change event.
 
 **Check All** regenerates every point and records the result of RFPro's public
 `activeProject.geometry.isValid()` check. Invalid points are highlighted and
 show `reasonWhyInvalid()` when RFPro supplies a reason. A `Valid` result only
 means RFPro accepts the geometry; visual review is still necessary for shapes
 that are technically valid but unintended.
+
+**Check All + PDF** prompts for a report path, regenerates and fits every sweep
+point, saves one numbered PNG per captured geometry in a sibling `<report
+name>_images` directory, and creates one PDF page per checked point. Each page
+includes the analysis name, point/sequence/combination number, parameter
+values, validity result, and RFPro's failure reason when available. Existing
+image directories are never replaced; a numeric suffix is used instead.
+
+The report first tries the geometry view's OpenGL framebuffer, then its normal
+Qt widget capture, with a native-window capture as a final fallback. If one
+point cannot be generated or captured, checking continues and its PDF page
+records the error. Canceling after at least one point writes a partial PDF and
+keeps every PNG captured up to that point. The row that was selected before
+the batch is loaded again when the operation finishes.
 
 The script never saves the project and never creates, queues, reruns, or
 deletes a simulation. It captures the original formulas before opening and
@@ -461,6 +479,9 @@ Update 2.1 and EMPro 2026 corpus:
   `parameterSequences` and unit-preserving sweep values.
 - `python_scripts/addons/SimpleParameterSweep.py` for editable project
   parameters and `setParameterValues()`.
+- `python_scripts/startup.py` and `python_scripts/addons/ScaleViewZ.py` for
+  `activeProjectView()`, `showGeometryView()`, `geometryView()`, `updateView()`,
+  and fitting the active RFPro 3-D view.
 - EMPro public Python documentation for `Analysis.simulationSettings`,
   `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
   `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,
@@ -476,6 +497,9 @@ Update 2.1 and EMPro 2026 corpus:
   user confirms.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
+- Qt for Python's public `QOpenGLWidget.grabFramebuffer()`, `QWidget.grab()`,
+  `QImage.save()`, and `QPdfWriter`/`QPainter` APIs for in-session image capture
+  and multi-page PDF generation without an additional PDF dependency.
 
 The three private FEM environment variables used by the explicit runner are
 intentional project requirements supplied for the target RFPro installation;

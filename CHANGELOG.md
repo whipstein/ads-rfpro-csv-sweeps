@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0 - 2026-08-17
+
+- Add an explicit **Load Selected** inspector action that regenerates the
+  highlighted parameter combination even when the table selection has not
+  changed.
+- Add **Check All + PDF** to fit and capture every generated geometry, retain
+  numbered PNG images, and create a multi-page validation report containing
+  the parameters and RFPro validity result for each point.
+- Preserve successfully captured images and create a valid partial report when
+  the user cancels after at least one point.
+- Keep **Fit View** limited to fitting the geometry that is already displayed,
+  and document that distinction in the UI.
+
 ## 0.7.3 - 2026-08-17
 
 - Honor each enabled frequency plan's `sweepType` or legacy `type` when

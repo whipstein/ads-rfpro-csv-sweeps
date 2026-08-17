@@ -12,8 +12,10 @@ closes. The script deliberately does not save the project.
 from __future__ import annotations
 
 import argparse
+import html
 import itertools
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -55,6 +57,17 @@ class QtRuntime:
     plugin_file: Path | None
     application_was_created: bool
     environment_was_restored: bool
+
+
+@dataclass(frozen=True)
+class GeometryReportPage:
+    """One checked sweep point and its optional saved geometry image."""
+
+    point: SweepPoint
+    valid: bool | None
+    message: str
+    image_path: Path | None
+    capture_error: str = ""
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -443,6 +456,298 @@ def refresh_geometry_view(empro_module: Any, zoom_to_extents: bool = False) -> N
     empro_module.gui.processEvents()
 
 
+def _usable_capture_image(value: Any) -> Any | None:
+    """Normalize a Qt image/pixmap-like result and reject empty captures."""
+
+    if value is None:
+        return None
+    to_image = getattr(value, "toImage", None)
+    image = to_image() if callable(to_image) else value
+    is_null = getattr(image, "isNull", None)
+    if callable(is_null) and bool(is_null()):
+        return None
+    width = getattr(image, "width", None)
+    height = getattr(image, "height", None)
+    if callable(width) and callable(height):
+        if int(width()) <= 0 or int(height()) <= 0:
+            return None
+    return image
+
+
+def capture_geometry_view_image(
+    empro_module: Any, application: Any
+) -> tuple[Any, str]:
+    """Capture RFPro's active 3-D view through supported Qt widget methods."""
+
+    project_view = empro_module.gui.activeProjectView()
+    project_view.showGeometryView()
+    geometry_view = project_view.geometryView()
+    geometry_view.updateView()
+    empro_module.gui.processEvents()
+
+    candidates: list[tuple[str, Any]] = [("geometry view", geometry_view)]
+    seen = {id(geometry_view)}
+    for attribute_name in ("viewport", "widget", "glWidget", "openGLWidget"):
+        try:
+            attribute = getattr(geometry_view, attribute_name)
+            candidate = attribute() if callable(attribute) else attribute
+        except Exception:
+            continue
+        if candidate is not None and id(candidate) not in seen:
+            seen.add(id(candidate))
+            candidates.append((f"geometry view {attribute_name}", candidate))
+
+    failures: list[str] = []
+    for candidate_name, candidate in candidates:
+        for method_name in ("grabFramebuffer", "grab"):
+            method = getattr(candidate, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                image = _usable_capture_image(method())
+            except Exception as error:
+                failures.append(f"{candidate_name}.{method_name}(): {error}")
+                continue
+            if image is not None:
+                return image, f"{candidate_name}.{method_name}()"
+            failures.append(f"{candidate_name}.{method_name}() returned an empty image")
+
+        # A native-window capture is a final fallback for RFPro builds whose
+        # geometry wrapper does not expose the OpenGL framebuffer directly.
+        win_id_method = getattr(candidate, "winId", None)
+        if callable(win_id_method):
+            try:
+                screen_method = getattr(candidate, "screen", None)
+                screen = screen_method() if callable(screen_method) else None
+                if screen is None:
+                    screen = application.primaryScreen()
+                pixmap = screen.grabWindow(int(win_id_method()))
+                image = _usable_capture_image(pixmap)
+            except Exception as error:
+                failures.append(f"{candidate_name} native-window capture: {error}")
+            else:
+                if image is not None:
+                    return image, f"{candidate_name} native-window capture"
+                failures.append(
+                    f"{candidate_name} native-window capture returned an empty image"
+                )
+
+    details = "\n  ".join(failures) if failures else "no capture method was exposed"
+    raise RuntimeError(
+        "RFPro's active geometry view could not be captured through Qt. "
+        "The geometry checks can continue, but no image is available.\n  " + details
+    )
+
+
+def save_geometry_image(image: Any, path: Path) -> None:
+    """Save one captured Qt image as PNG and verify that it was written."""
+
+    save = getattr(image, "save", None)
+    if not callable(save) or not bool(save(str(path), "PNG")):
+        raise RuntimeError(f"Qt could not save the geometry image to {path}.")
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError(f"The geometry image was not written to {path}.")
+
+
+def default_geometry_report_filename(analysis_name: str) -> str:
+    """Build a portable default filename from the selected analysis name."""
+
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(analysis_name)).strip("._-")
+    return f"{stem or 'rfpro'}_geometry_validation.pdf"
+
+
+def next_available_image_directory(pdf_path: Path) -> Path:
+    """Choose a sibling image directory without replacing an older capture set."""
+
+    base = pdf_path.with_name(f"{pdf_path.stem}_images")
+    candidate = base
+    suffix = 2
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}_{suffix}")
+        suffix += 1
+    return candidate
+
+
+def _geometry_report_page_html(
+    analysis_name: str,
+    page: GeometryReportPage,
+    page_number: int,
+    report_page_count: int,
+    total_point_count: int,
+) -> str:
+    """Render the wrapped metadata header used on one PDF page."""
+
+    point = page.point
+    parameters = " &nbsp; | &nbsp; ".join(
+        f"<b>{html.escape(value.parameter_name)}</b>="
+        f"{html.escape(value.display)}"
+        for value in point.values
+    ) or "(baseline parameters)"
+    if page.valid is True:
+        status_color = "#1b5e20"
+        status = "Valid"
+    elif page.valid is False:
+        status_color = "#b71c1c"
+        status = "INVALID"
+    else:
+        status_color = "#795500"
+        status = "Automatic validity unavailable"
+    details = page.message
+    if page.capture_error:
+        details += f" Capture: {page.capture_error}"
+
+    return f"""
+<style>
+  body {{ font-family: sans-serif; font-size: 9pt; color: #202124; }}
+  h1 {{ font-size: 18pt; margin: 0 0 6px 0; }}
+  p {{ margin: 2px 0; }}
+</style>
+<h1>RFPro Geometry Validation</h1>
+<p><b>Analysis:</b> {html.escape(str(analysis_name))}</p>
+<p><b>Sweep point:</b> {point.point_index + 1} of {total_point_count}
+   &nbsp;&nbsp; <b>Sequence:</b> {point.sequence_index + 1}
+   &nbsp;&nbsp; <b>Combination:</b> {point.combination_index + 1}</p>
+<p style="margin-top: 6px;"><b>Parameters:</b> {parameters}</p>
+<p style="color: {status_color}; margin-top: 6px;">
+  <b>{status}:</b> {html.escape(details)}
+</p>
+<p style="color: #5f6368;">Report page {page_number} of {report_page_count}</p>
+""".strip()
+
+
+def write_geometry_pdf_report(
+    output_path: Path,
+    analysis_name: str,
+    pages: Sequence[GeometryReportPage],
+    total_point_count: int,
+) -> None:
+    """Create a fitted multi-page PDF using RFPro's existing PySide6 runtime."""
+
+    if not pages:
+        raise ValueError("At least one checked geometry point is required for a PDF.")
+
+    from PySide6.QtCore import QRectF, QSizeF, Qt
+    from PySide6.QtGui import (
+        QColor,
+        QImage,
+        QPageSize,
+        QPainter,
+        QPdfWriter,
+        QTextDocument,
+    )
+
+    writer = QPdfWriter(str(output_path))
+    writer.setCreator("ads-rfpro-csv-sweeps")
+    writer.setTitle(f"RFPro Geometry Validation - {analysis_name}")
+    writer.setResolution(150)
+    writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
+
+    painter = QPainter()
+    if not painter.begin(writer):
+        raise RuntimeError(f"Qt could not create the PDF report at {output_path}.")
+    try:
+        for page_index, report_page in enumerate(pages):
+            if page_index and not writer.newPage():
+                raise RuntimeError(
+                    f"Qt could not start PDF page {page_index + 1}."
+                )
+
+            page_width = float(writer.width())
+            page_height = float(writer.height())
+            margin = float(writer.resolution()) * 0.45
+            spacing = float(writer.resolution()) * 0.12
+            footer_height = float(writer.resolution()) * 0.22
+            content_width = page_width - 2.0 * margin
+
+            header = QTextDocument()
+            header.setHtml(
+                _geometry_report_page_html(
+                    analysis_name,
+                    report_page,
+                    page_index + 1,
+                    len(pages),
+                    total_point_count,
+                )
+            )
+            header.setTextWidth(content_width)
+            natural_header_height = float(header.size().height())
+            maximum_header_height = page_height * 0.42
+            header_scale = min(
+                1.0, maximum_header_height / max(1.0, natural_header_height)
+            )
+            header_height = natural_header_height * header_scale
+            painter.save()
+            painter.translate(margin, margin)
+            painter.scale(header_scale, header_scale)
+            header.drawContents(
+                painter,
+                QRectF(
+                    0.0,
+                    0.0,
+                    content_width,
+                    natural_header_height,
+                ),
+            )
+            painter.restore()
+
+            image_top = margin + header_height + spacing
+            image_height = max(
+                float(writer.resolution()),
+                page_height - image_top - margin - footer_height,
+            )
+            image_bounds = QRectF(margin, image_top, content_width, image_height)
+
+            image = (
+                QImage(str(report_page.image_path))
+                if report_page.image_path is not None
+                else QImage()
+            )
+            if not image.isNull():
+                scaled_size = QSizeF(image.size())
+                scaled_size.scale(
+                    image_bounds.size(), Qt.AspectRatioMode.KeepAspectRatio
+                )
+                target = QRectF(
+                    image_bounds.x()
+                    + (image_bounds.width() - scaled_size.width()) / 2.0,
+                    image_bounds.y()
+                    + (image_bounds.height() - scaled_size.height()) / 2.0,
+                    scaled_size.width(),
+                    scaled_size.height(),
+                )
+                painter.drawImage(target, image)
+            else:
+                painter.setPen(QColor("#b71c1c"))
+                painter.drawRect(image_bounds)
+                painter.drawText(
+                    image_bounds,
+                    int(
+                        Qt.AlignmentFlag.AlignCenter
+                        | Qt.TextFlag.TextWordWrap
+                    ),
+                    report_page.capture_error
+                    or "No geometry image was captured for this point.",
+                )
+
+            painter.setPen(QColor("#5f6368"))
+            painter.drawText(
+                QRectF(
+                    margin,
+                    page_height - margin - footer_height,
+                    content_width,
+                    footer_height,
+                ),
+                int(Qt.AlignmentFlag.AlignCenter),
+                f"Point {report_page.point.point_index + 1} - "
+                f"page {page_index + 1} of {len(pages)}",
+            )
+    finally:
+        painter.end()
+
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        raise RuntimeError(f"The PDF report was not written to {output_path}.")
+
+
 def _status_text(valid: bool | None, message: str) -> str:
     if valid is True:
         return "Valid"
@@ -497,7 +802,9 @@ def create_inspector_dialog(
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (
         QAbstractItemView,
+        QApplication,
         QDialog,
+        QFileDialog,
         QHBoxLayout,
         QLabel,
         QMessageBox,
@@ -526,8 +833,10 @@ def create_inspector_dialog(
             layout = QVBoxLayout(self)
             instructions = QLabel(
                 "Select a row to apply that parameter combination to RFPro's active "
-                "geometry view. No simulation is created or queued. Original parameter "
-                "formulas are restored when this window closes."
+                "geometry view. Use Load Selected to explicitly regenerate the "
+                "highlighted row; Fit View only fits the geometry already displayed. "
+                "No simulation is created or queued. Original parameter formulas are "
+                "restored when this window closes."
             )
             instructions.setWordWrap(True)
             layout.addWidget(instructions)
@@ -567,19 +876,34 @@ def create_inspector_dialog(
             controls = QHBoxLayout()
             self.previous_button = QPushButton("Previous")
             self.next_button = QPushButton("Next")
+            self.load_selected_button = QPushButton("Load Selected")
             self.fit_button = QPushButton("Fit View")
             self.check_all_button = QPushButton("Check All")
+            self.report_button = QPushButton("Check All + PDF")
             close_button = QPushButton("Close and Restore")
             self.previous_button.clicked.connect(self._previous)
             self.next_button.clicked.connect(self._next)
+            self.load_selected_button.clicked.connect(self._load_selected)
             self.fit_button.clicked.connect(self._fit_view)
             self.check_all_button.clicked.connect(self._check_all)
+            self.report_button.clicked.connect(self._check_all_with_pdf)
             close_button.clicked.connect(self.close)
+            self.load_selected_button.setToolTip(
+                "Regenerate and display the parameter combination in the highlighted row."
+            )
+            self.fit_button.setToolTip(
+                "Fit the geometry currently displayed; this does not load a table row."
+            )
+            self.report_button.setToolTip(
+                "Check every point, save one PNG per geometry, and create a PDF."
+            )
             for button in (
                 self.previous_button,
                 self.next_button,
+                self.load_selected_button,
                 self.fit_button,
                 self.check_all_button,
+                self.report_button,
                 close_button,
             ):
                 controls.addWidget(button)
@@ -628,19 +952,24 @@ def create_inspector_dialog(
             self.previous_button.setEnabled(current_row > 0)
             self.next_button.setEnabled(current_row + 1 < len(points))
 
-        def _apply_row(self, row: int) -> None:
+        def _apply_row(
+            self, row: int, force_fit: bool | None = None
+        ) -> bool:
             if self._applying or row < 0 or row >= len(points):
-                return
+                return False
             self._applying = True
             try:
                 apply_sweep_point(project, baseline_formulas, points[row])
-                refresh_geometry_view(empro_module, zoom_to_extents)
+                fit_view = zoom_to_extents if force_fit is None else force_fit
+                refresh_geometry_view(empro_module, fit_view)
                 valid, message = geometry_validity(project)
                 self._set_status(row, valid, message)
+                return True
             except Exception as error:
                 message = f"Could not generate geometry: {error}"
                 self._set_status(row, False, message)
                 print(f"Point {row + 1}: {message}")
+                return False
             finally:
                 self._applying = False
 
@@ -659,6 +988,9 @@ def create_inspector_dialog(
             if row + 1 < len(points):
                 self.table.selectRow(row + 1)
 
+        def _load_selected(self) -> None:
+            self._apply_row(max(0, self.table.currentRow()))
+
         def _fit_view(self) -> None:
             try:
                 refresh_geometry_view(empro_module, True)
@@ -666,9 +998,48 @@ def create_inspector_dialog(
                 QMessageBox.warning(self, "Could not fit geometry view", str(error))
 
         def _check_all(self) -> None:
+            self._run_check_all(None)
+
+        def _check_all_with_pdf(self) -> None:
+            selected_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save RFPro Geometry Validation Report",
+                default_geometry_report_filename(str(analysis.name)),
+                "PDF files (*.pdf)",
+            )
+            if not selected_path:
+                return
+            pdf_path = Path(selected_path)
+            if pdf_path.suffix.casefold() != ".pdf":
+                pdf_path = pdf_path.with_suffix(".pdf")
+            self._run_check_all(pdf_path)
+
+        def _run_check_all(self, pdf_path: Path | None) -> None:
             selected_row = max(0, self.table.currentRow())
+            image_directory = (
+                next_available_image_directory(pdf_path)
+                if pdf_path is not None
+                else None
+            )
+            if image_directory is not None:
+                try:
+                    image_directory.mkdir(parents=True, exist_ok=False)
+                except Exception as error:
+                    QMessageBox.warning(
+                        self,
+                        "Could not create report image directory",
+                        str(error),
+                    )
+                    return
+
+            report_pages: list[GeometryReportPage] = []
+            capture_failures = 0
             progress = QProgressDialog(
-                "Generating and checking every geometry point...",
+                (
+                    "Generating, checking, and capturing every geometry point..."
+                    if pdf_path is not None
+                    else "Generating and checking every geometry point..."
+                ),
                 "Cancel",
                 0,
                 len(points),
@@ -685,13 +1056,93 @@ def create_inspector_dialog(
                 )
                 progress.setValue(row)
                 empro_module.gui.processEvents()
-                self._apply_row(row)
+                generated = self._apply_row(
+                    row, force_fit=True if pdf_path is not None else None
+                )
+                if pdf_path is not None:
+                    status = self._statuses[row]
+                    assert status is not None
+                    valid, message = status
+                    image_path: Path | None = None
+                    capture_error = ""
+                    if generated:
+                        assert image_directory is not None
+                        image_path = image_directory / f"point_{row + 1:04d}.png"
+                        try:
+                            image, capture_method = capture_geometry_view_image(
+                                empro_module, QApplication.instance()
+                            )
+                            save_geometry_image(image, image_path)
+                            print(
+                                f"Captured point {row + 1} via "
+                                f"{capture_method}: {image_path}"
+                            )
+                        except Exception as error:
+                            image_path = None
+                            capture_error = str(error)
+                            capture_failures += 1
+                    else:
+                        capture_error = (
+                            "Geometry generation failed; no image was captured."
+                        )
+                        capture_failures += 1
+                    report_pages.append(
+                        GeometryReportPage(
+                            point=points[row],
+                            valid=valid,
+                            message=message,
+                            image_path=image_path,
+                            capture_error=capture_error,
+                        )
+                    )
             if not progress.wasCanceled():
                 progress.setValue(len(points))
+            else:
+                progress.close()
             self.table.blockSignals(True)
             self.table.selectRow(selected_row)
             self.table.blockSignals(False)
             self._apply_row(selected_row)
+
+            if pdf_path is None or not report_pages:
+                return
+            try:
+                write_geometry_pdf_report(
+                    pdf_path,
+                    str(analysis.name),
+                    report_pages,
+                    len(points),
+                )
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Could not create geometry PDF",
+                    f"{error}\n\nCaptured PNG files remain in:\n{image_directory}",
+                )
+                return
+
+            completion = (
+                f"Created {len(report_pages)} PDF page(s) from "
+                f"{len(points)} sweep point(s).\n\n"
+                f"PDF:\n{pdf_path}\n\nPNG images:\n{image_directory}"
+            )
+            if progress.wasCanceled():
+                completion = (
+                    "The check was canceled; a partial report was saved.\n\n"
+                    + completion
+                )
+            if capture_failures:
+                QMessageBox.warning(
+                    self,
+                    "Geometry report created with capture failures",
+                    completion
+                    + f"\n\nPoints without images: {capture_failures}. "
+                    "Their PDF pages contain the failure details.",
+                )
+            else:
+                QMessageBox.information(
+                    self, "Geometry report created", completion
+                )
 
         def restore_original_parameters(self) -> None:
             if self._restored:

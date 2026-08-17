@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -108,6 +109,70 @@ class FakeApplication:
         self.process_events_calls += 1
 
 
+class FakeCaptureImage:
+    def __init__(self, null: bool = False) -> None:
+        self.null = null
+        self.saved_paths: list[Path] = []
+
+    def isNull(self) -> bool:
+        return self.null
+
+    def width(self) -> int:
+        return 0 if self.null else 640
+
+    def height(self) -> int:
+        return 0 if self.null else 480
+
+    def save(self, path: str, image_format: str) -> bool:
+        self.saved_paths.append(Path(path))
+        Path(path).write_bytes(b"fake png")
+        return image_format == "PNG"
+
+
+class FakeCapturePixmap:
+    def __init__(self, image: FakeCaptureImage) -> None:
+        self.image = image
+
+    def toImage(self) -> FakeCaptureImage:
+        return self.image
+
+
+class FakeGeometryView:
+    def __init__(self, image: FakeCaptureImage) -> None:
+        self.image = image
+        self.update_calls = 0
+
+    def updateView(self) -> None:
+        self.update_calls += 1
+
+    def grabFramebuffer(self) -> FakeCaptureImage:
+        return self.image
+
+
+class FakeProjectView:
+    def __init__(self, geometry_view: FakeGeometryView) -> None:
+        self.geometry_view = geometry_view
+        self.show_calls = 0
+
+    def showGeometryView(self) -> None:
+        self.show_calls += 1
+
+    def geometryView(self) -> FakeGeometryView:
+        return self.geometry_view
+
+
+class FakeCaptureGui:
+    def __init__(self, project_view: FakeProjectView) -> None:
+        self.project_view = project_view
+        self.process_events_calls = 0
+
+    def activeProjectView(self) -> FakeProjectView:
+        return self.project_view
+
+    def processEvents(self) -> None:
+        self.process_events_calls += 1
+
+
 class PreviewSweepGeometryTests(unittest.TestCase):
     def test_sequences_expand_as_concatenated_cartesian_products(self) -> None:
         settings = FakeSettings(
@@ -189,6 +254,84 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             ),
             (False, "self-intersection"),
         )
+
+    def test_geometry_capture_prefers_the_opengl_framebuffer(self) -> None:
+        image = FakeCaptureImage()
+        geometry_view = FakeGeometryView(image)
+        project_view = FakeProjectView(geometry_view)
+        gui = FakeCaptureGui(project_view)
+        empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+        captured, method = MODULE.capture_geometry_view_image(
+            empro_module, application=object()
+        )
+
+        self.assertIs(captured, image)
+        self.assertEqual(method, "geometry view.grabFramebuffer()")
+        self.assertEqual(project_view.show_calls, 1)
+        self.assertEqual(geometry_view.update_calls, 1)
+        self.assertEqual(gui.process_events_calls, 1)
+
+    def test_pixmap_capture_is_normalized_to_an_image(self) -> None:
+        image = FakeCaptureImage()
+        self.assertIs(
+            MODULE._usable_capture_image(FakeCapturePixmap(image)), image
+        )
+        self.assertIsNone(
+            MODULE._usable_capture_image(FakeCapturePixmap(FakeCaptureImage(True)))
+        )
+
+    def test_geometry_png_is_saved_and_verified(self) -> None:
+        image = FakeCaptureImage()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "point_0001.png"
+            MODULE.save_geometry_image(image, output)
+            self.assertEqual(output.read_bytes(), b"fake png")
+
+    def test_report_paths_do_not_replace_prior_image_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "geometry report.pdf"
+            first = MODULE.next_available_image_directory(pdf_path)
+            self.assertEqual(first.name, "geometry report_images")
+            first.mkdir()
+            second = MODULE.next_available_image_directory(pdf_path)
+            self.assertEqual(second.name, "geometry report_images_2")
+        self.assertEqual(
+            MODULE.default_geometry_report_filename("My RF/Analysis"),
+            "My_RF_Analysis_geometry_validation.pdf",
+        )
+
+    def test_pdf_page_metadata_is_escaped_and_complete(self) -> None:
+        point = MODULE.SweepPoint(
+            point_index=2,
+            sequence_index=1,
+            combination_index=4,
+            values=(MODULE.SweepValue("W<1", 1.0, "2 & 3 mm"),),
+        )
+        page = MODULE.GeometryReportPage(
+            point=point,
+            valid=False,
+            message="self-intersection <edge>",
+            image_path=None,
+            capture_error="no image & retry",
+        )
+
+        report_html = MODULE._geometry_report_page_html(
+            "Analysis <A>", page, 1, 1, 10
+        )
+
+        self.assertIn("Analysis &lt;A&gt;", report_html)
+        self.assertIn("W&lt;1", report_html)
+        self.assertIn("2 &amp; 3 mm", report_html)
+        self.assertIn("Sweep point:</b> 3 of 10", report_html)
+        self.assertIn("INVALID", report_html)
+        self.assertIn("no image &amp; retry", report_html)
+
+    def test_pdf_report_rejects_an_empty_page_set_before_loading_qt(self) -> None:
+        with self.assertRaisesRegex(ValueError, "At least one"):
+            MODULE.write_geometry_pdf_report(
+                Path("unused.pdf"), "Analysis", [], total_point_count=0
+            )
 
     def test_existing_inspector_is_closed_before_new_one_is_registered(self) -> None:
         application = FakeApplication()
