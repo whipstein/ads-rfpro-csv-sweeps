@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.3 - 2026-08-17
+
+- Replace all framebuffer, widget-grab, and native-window screenshot attempts
+  with RFPro's actual **View > Export Image** action.
+- Drive the action's save dialog with a numbered PNG path and select PNG when
+  the export dialog offers multiple image formats.
+- Require RFPro to create a nonempty PNG for every included point; stop on the
+  first export failure and do not create a placeholder PDF.
+- Report the discovered menu action and save-dialog state when the native
+  export cannot be completed, while retaining any PNGs already exported.
+
 ## 0.8.2 - 2026-08-17
 
 - Capture validation images from the visible RFPro

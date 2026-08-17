@@ -123,46 +123,6 @@ class FakeApplication:
         self.process_events_calls += 1
 
 
-class FakeCaptureImage:
-    def __init__(self, null: bool = False) -> None:
-        self.null = null
-        self.saved_paths: list[Path] = []
-
-    def isNull(self) -> bool:
-        return self.null
-
-    def width(self) -> int:
-        return 0 if self.null else 640
-
-    def height(self) -> int:
-        return 0 if self.null else 480
-
-    def save(self, path: str, image_format: str) -> bool:
-        self.saved_paths.append(Path(path))
-        Path(path).write_bytes(b"fake png")
-        return image_format == "PNG"
-
-
-class FakeCapturePixmap:
-    def __init__(self, image: FakeCaptureImage) -> None:
-        self.image = image
-
-    def toImage(self) -> FakeCaptureImage:
-        return self.image
-
-
-class FakeGeometryView:
-    def __init__(self, image: FakeCaptureImage) -> None:
-        self.image = image
-        self.update_calls = 0
-
-    def updateView(self) -> None:
-        self.update_calls += 1
-
-    def grabFramebuffer(self) -> FakeCaptureImage:
-        return self.image
-
-
 class FakeGeometryViewController:
     def __init__(self) -> None:
         self.update_calls = 0
@@ -171,30 +131,59 @@ class FakeGeometryViewController:
         self.update_calls += 1
 
 
-class FakeGeometryViewWidget:
-    def __init__(self, image: FakeCaptureImage) -> None:
-        self.image = image
-        self.grab_calls = 0
+class FakeAction:
+    def __init__(self, text: str, on_trigger=None, menu=None) -> None:
+        self.text = text
+        self.enabled = True
+        self.on_trigger = on_trigger
+        self.menu = menu
+        self.trigger_calls = 0
 
-    def grab(self) -> FakeCapturePixmap:
-        self.grab_calls += 1
-        return FakeCapturePixmap(self.image)
+    def trigger(self) -> None:
+        self.trigger_calls += 1
+        if self.on_trigger is not None:
+            self.on_trigger()
+
+
+class FakeMenu:
+    def __init__(self, actions) -> None:
+        self._actions = list(actions)
+
+    def actions(self):
+        return list(self._actions)
+
+
+class FakeSaveDialogAutomation:
+    def __init__(self, _application, _output_path: Path) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def diagnostics(self) -> str:
+        return "fake automation"
 
 
 class FakeProjectView:
-    def __init__(self, geometry_view, geometry_widget=None) -> None:
+    def __init__(self, geometry_view, view_menu=None) -> None:
         self.geometry_view = geometry_view
-        self.geometry_widget = geometry_widget
+        self.view_menu = view_menu or FakeMenu([])
         self.show_calls = 0
 
     def showGeometryView(self) -> None:
         self.show_calls += 1
 
-    def geometryView(self) -> FakeGeometryView:
+    def geometryView(self):
         return self.geometry_view
 
-    def geometryViewWidget(self):
-        return self.geometry_widget
+    def menu(self, name: str):
+        if name != "view":
+            raise KeyError(name)
+        return self.view_menu
 
 
 class FakeCaptureGui:
@@ -325,54 +314,80 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             (False, "self-intersection"),
         )
 
-    def test_geometry_capture_uses_the_rfpro_geometry_view_widget(self) -> None:
-        image = FakeCaptureImage()
-        geometry_view = FakeGeometryViewController()
-        geometry_widget = FakeGeometryViewWidget(image)
-        project_view = FakeProjectView(geometry_view, geometry_widget)
-        gui = FakeCaptureGui(project_view)
-        empro_module = type("FakeEmpro", (), {"gui": gui})()
-
-        captured, method = MODULE.capture_geometry_view_image(
-            empro_module, application=object()
+    def test_export_image_action_is_found_recursively_in_the_view_menu(self) -> None:
+        export_action = FakeAction("&Export Image...")
+        submenu_action = FakeAction("Export", menu=FakeMenu([export_action]))
+        project_view = FakeProjectView(
+            FakeGeometryViewController(), FakeMenu([submenu_action])
         )
 
-        self.assertIs(captured, image)
-        self.assertEqual(method, "geometry view widget.grab()")
-        self.assertEqual(project_view.show_calls, 1)
-        self.assertEqual(geometry_view.update_calls, 1)
-        self.assertEqual(geometry_widget.grab_calls, 1)
-        self.assertEqual(gui.process_events_calls, 1)
-
-    def test_geometry_capture_falls_back_to_the_scene_controller(self) -> None:
-        image = FakeCaptureImage()
-        geometry_view = FakeGeometryView(image)
-        project_view = FakeProjectView(geometry_view)
-        gui = FakeCaptureGui(project_view)
-        empro_module = type("FakeEmpro", (), {"gui": gui})()
-
-        captured, method = MODULE.capture_geometry_view_image(
-            empro_module, application=object()
+        action, description = MODULE.find_rfpro_export_image_action(
+            project_view,
+            FakeApplication(),
+            qt_action_type=None,
         )
 
-        self.assertIs(captured, image)
-        self.assertEqual(method, "geometry view controller.grabFramebuffer()")
+        self.assertIs(action, export_action)
+        self.assertEqual(description, "RFPro View menu > &Export Image...")
 
-    def test_pixmap_capture_is_normalized_to_an_image(self) -> None:
-        image = FakeCaptureImage()
-        self.assertIs(
-            MODULE._usable_capture_image(FakeCapturePixmap(image)), image
-        )
-        self.assertIsNone(
-            MODULE._usable_capture_image(FakeCapturePixmap(FakeCaptureImage(True)))
+    def test_missing_export_action_reports_the_view_menu_contents(self) -> None:
+        project_view = FakeProjectView(
+            FakeGeometryViewController(), FakeMenu([FakeAction("Fit View")])
         )
 
-    def test_geometry_png_is_saved_and_verified(self) -> None:
-        image = FakeCaptureImage()
+        with self.assertRaisesRegex(
+            RuntimeError, "View menu: Fit View"
+        ):
+            MODULE.find_rfpro_export_image_action(
+                project_view,
+                FakeApplication(),
+                qt_action_type=None,
+            )
+
+    def test_geometry_png_uses_rfpro_export_image_action_and_is_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "point_0001.png"
-            MODULE.save_geometry_image(image, output)
-            self.assertEqual(output.read_bytes(), b"fake png")
+            export_action = FakeAction(
+                "Export Image...", lambda: output.write_bytes(b"rfpro png")
+            )
+            geometry_view = FakeGeometryViewController()
+            project_view = FakeProjectView(
+                geometry_view, FakeMenu([export_action])
+            )
+            gui = FakeCaptureGui(project_view)
+            empro_module = type("FakeEmpro", (), {"gui": gui})()
+
+            method = MODULE.export_geometry_view_png(
+                empro_module,
+                FakeApplication(),
+                output,
+                automation_factory=FakeSaveDialogAutomation,
+            )
+
+            self.assertEqual(output.read_bytes(), b"rfpro png")
+            self.assertEqual(method, "RFPro View menu > Export Image...")
+            self.assertEqual(export_action.trigger_calls, 1)
+            self.assertEqual(project_view.show_calls, 1)
+            self.assertEqual(geometry_view.update_calls, 1)
+
+    def test_export_fails_when_rfpro_does_not_create_the_png(self) -> None:
+        export_action = FakeAction("Export Image...")
+        project_view = FakeProjectView(
+            FakeGeometryViewController(), FakeMenu([export_action])
+        )
+        gui = FakeCaptureGui(project_view)
+        empro_module = type("FakeEmpro", (), {"gui": gui})()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "point_0001.png"
+            with self.assertRaisesRegex(
+                RuntimeError, "triggered, but RFPro did not create"
+            ):
+                MODULE.export_geometry_view_png(
+                    empro_module,
+                    FakeApplication(),
+                    output,
+                    automation_factory=FakeSaveDialogAutomation,
+                )
 
     def test_report_paths_do_not_replace_prior_image_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

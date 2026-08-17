@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -528,116 +529,395 @@ def refresh_geometry_view(empro_module: Any, zoom_to_extents: bool = False) -> N
         empro_module.gui.processEvents()
 
 
-def _usable_capture_image(value: Any) -> Any | None:
-    """Normalize a Qt image/pixmap-like result and reject empty captures."""
+def _call_or_value(value: Any, default: Any = None) -> Any:
+    """Read either a Qt-style method or an EMPro wrapper property."""
 
     if value is None:
-        return None
-    to_image = getattr(value, "toImage", None)
-    image = to_image() if callable(to_image) else value
-    is_null = getattr(image, "isNull", None)
-    if callable(is_null) and bool(is_null()):
-        return None
-    width = getattr(image, "width", None)
-    height = getattr(image, "height", None)
-    if callable(width) and callable(height):
-        if int(width()) <= 0 or int(height()) <= 0:
-            return None
-    return image
+        return default
+    try:
+        return value() if callable(value) else value
+    except Exception:
+        return default
 
 
-def capture_geometry_view_image(
-    empro_module: Any, application: Any
+def _action_text(action: Any) -> str:
+    return str(_call_or_value(getattr(action, "text", None), "") or "")
+
+
+def _normalized_action_text(text: str) -> str:
+    without_mnemonics = str(text).replace("&", "").replace("…", " ")
+    return " ".join(re.findall(r"[a-z0-9]+", without_mnemonics.casefold()))
+
+
+def _iter_empro_menu_actions(menu: Any) -> Iterable[Any]:
+    """Yield actions recursively from an EMPro menu wrapper."""
+
+    pending = [menu]
+    seen_menus: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen_menus:
+            continue
+        seen_menus.add(id(current))
+        actions = _call_or_value(getattr(current, "actions", None), []) or []
+        for action in actions:
+            yield action
+            submenu = _call_or_value(getattr(action, "menu", None), None)
+            if submenu is not None:
+                pending.append(submenu)
+
+
+def _action_is_enabled(action: Any) -> bool:
+    enabled = _call_or_value(
+        getattr(action, "isEnabled", None),
+        _call_or_value(getattr(action, "enabled", None), True),
+    )
+    return bool(enabled)
+
+
+def _action_can_trigger(action: Any) -> bool:
+    return callable(getattr(action, "trigger", None)) or callable(
+        getattr(action, "onTriggered", None)
+    )
+
+
+def _action_trigger(action: Any) -> None:
+    """Activate the same QAction slot used by a manual menu click."""
+
+    trigger = getattr(action, "trigger", None)
+    if callable(trigger):
+        trigger()
+        return
+    on_triggered = getattr(action, "onTriggered", None)
+    if callable(on_triggered):
+        try:
+            on_triggered(False)
+        except TypeError:
+            on_triggered()
+        return
+    raise RuntimeError(
+        f"The RFPro action {_action_text(action)!r} exposes no trigger method."
+    )
+
+
+def find_rfpro_export_image_action(
+    project_view: Any,
+    application: Any,
+    qt_action_type: type[Any] | None = None,
 ) -> tuple[Any, str]:
-    """Capture RFPro's active 3-D view through its GUI widget."""
+    """Find RFPro's View > Export Image action without invoking it."""
 
+    records: list[tuple[int, Any, str]] = []
+    discovered: list[str] = []
+    try:
+        view_menu = project_view.menu("view")
+    except Exception as error:
+        view_menu = None
+        discovered.append(f"RFPro View menu unavailable: {error}")
+    if view_menu is not None:
+        for action in _iter_empro_menu_actions(view_menu):
+            text = _action_text(action)
+            if text:
+                discovered.append(f"View menu: {text}")
+            normalized = _normalized_action_text(text)
+            if "export" in normalized and "image" in normalized:
+                if not _action_can_trigger(action):
+                    discovered.append(
+                        f"View menu action cannot be triggered from Python: {text}"
+                    )
+                    continue
+                score = 300 if normalized == "export image" else 250
+                score += 20 if _action_is_enabled(action) else 0
+                records.append((score, action, f"RFPro View menu > {text}"))
+
+    if qt_action_type is None:
+        try:
+            from PySide6.QtGui import QAction
+
+            qt_action_type = QAction
+        except Exception:
+            qt_action_type = None
+    if qt_action_type is not None:
+        seen_actions: set[int] = set()
+        top_levels = _call_or_value(
+            getattr(application, "topLevelWidgets", None), []
+        ) or []
+        for top_level in top_levels:
+            window_title = str(
+                _call_or_value(getattr(top_level, "windowTitle", None), "") or ""
+            )
+            find_children = getattr(top_level, "findChildren", None)
+            if not callable(find_children):
+                continue
+            try:
+                actions = find_children(qt_action_type)
+            except Exception:
+                continue
+            for action in actions:
+                if id(action) in seen_actions:
+                    continue
+                seen_actions.add(id(action))
+                text = _action_text(action)
+                normalized = _normalized_action_text(text)
+                if "export" not in normalized or "image" not in normalized:
+                    continue
+                discovered.append(f"Qt window {window_title!r}: {text}")
+                if not _action_can_trigger(action):
+                    continue
+                score = 200 if normalized == "export image" else 150
+                title_normalized = window_title.casefold()
+                if "rfpro" in title_normalized or "empro" in title_normalized:
+                    score += 20
+                if _action_is_enabled(action):
+                    score += 10
+                records.append(
+                    (score, action, f"Qt window {window_title!r} > {text}")
+                )
+
+    if not records:
+        details = "\n  ".join(discovered[-40:]) or "no menu actions were visible"
+        raise RuntimeError(
+            "RFPro's Export Image action was not found. Discovered menu state:\n  "
+            + details
+        )
+    records.sort(key=lambda record: record[0], reverse=True)
+    _score, action, description = records[0]
+    if not _action_is_enabled(action):
+        raise RuntimeError(f"{description} is currently disabled.")
+    return action, description
+
+
+class QtSaveDialogAutomation:
+    """Supply a filename to the save dialog opened by Export Image."""
+
+    def __init__(
+        self,
+        application: Any,
+        output_path: Path,
+        timeout_seconds: float = 8.0,
+    ) -> None:
+        from PySide6.QtCore import QTimer, Qt
+        from PySide6.QtWidgets import QComboBox, QFileDialog, QLineEdit, QPushButton
+
+        self.application = application
+        self.output_path = output_path
+        self.timeout_seconds = timeout_seconds
+        self.timer_type = QTimer
+        self.dont_use_native_dialogs_attribute = (
+            Qt.ApplicationAttribute.AA_DontUseNativeDialogs
+        )
+        self.file_dialog_type = QFileDialog
+        self.push_button_type = QPushButton
+        self.line_edit_type = QLineEdit
+        self.combo_box_type = QComboBox
+        self.timer = QTimer()
+        self.timer.setInterval(25)
+        self.timer.timeout.connect(self._poll)
+        self.started_at = 0.0
+        self.file_dialog_was_accepted = False
+        self.custom_dialog_was_advanced = False
+        self.custom_filename_was_set = False
+        self.timed_out = False
+        self.observed_dialogs: list[str] = []
+        self.native_dialogs_were_disabled = False
+
+    def start(self) -> None:
+        test_attribute = getattr(self.application, "testAttribute", None)
+        set_attribute = getattr(self.application, "setAttribute", None)
+        if callable(test_attribute) and callable(set_attribute):
+            self.native_dialogs_were_disabled = bool(
+                test_attribute(self.dont_use_native_dialogs_attribute)
+            )
+            set_attribute(self.dont_use_native_dialogs_attribute, True)
+        self.started_at = time.monotonic()
+        self.timer.start()
+
+    def stop(self) -> None:
+        self.timer.stop()
+        if not self.native_dialogs_were_disabled:
+            set_attribute = getattr(self.application, "setAttribute", None)
+            if callable(set_attribute):
+                set_attribute(self.dont_use_native_dialogs_attribute, False)
+
+    def diagnostics(self) -> str:
+        details = ", ".join(self.observed_dialogs) or "no modal dialog was exposed"
+        return (
+            f"save dialog accepted={self.file_dialog_was_accepted}; "
+            f"custom dialog advanced={self.custom_dialog_was_advanced}; "
+            f"custom filename set={self.custom_filename_was_set}; "
+            f"timed out={self.timed_out}; observed={details}"
+        )
+
+    def _visible_dialogs(self) -> list[Any]:
+        candidates: list[Any] = []
+        active = _call_or_value(
+            getattr(self.application, "activeModalWidget", None), None
+        )
+        if active is not None:
+            candidates.append(active)
+        top_levels = _call_or_value(
+            getattr(self.application, "topLevelWidgets", None), []
+        ) or []
+        for widget in top_levels:
+            if widget not in candidates:
+                candidates.append(widget)
+        return candidates
+
+    def _describe_dialog(self, dialog: Any) -> str:
+        title = str(
+            _call_or_value(getattr(dialog, "windowTitle", None), "") or ""
+        )
+        return f"{type(dialog).__name__}({title!r})"
+
+    def _poll(self) -> None:
+        dialogs = self._visible_dialogs()
+        for dialog in dialogs:
+            visible = _call_or_value(getattr(dialog, "isVisible", None), True)
+            if not visible:
+                continue
+            description = self._describe_dialog(dialog)
+            if description not in self.observed_dialogs:
+                self.observed_dialogs.append(description)
+            if isinstance(dialog, self.file_dialog_type):
+                try:
+                    dialog.setAcceptMode(
+                        self.file_dialog_type.AcceptMode.AcceptSave
+                    )
+                    dialog.setDefaultSuffix("png")
+                    dialog.setDirectory(str(self.output_path.parent))
+                    name_filters = dialog.nameFilters()
+                    for name_filter in name_filters:
+                        if "png" in str(name_filter).casefold():
+                            dialog.selectNameFilter(name_filter)
+                            break
+                    dialog.selectFile(self.output_path.name)
+                    dialog.accept()
+                except Exception:
+                    continue
+                self.file_dialog_was_accepted = True
+                return
+
+            title = _normalized_action_text(
+                str(
+                    _call_or_value(
+                        getattr(dialog, "windowTitle", None), ""
+                    )
+                    or ""
+                )
+            )
+            if (
+                not self.custom_dialog_was_advanced
+                and ("export" in title or "save" in title)
+                and "image" in title
+            ):
+                find_children = getattr(dialog, "findChildren", None)
+                if callable(find_children):
+                    combo_boxes = find_children(self.combo_box_type)
+                    for combo_box in combo_boxes:
+                        for index in range(combo_box.count()):
+                            if "png" in str(combo_box.itemText(index)).casefold():
+                                combo_box.setCurrentIndex(index)
+                                break
+                    line_edits = find_children(self.line_edit_type)
+                    for line_edit in line_edits:
+                        metadata = " ".join(
+                            str(
+                                _call_or_value(
+                                    getattr(line_edit, attribute_name, None), ""
+                                )
+                                or ""
+                            )
+                            for attribute_name in (
+                                "objectName",
+                                "placeholderText",
+                                "toolTip",
+                                "accessibleName",
+                                "text",
+                            )
+                        ).casefold()
+                        if len(line_edits) == 1 or any(
+                            token in metadata
+                            for token in ("file", "path", "name", ".png")
+                        ):
+                            line_edit.setText(str(self.output_path))
+                            self.custom_filename_was_set = True
+                            break
+                buttons = (
+                    find_children(self.push_button_type)
+                    if callable(find_children)
+                    else []
+                )
+                for button in buttons:
+                    button_text = _normalized_action_text(
+                        str(
+                            _call_or_value(getattr(button, "text", None), "")
+                            or ""
+                        )
+                    )
+                    is_default = bool(
+                        _call_or_value(getattr(button, "isDefault", None), False)
+                    )
+                    if button_text in {"export", "save", "ok"} or is_default:
+                        self.custom_dialog_was_advanced = True
+                        self.timer_type.singleShot(0, button.click)
+                        return
+
+        if time.monotonic() - self.started_at < self.timeout_seconds:
+            return
+        self.timed_out = True
+        active = _call_or_value(
+            getattr(self.application, "activeModalWidget", None), None
+        )
+        if active is not None:
+            title = _normalized_action_text(
+                str(
+                    _call_or_value(getattr(active, "windowTitle", None), "") or ""
+                )
+            )
+            if (
+                "rfpro sweep geometry" not in title
+                and "geometry validation" not in title
+            ):
+                reject = getattr(active, "reject", None)
+                if callable(reject):
+                    reject()
+
+
+def export_geometry_view_png(
+    empro_module: Any,
+    application: Any,
+    output_path: Path,
+    automation_factory: Any = QtSaveDialogAutomation,
+    qt_action_type: type[Any] | None = None,
+) -> str:
+    """Invoke RFPro's View > Export Image command and verify its PNG."""
+
+    if output_path.exists():
+        raise FileExistsError(f"Refusing to replace existing image: {output_path}")
     project_view = empro_module.gui.activeProjectView()
     project_view.showGeometryView()
     geometry_view = project_view.geometryView()
     geometry_view.updateView()
     empro_module.gui.processEvents()
-
-    failures: list[str] = []
-    candidates: list[tuple[str, Any]] = []
-    seen: set[int] = set()
-
-    def add_candidate(candidate_name: str, candidate: Any) -> None:
-        if candidate is not None and id(candidate) not in seen:
-            seen.add(id(candidate))
-            candidates.append((candidate_name, candidate))
-
-    # Keysight's shipped EMPro/RFPro initialization code obtains the visible
-    # layout with ProjectView.geometryViewWidget().  geometryView() is the
-    # scene/controller API; it is not necessarily a QWidget and therefore did
-    # not expose capture methods in RFPro.
-    geometry_widget_accessor = getattr(project_view, "geometryViewWidget", None)
-    if callable(geometry_widget_accessor):
-        try:
-            add_candidate("geometry view widget", geometry_widget_accessor())
-        except Exception as error:
-            failures.append(f"geometryViewWidget(): {error}")
-    else:
-        failures.append("geometryViewWidget() is not exposed by this RFPro build")
-
-    add_candidate("geometry view controller", geometry_view)
-    for parent_name, parent in tuple(candidates):
-        for attribute_name in ("viewport", "widget", "glWidget", "openGLWidget"):
-            try:
-                attribute = getattr(parent, attribute_name)
-                candidate = attribute() if callable(attribute) else attribute
-            except Exception:
-                continue
-            add_candidate(f"{parent_name} {attribute_name}", candidate)
-
-    for candidate_name, candidate in candidates:
-        for method_name in ("grabFramebuffer", "grab"):
-            method = getattr(candidate, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                image = _usable_capture_image(method())
-            except Exception as error:
-                failures.append(f"{candidate_name}.{method_name}(): {error}")
-                continue
-            if image is not None:
-                return image, f"{candidate_name}.{method_name}()"
-            failures.append(f"{candidate_name}.{method_name}() returned an empty image")
-
-        # A native-window capture is a final fallback for RFPro builds whose
-        # geometry wrapper does not expose the OpenGL framebuffer directly.
-        win_id_method = getattr(candidate, "winId", None)
-        if callable(win_id_method):
-            try:
-                screen_method = getattr(candidate, "screen", None)
-                screen = screen_method() if callable(screen_method) else None
-                if screen is None:
-                    screen = application.primaryScreen()
-                pixmap = screen.grabWindow(int(win_id_method()))
-                image = _usable_capture_image(pixmap)
-            except Exception as error:
-                failures.append(f"{candidate_name} native-window capture: {error}")
-            else:
-                if image is not None:
-                    return image, f"{candidate_name} native-window capture"
-                failures.append(
-                    f"{candidate_name} native-window capture returned an empty image"
-                )
-
-    details = "\n  ".join(failures) if failures else "no capture method was exposed"
-    raise RuntimeError(
-        "RFPro's active geometry-view widget could not be captured through Qt. "
-        "The geometry checks can continue, but no image is available.\n  " + details
+    action, description = find_rfpro_export_image_action(
+        project_view,
+        application,
+        qt_action_type=qt_action_type,
     )
-
-
-def save_geometry_image(image: Any, path: Path) -> None:
-    """Save one captured Qt image as PNG and verify that it was written."""
-
-    save = getattr(image, "save", None)
-    if not callable(save) or not bool(save(str(path), "PNG")):
-        raise RuntimeError(f"Qt could not save the geometry image to {path}.")
-    if not path.is_file() or path.stat().st_size <= 0:
-        raise RuntimeError(f"The geometry image was not written to {path}.")
+    automation = automation_factory(application, output_path)
+    automation.start()
+    try:
+        _action_trigger(action)
+    finally:
+        automation.stop()
+    empro_module.gui.processEvents()
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        diagnostics = getattr(automation, "diagnostics", lambda: "unavailable")()
+        raise RuntimeError(
+            f"{description} was triggered, but RFPro did not create {output_path}. "
+            f"Save-dialog diagnostics: {diagnostics}"
+        )
+    return description
 
 
 def default_geometry_report_filename(analysis_name: str) -> str:
@@ -1147,11 +1427,11 @@ def create_inspector_dialog(
                     return
 
             report_pages: list[GeometryReportPage] = []
-            capture_failures = 0
-            captured_image_count = 0
+            exported_image_count = 0
+            export_failure = ""
             progress = QProgressDialog(
                 (
-                    "Generating, checking, and capturing every geometry point..."
+                    "Generating, checking, and exporting every geometry point..."
                     if pdf_path is not None
                     else "Generating and checking every geometry point..."
                 ),
@@ -1180,37 +1460,40 @@ def create_inspector_dialog(
                     status = self._statuses[row]
                     assert status is not None
                     valid, message = status
-                    image_path: Path | None = None
-                    capture_error = ""
                     if generated:
                         assert image_directory is not None
                         image_path = image_directory / f"point_{row + 1:04d}.png"
                         try:
-                            image, capture_method = capture_geometry_view_image(
-                                empro_module, QApplication.instance()
+                            export_method = export_geometry_view_png(
+                                empro_module,
+                                QApplication.instance(),
+                                image_path,
                             )
-                            save_geometry_image(image, image_path)
-                            captured_image_count += 1
+                            exported_image_count += 1
                             print(
-                                f"Captured point {row + 1} via "
-                                f"{capture_method}: {image_path}"
+                                f"Exported point {row + 1} via "
+                                f"{export_method}: {image_path}"
                             )
                         except Exception as error:
-                            image_path = None
-                            capture_error = str(error)
-                            capture_failures += 1
+                            export_failure = (
+                                f"Point {row + 1} could not be exported through "
+                                f"RFPro's View > Export Image command:\n{error}"
+                            )
+                            print(export_failure)
+                            break
                     else:
-                        capture_error = (
-                            "Geometry generation failed; no image was captured."
+                        export_failure = (
+                            f"Point {row + 1} geometry generation failed; RFPro's "
+                            "Export Image command was not invoked."
                         )
-                        capture_failures += 1
+                        print(export_failure)
+                        break
                     report_pages.append(
                         GeometryReportPage(
                             point=points[row],
                             valid=valid,
                             message=message,
                             image_path=image_path,
-                            capture_error=capture_error,
                         )
                     )
             if not progress.wasCanceled():
@@ -1224,6 +1507,26 @@ def create_inspector_dialog(
 
             if pdf_path is None:
                 return
+            if export_failure:
+                removed_empty_directory = (
+                    exported_image_count == 0
+                    and remove_empty_image_directory(image_directory)
+                )
+                image_note = (
+                    "No PNG images were exported; the empty image directory "
+                    "was removed."
+                    if removed_empty_directory
+                    else f"Successfully exported PNG files remain in:\n{image_directory}"
+                )
+                QMessageBox.warning(
+                    self,
+                    "RFPro image export failed",
+                    export_failure
+                    + "\n\nNo PDF was created because every PDF page must have "
+                    "its verified RFPro-exported PNG.\n\n"
+                    + image_note,
+                )
+                return
             if not report_pages:
                 remove_empty_image_directory(image_directory)
                 return
@@ -1236,11 +1539,11 @@ def create_inspector_dialog(
                 )
             except Exception as error:
                 removed_empty_directory = (
-                    captured_image_count == 0
+                    exported_image_count == 0
                     and remove_empty_image_directory(image_directory)
                 )
                 image_note = (
-                    "No geometry images were captured; the empty image "
+                    "No geometry images were exported; the empty image "
                     "directory was removed."
                     if removed_empty_directory
                     else f"Captured PNG files remain in:\n{image_directory}"
@@ -1253,11 +1556,11 @@ def create_inspector_dialog(
                 return
 
             removed_empty_directory = (
-                captured_image_count == 0
+                exported_image_count == 0
                 and remove_empty_image_directory(image_directory)
             )
             image_note = (
-                "No PNG images were captured; the empty image directory was removed."
+                "No PNG images were exported; the empty image directory was removed."
                 if removed_empty_directory
                 else f"PNG images:\n{image_directory}"
             )
@@ -1271,18 +1574,9 @@ def create_inspector_dialog(
                     "The check was canceled; a partial report was saved.\n\n"
                     + completion
                 )
-            if capture_failures:
-                QMessageBox.warning(
-                    self,
-                    "Geometry report created with capture failures",
-                    completion
-                    + f"\n\nPoints without images: {capture_failures}. "
-                    "Their PDF pages contain the failure details.",
-                )
-            else:
-                QMessageBox.information(
-                    self, "Geometry report created", completion
-                )
+            QMessageBox.information(
+                self, "Geometry report created", completion
+            )
 
         def restore_original_parameters(self) -> None:
             if self._restored:

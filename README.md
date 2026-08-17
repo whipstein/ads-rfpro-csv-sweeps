@@ -16,7 +16,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.8.2**.
+The current release is **0.8.3**.
 
 ## Execution model
 
@@ -168,21 +168,22 @@ means RFPro accepts the geometry; visual review is still necessary for shapes
 that are technically valid but unintended.
 
 **Check All + PDF** prompts for a report path, regenerates and fits every sweep
-point, saves one numbered PNG per captured geometry in a sibling `<report
+point, saves one numbered PNG per exported geometry in a sibling `<report
 name>_images` directory, and creates one PDF page per checked point. Each page
 includes the analysis name, point/sequence/combination number, parameter
 values, validity result, and RFPro's failure reason when available. Existing
 image directories are never replaced; a numeric suffix is used instead.
 
-The report captures `activeProjectView().geometryViewWidget()`, the visible
-RFPro layout widget used by Keysight's own application setup code. It first
-tries that widget's OpenGL framebuffer and normal Qt capture, then falls back
-to the scene controller and native-window capture for older builds. If one
-point cannot be generated or captured, checking continues and its PDF page
-records the error. If no image is captured, the unused empty image directory
-is removed. Canceling after at least one point writes a partial PDF and keeps
-every PNG captured up to that point. The row that was selected before the
-batch is loaded again when the operation finishes.
+For every point, the report invokes RFPro's actual **View > Export Image** menu
+action and supplies the numbered PNG path to the save dialog. The file must
+exist and be nonempty before its PDF page is accepted. If RFPro cannot expose
+the action, automate its dialog, or create the PNG, the batch stops at that
+point and no PDF is written; any earlier verified PNGs are preserved. This
+prevents a placeholder PDF from hiding an image-export failure. If no image
+was exported, the unused empty image directory is removed. Canceling after at
+least one successful point writes a partial PDF and keeps every PNG exported
+up to that point. The row selected before the batch is loaded again when the
+operation finishes.
 
 The script never saves the project and never creates, queues, reruns, or
 deletes a simulation. It captures the original formulas before opening and
@@ -498,9 +499,9 @@ Update 2.1 and EMPro 2026 corpus:
 - `python_scripts/startup.py` and `python_scripts/addons/ScaleViewZ.py` for
   `activeProjectView()`, `showGeometryView()`, `geometryView()`, `updateView()`,
   and fitting the active RFPro 3-D view.
-- EMPro's shipped `empro/toolkit/analysis/gui.py` for
-  `activeProjectView().geometryViewWidget()` as the visible RFPro layout
-  widget.
+- EMPro's shipped `python_scripts/startup.py` for
+  `activeProjectView().menu(name)`, recursive menu actions, and the native
+  action objects used by RFPro.
 - EMPro public Python documentation for `Analysis.simulationSettings`,
   `SimulationData.reuseExistingResults`, `AnalysisList.names/index`,
   `AnalysisOutput`, `AnalysisOutput.getAvailableSimulationPaths()`,
@@ -516,9 +517,10 @@ Update 2.1 and EMPro 2026 corpus:
   user confirms.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
-- Qt for Python's public `QOpenGLWidget.grabFramebuffer()`, `QWidget.grab()`,
-  `QImage.save()`, and `QPdfWriter`/`QPainter` APIs for in-session image capture
-  and multi-page PDF generation without an additional PDF dependency.
+- Qt for Python's public `QAction.trigger()`, `QFileDialog.selectFile()`,
+  `QTimer`, and `QPdfWriter`/`QPainter` APIs for invoking RFPro's image export,
+  supplying each PNG path, and creating the multi-page PDF without an
+  additional PDF dependency.
 
 The inspector's `_loadOaParametersFromDesignSpec()` and
 `layout._updateDesignParameters()` calls are intentional implementation-level
