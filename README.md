@@ -8,7 +8,8 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/export_analysis_mdif.py` exports all available swept
   S-parameter results from an analysis to one generic MDIF file.
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
-  later while requesting reuse of valid existing results.
+  later while requesting reuse of valid existing results and throttling
+  SiteCluster submissions.
 - `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
   point, displays its regenerated geometry, and loads or exports available
   saved Mesh/Ports results in RFPro for inspection.
@@ -17,7 +18,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.11.3**.
+The current release is **0.12.0**.
 
 ## Execution model
 
@@ -303,6 +304,42 @@ After confirmation it explicitly saves the active RFPro project, then calls the
 public `empro.toolkit.analysis.runAnalysis()` API. A save failure stops the
 operation before any simulation is submitted.
 
+SiteCluster submission is bounded by default:
+
+```python
+DEFAULT_MAX_CONCURRENT_SIMULATIONS = 1
+DEFAULT_STOP_SUBMITTING_ON_ERROR = True
+```
+
+With a limit of `1`, the script submits one simulation and waits for it to
+finish before submitting the next. A larger value maintains that many active
+simulations as a sliding window: whenever one reaches a terminal status, one
+new job is submitted. “Active” includes RFPro statuses `Queued`, `Running`,
+`PostProcessing`, `Interrupting`, and `Killing`, so a SiteCluster job waiting in
+the external scheduler still occupies a slot.
+
+The runner must stay open until the bounded run finishes. It continues
+processing RFPro Qt events while polling status, so the RFPro interface remains
+responsive. By default, a failed job stops new submissions; jobs already active
+are allowed to finish, and all remaining jobs stay unqueued. Use
+`--continue-on-error` only when subsequent submissions should proceed despite a
+failure.
+
+To establish the limit without reimplementing analysis expansion, the script:
+
+1. Requires the RFPro Simulation queue to be idle and not already held.
+2. Holds the native queue before calling `runAnalysis()`.
+3. Lets RFPro's normal Auto/reuse policy select only the cases that need work.
+4. Removes those newly staged cases from the queue while it is still held.
+5. Releases no more than `DEFAULT_MAX_CONCURRENT_SIMULATIONS` at a time.
+
+If RFPro cannot verify that every staged case was removed from the queue, the
+script leaves the entire RFPro queue **held** and reports an error. Inspect the
+Simulation window before manually releasing that hold; this fail-safe prevents
+an accidental all-at-once SiteCluster launch. Do not run this script while
+another RFPro queue is active, because the script intentionally refuses to mix
+unrelated existing jobs into its concurrency accounting.
+
 The safe default follows RFPro's native analysis launch path, preserving the
 same Auto reuse policy and native confirmation behavior used when starting the
 analysis from the GUI:
@@ -364,7 +401,7 @@ For an explicit scripted launch:
 ```python
 scripting.run(
     r"C:\path\to\rfpro_scripts\run_analysis_reuse_existing.py",
-    ["--analysis", "My RF Analysis", "--yes"],
+    ["--analysis", "My RF Analysis", "--max-concurrent", "4", "--yes"],
 )
 ```
 
@@ -372,6 +409,8 @@ Useful runner options:
 
 ```text
 --analysis NAME
+--max-concurrent COUNT
+--continue-on-error
 --yes
 ```
 
@@ -622,6 +661,10 @@ Update 2.1 and EMPro 2026 corpus:
 - `empro.toolkit.analysis.runAnalysis()` and its documented `saveProject=True`
   and `reuseExistingIfPossible=True` options for saving and explicitly starting
   only after the user confirms.
+- `SimulationList.isQueueHeld`, `Simulation.setQueued(bool)`,
+  `Simulation.status`, and the public
+  `empro.toolkit.simulation.wait()` status set for safely staging and polling a
+  bounded SiteCluster submission window.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
 - Qt for Python's public `QAction.trigger()`, `QFileDialog.selectFile()`,

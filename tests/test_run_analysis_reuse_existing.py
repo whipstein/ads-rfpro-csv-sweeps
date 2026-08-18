@@ -45,6 +45,43 @@ class FakeEmpro:
     analysis = FakeAnalysisModule
 
 
+class FakeSimulation:
+    def __init__(
+        self,
+        simulation_id: str,
+        status: str = "Ready",
+        dequeue_works: bool = True,
+        queue_error: Exception | None = None,
+    ) -> None:
+        self._simulation_id = simulation_id
+        self.status = status
+        self.dequeue_works = dequeue_works
+        self.queue_error = queue_error
+        self.queue_calls: list[bool] = []
+
+    def id(self) -> str:
+        return self._simulation_id
+
+    def setQueued(self, queued: bool) -> None:
+        self.queue_calls.append(queued)
+        if queued and self.queue_error is not None:
+            raise self.queue_error
+        if queued:
+            self.status = "Queued"
+        elif self.dequeue_works:
+            self.status = "Ready"
+
+
+class FakeSimulationList(list[FakeSimulation]):
+    def __init__(self, *simulations: FakeSimulation) -> None:
+        super().__init__(simulations)
+        self.isQueueHeld = False
+        self.refresh_count = 0
+
+    def refresh(self) -> None:
+        self.refresh_count += 1
+
+
 class ReuseRunnerTests(unittest.TestCase):
     def test_preview_makes_manual_start_and_reuse_explicit(self) -> None:
         preview = MODULE.build_run_preview(FakeAnalysis(), 5, 3, True)
@@ -55,8 +92,11 @@ class ReuseRunnerTests(unittest.TestCase):
         self.assertIn("native analysis launch path", preview)
         self.assertIn("do not approve an overwrite", preview)
         self.assertIn("will be saved before submission", preview)
+        self.assertIn("Maximum active simulations: 1", preview)
+        self.assertIn("stop submitting new jobs after the first error", preview)
+        self.assertIn("staged under queue hold", preview)
         self.assertIn("remain set for the current RFPro session", preview)
-        self.assertIn("starts the analysis now", preview)
+        self.assertIn("stays open until every submitted simulation finishes", preview)
         self.assertIn("FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR=0.5", preview)
         self.assertIn("FEMIZER_WAVEGUIDE_VERTICAL_FACTOR=2.0", preview)
         self.assertIn("FEM_ALWAYS_SOLVE_ON_FINEST_MESH=on", preview)
@@ -114,6 +154,12 @@ class ReuseRunnerTests(unittest.TestCase):
     def test_confirmation_is_enabled_by_default(self) -> None:
         arguments = MODULE._parse_arguments([])
         self.assertFalse(arguments.yes)
+        self.assertEqual(arguments.max_concurrent, 1)
+        self.assertFalse(arguments.continue_on_error)
+
+    def test_max_concurrent_argument_must_be_positive(self) -> None:
+        with self.assertRaises(SystemExit):
+            MODULE._parse_arguments(["--max-concurrent", "0"])
 
     def test_project_is_saved_before_submission(self) -> None:
         events: list[str] = []
@@ -247,6 +293,162 @@ class ReuseRunnerTests(unittest.TestCase):
         unsupported.analysisType = 99
         with self.assertRaisesRegex(ValueError, "Nothing was started"):
             MODULE.validate_reuse_supported(FakeEmpro, unsupported)
+
+    def test_staging_holds_then_unqueues_every_selected_simulation(self) -> None:
+        first = FakeSimulation("000001")
+        second = FakeSimulation("000002")
+        simulations = FakeSimulationList(first, second)
+        events: list[str] = []
+
+        def submit() -> None:
+            self.assertTrue(simulations.isQueueHeld)
+            events.append("submit")
+            first.setQueued(True)
+            second.setQueued(True)
+
+        staged = MODULE.stage_analysis_simulations(simulations, submit, lambda: None)
+
+        self.assertEqual(staged, [first, second])
+        self.assertEqual(events, ["submit"])
+        self.assertEqual(first.queue_calls, [True, False])
+        self.assertEqual(second.queue_calls, [True, False])
+        self.assertEqual([first.status, second.status], ["Ready", "Ready"])
+        self.assertFalse(simulations.isQueueHeld)
+
+    def test_staging_refuses_to_mix_with_an_active_queue(self) -> None:
+        simulations = FakeSimulationList(FakeSimulation("old", "Running"))
+        submit_called = False
+
+        def submit() -> None:
+            nonlocal submit_called
+            submit_called = True
+
+        with self.assertRaisesRegex(RuntimeError, "requires an idle RFPro queue"):
+            MODULE.stage_analysis_simulations(simulations, submit, lambda: None)
+
+        self.assertFalse(submit_called)
+        self.assertFalse(simulations.isQueueHeld)
+
+    def test_failed_dequeue_leaves_rfpro_queue_held(self) -> None:
+        simulation = FakeSimulation("000001", dequeue_works=False)
+        simulations = FakeSimulationList(simulation)
+
+        def submit() -> None:
+            simulation.setQueued(True)
+
+        with self.assertRaisesRegex(RuntimeError, "queue was left HELD"):
+            MODULE.stage_analysis_simulations(simulations, submit, lambda: None)
+
+        self.assertTrue(simulations.isQueueHeld)
+        self.assertEqual(simulation.status, "Queued")
+
+    def test_unexpected_hold_release_is_reasserted_for_running_jobs(self) -> None:
+        simulation = FakeSimulation("000001")
+        simulations = FakeSimulationList(simulation)
+
+        def submit() -> None:
+            simulation.status = "Running"
+            simulations.isQueueHeld = False
+
+        with self.assertRaisesRegex(RuntimeError, "queue was left HELD"):
+            MODULE.stage_analysis_simulations(simulations, submit, lambda: None)
+
+        self.assertTrue(simulations.isQueueHeld)
+        self.assertEqual(simulation.status, "Running")
+
+    def test_scheduler_maintains_sliding_concurrency_limit(self) -> None:
+        staged = [FakeSimulation(f"{index:06d}") for index in range(1, 5)]
+        simulations = FakeSimulationList(*staged)
+        observed_active_counts: list[int] = []
+
+        def process_events() -> None:
+            active = [
+                simulation
+                for simulation in simulations
+                if simulation.status in MODULE._ONGOING_SIMULATION_STATUSES
+            ]
+            observed_active_counts.append(len(active))
+            if active:
+                active[0].status = "Completed"
+
+        result = MODULE.run_staged_simulations_with_limit(
+            simulations,
+            staged,
+            max_concurrent_simulations=2,
+            stop_submitting_on_error=True,
+            process_events=process_events,
+            sleep=lambda _seconds: None,
+            poll_seconds=0,
+        )
+
+        self.assertEqual(result.submitted_ids, ("000001", "000002", "000003", "000004"))
+        self.assertEqual(result.completed_ids, result.submitted_ids)
+        self.assertEqual(result.failed, ())
+        self.assertEqual(result.remaining_ids, ())
+        self.assertLessEqual(max(observed_active_counts), 2)
+        self.assertIn(2, observed_active_counts)
+
+    def test_scheduler_stops_new_submissions_after_first_failure(self) -> None:
+        staged = [FakeSimulation(f"{index:06d}") for index in range(1, 4)]
+        simulations = FakeSimulationList(*staged)
+
+        def process_events() -> None:
+            for simulation in simulations:
+                if simulation.status == "Queued":
+                    simulation.status = "Failed"
+                    break
+
+        result = MODULE.run_staged_simulations_with_limit(
+            simulations,
+            staged,
+            max_concurrent_simulations=1,
+            stop_submitting_on_error=True,
+            process_events=process_events,
+            sleep=lambda _seconds: None,
+            poll_seconds=0,
+        )
+
+        self.assertEqual(result.submitted_ids, ("000001",))
+        self.assertEqual(result.failed, (("000001", "Failed"),))
+        self.assertEqual(result.remaining_ids, ("000002", "000003"))
+
+    def test_batched_runner_saves_before_staging_and_preserves_reuse_flags(self) -> None:
+        simulation = FakeSimulation("000001")
+        simulations = FakeSimulationList(simulation)
+        events: list[str] = []
+
+        class FakeProject:
+            def __init__(self) -> None:
+                self.simulations = simulations
+
+            @staticmethod
+            def saveActiveProject() -> None:
+                events.append("save")
+
+        def fake_run(_analysis: object, **kwargs: object) -> None:
+            events.append("run")
+            self.assertTrue(simulations.isQueueHeld)
+            self.assertTrue(kwargs["waitForConfirmation"])
+            self.assertTrue(kwargs["reuseExistingIfPossible"])
+            simulation.setQueued(True)
+
+        def process_events() -> None:
+            if simulation.queue_calls == [True, False, True]:
+                simulation.status = "Completed"
+
+        result = MODULE.save_and_run_analysis_batched(
+            FakeProject(),
+            fake_run,
+            FakeAnalysis(),
+            reuse_existing=True,
+            max_concurrent_simulations=1,
+            process_events=process_events,
+            sleep=lambda _seconds: None,
+            poll_seconds=0,
+        )
+
+        self.assertEqual(events, ["save", "run"])
+        self.assertEqual(result.completed_ids, ("000001",))
 
 
 if __name__ == "__main__":

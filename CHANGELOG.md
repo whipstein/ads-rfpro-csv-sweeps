@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.12.0 - 2026-08-18
+
+- Add bounded SiteCluster submission to the explicit RFPro runner, with an
+  editable/CLI maximum active-simulation count and a sliding window that
+  submits a replacement only after an active job reaches a terminal status.
+- Preserve RFPro's native Auto/reuse selection by staging the jobs created by
+  `runAnalysis()` under `SimulationList.isQueueHeld`, unqueueing them, and then
+  releasing them individually with `Simulation.setQueued(True)`.
+- Refuse to mix a new bounded run with an already active or held RFPro queue.
+- Stop new submissions after the first failed job by default while allowing
+  already active jobs to finish; add `--continue-on-error` as an explicit
+  override.
+- Leave the RFPro queue held if the staging/unqueue operation cannot be
+  verified, preventing an unsafe all-at-once SiteCluster launch.
+
 ## 0.11.3 - 2026-08-17
 
 - Default the analysis runner to RFPro's native Auto/reuse launch path by using
