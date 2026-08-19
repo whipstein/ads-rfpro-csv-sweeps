@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.1 - 2026-08-19
+
+- Make `rfpro_workflow.py` and `rfpro_diagnostics.py` self-contained by
+  embedding the complete Qt bootstrap, dropdown, analysis selection, and
+  operation-dispatch implementation in each direct entry script.
+- Remove the `rfpro_tool_launcher.py` runtime dependency that caused Keysight's
+  scripting loader to raise `ModuleNotFoundError` when the helper was not
+  present beside the selected entry file.
+- Avoid `@dataclass` in the direct entry modules so they also load under
+  Keysight's `_loadModule` lifecycle, which executes a source module without
+  first inserting it into `sys.modules`.
+- Retain delegation only for the existing operation scripts and report their
+  exact expected path if one is missing.
+
 ## 0.14.0 - 2026-08-19
 
 - Add `rfpro_workflow.py`, a combined dropdown for CSV import, native analysis

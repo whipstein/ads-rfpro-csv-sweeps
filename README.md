@@ -26,16 +26,17 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.0**.
+The current release is **0.14.1**.
 
 ## Execution model
 
 These are in-application RFPro scripts. They use the active
 `empro.activeProject` and must not be run with an unrelated system Python.
-The standalone tools are self-contained, including Qt startup. The two compact
-combined entry scripts delegate to their sibling shared launcher, which carries
-the same Qt startup implementation. The repository does not need to be
-installed as a Python package.
+The standalone tools and both combined entry scripts are self-contained,
+including Qt startup. The combined scripts delegate only the selected operation
+to its existing sibling production script. They do not import or load a shared
+launcher module, and the repository does not need to be installed as a Python
+package.
 
 From RFPro's Python console, run a script with the documented scripting
 loader:

@@ -21,10 +21,18 @@ def load_module(name: str, relative_path: str):
     return module
 
 
-LAUNCHER = load_module(
-    "rfpro_tool_launcher",
-    "rfpro_scripts/rfpro_tool_launcher.py",
-)
+def load_module_like_rfpro(name: str, relative_path: str):
+    """Mirror empro.toolkit.addon._loadModule without sys.modules insertion."""
+
+    path = ROOT / relative_path
+    sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 DIAGNOSTICS = load_module(
     "rfpro_diagnostics",
     "rfpro_scripts/rfpro_diagnostics.py",
@@ -58,63 +66,80 @@ def fake_empro_modules(scripting: FakeScripting) -> dict[str, types.ModuleType]:
 
 
 class RFProToolLauncherTests(unittest.TestCase):
-    def test_workflow_contains_geometry_inspector(self) -> None:
-        operations = {item[0]: item for item in LAUNCHER.operation_specs("workflow")}
+    def test_workflow_contains_all_expected_operations(self) -> None:
+        operations = {item[0]: item for item in WORKFLOW.operation_specs()}
 
+        self.assertEqual(
+            set(operations),
+            {"import_csv", "run_analysis", "export_mdif", "geometry_inspector"},
+        )
         self.assertEqual(
             operations["geometry_inspector"][3],
             "preview_sweep_geometries.py",
         )
 
-    def test_diagnostics_contains_duplicate_audit_and_geometry_inspector(self) -> None:
-        operations = {
-            item[0]: item for item in LAUNCHER.operation_specs("diagnostics")
-        }
+    def test_diagnostics_contains_all_expected_operations(self) -> None:
+        operations = {item[0]: item for item in DIAGNOSTICS.operation_specs()}
 
+        self.assertEqual(
+            set(operations),
+            {
+                "duplicate_conditions",
+                "analysis_reuse",
+                "cache_inventory",
+                "geometry_inspector",
+            },
+        )
         self.assertEqual(
             operations["duplicate_conditions"][3],
             "diagnose_duplicate_sweep_conditions.py",
         )
-        self.assertEqual(
-            operations["geometry_inspector"][3],
-            "preview_sweep_geometries.py",
-        )
 
     def test_every_operation_resolves_to_an_existing_script(self) -> None:
-        for category in ("workflow", "diagnostics"):
-            for operation in LAUNCHER.operation_specs(category):
-                with self.subTest(category=category, operation=operation[0]):
-                    self.assertTrue(LAUNCHER.tool_script_path(operation[3]).is_file())
+        for module in (WORKFLOW, DIAGNOSTICS):
+            for operation in module.operation_specs():
+                with self.subTest(module=module.__name__, operation=operation[0]):
+                    self.assertTrue(module.tool_script_path(operation[3]).is_file())
 
-    def test_selected_operation_is_loaded_with_the_analysis_argument(self) -> None:
-        scripting = FakeScripting()
-        operation = LAUNCHER.find_operation("workflow", "export_mdif")
-
-        with patch.dict(sys.modules, fake_empro_modules(scripting)):
-            LAUNCHER.run_operation(operation, "RF Analysis")
-
-        self.assertEqual(len(scripting.calls), 1)
-        path, arguments = scripting.calls[0]
-        self.assertTrue(path.endswith("rfpro_scripts/export_analysis_mdif.py"))
-        self.assertEqual(arguments, ["--analysis", "RF Analysis"])
-
-    def test_direct_entry_scripts_delegate_to_the_shared_launcher(self) -> None:
-        for module, category in (
-            (DIAGNOSTICS, "diagnostics"),
-            (WORKFLOW, "workflow"),
+    def test_selected_operations_are_loaded_with_the_analysis_argument(self) -> None:
+        for module, operation_key, expected_filename in (
+            (WORKFLOW, "export_mdif", "export_analysis_mdif.py"),
+            (
+                DIAGNOSTICS,
+                "duplicate_conditions",
+                "diagnose_duplicate_sweep_conditions.py",
+            ),
         ):
             scripting = FakeScripting()
-            with self.subTest(category=category):
+            operation = module.find_operation(operation_key)
+
+            with self.subTest(module=module.__name__, operation=operation_key):
                 with patch.dict(sys.modules, fake_empro_modules(scripting)):
-                    module.main(["--analysis", "RF Analysis"])
+                    module.run_operation(operation, "RF Analysis")
 
                 self.assertEqual(len(scripting.calls), 1)
                 path, arguments = scripting.calls[0]
-                self.assertTrue(path.endswith("rfpro_scripts/rfpro_tool_launcher.py"))
-                self.assertEqual(
-                    arguments,
-                    ["--category", category, "--analysis", "RF Analysis"],
+                self.assertTrue(path.endswith(f"rfpro_scripts/{expected_filename}"))
+                self.assertEqual(arguments, ["--analysis", "RF Analysis"])
+
+    def test_entry_scripts_do_not_depend_on_the_removed_shared_launcher(self) -> None:
+        for filename in ("rfpro_workflow.py", "rfpro_diagnostics.py"):
+            source = (ROOT / "rfpro_scripts" / filename).read_text(encoding="utf-8")
+            with self.subTest(filename=filename):
+                self.assertNotIn("rfpro_tool_launcher", source)
+                self.assertIn("def create_or_reuse_qapplication", source)
+                self.assertIn("def choose_operation", source)
+
+    def test_entries_load_with_keysights_unregistered_module_lifecycle(self) -> None:
+        for filename in ("rfpro_workflow.py", "rfpro_diagnostics.py"):
+            module_name = "rfpro_loader_test_" + filename.removesuffix(".py")
+            with self.subTest(filename=filename):
+                module = load_module_like_rfpro(
+                    module_name,
+                    f"rfpro_scripts/{filename}",
                 )
+                self.assertTrue(callable(module.main))
+                self.assertNotIn(module_name, sys.modules)
 
 
 if __name__ == "__main__":
