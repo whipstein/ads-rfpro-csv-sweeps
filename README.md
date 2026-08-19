@@ -8,8 +8,8 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/export_analysis_mdif.py` exports all available swept
   S-parameter results from an analysis to one generic MDIF file.
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
-  later while requesting reuse of valid existing results and throttling
-  SiteCluster submissions.
+  later while requesting reuse of valid existing results through RFPro's native
+  analysis queue lifecycle.
 - `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
   point, displays its regenerated geometry, and loads or exports available
   saved Mesh/Ports results in RFPro for inspection.
@@ -18,7 +18,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.12.1**.
+The current release is **0.13.0**.
 
 ## Execution model
 
@@ -321,41 +321,17 @@ After confirmation it explicitly saves the active RFPro project, then calls the
 public `empro.toolkit.analysis.runAnalysis()` API. A save failure stops the
 operation before any simulation is submitted.
 
-SiteCluster submission is bounded by default:
+The script deliberately does not throttle SiteCluster by holding, unqueueing,
+and later requeueing RFPro-created analysis simulations. Those simulations are
+owned by RFPro's native `SimulationsTable`; changing their queue membership
+after `runAnalysis()` can desynchronize that table and produce
+`SimulationsTable has corrupt state: number of simulations mismatch!`.
 
-```python
-DEFAULT_MAX_CONCURRENT_SIMULATIONS = 1
-DEFAULT_STOP_SUBMITTING_ON_ERROR = True
-```
-
-With a limit of `1`, the script submits one simulation and waits for it to
-finish before submitting the next. A larger value maintains that many active
-simulations as a sliding window: whenever one reaches a terminal status, one
-new job is submitted. “Active” includes RFPro statuses `Queued`, `Running`,
-`PostProcessing`, `Interrupting`, and `Killing`, so a SiteCluster job waiting in
-the external scheduler still occupies a slot.
-
-The runner must stay open until the bounded run finishes. It continues
-processing RFPro Qt events while polling status, so the RFPro interface remains
-responsive. By default, a failed job stops new submissions; jobs already active
-are allowed to finish, and all remaining jobs stay unqueued. Use
-`--continue-on-error` only when subsequent submissions should proceed despite a
-failure.
-
-To establish the limit without reimplementing analysis expansion, the script:
-
-1. Requires the RFPro Simulation queue to be idle and not already held.
-2. Holds the native queue before calling `runAnalysis()`.
-3. Lets RFPro's normal Auto/reuse policy select only the cases that need work.
-4. Removes those newly staged cases from the queue while it is still held.
-5. Releases no more than `DEFAULT_MAX_CONCURRENT_SIMULATIONS` at a time.
-
-If RFPro cannot verify that every staged case was removed from the queue, the
-script leaves the entire RFPro queue **held** and reports an error. Inspect the
-Simulation window before manually releasing that hold; this fail-safe prevents
-an accidental all-at-once SiteCluster launch. Do not run this script while
-another RFPro queue is active, because the script intentionally refuses to mix
-unrelated existing jobs into its concurrency accounting.
+Set the concurrency or license limit in the SiteCluster scheduler submission
+configuration instead. RFPro can then create and submit its analysis table
+normally while the scheduler limits how many solver jobs run at once. The
+exact setting is scheduler/site-template specific and is not inferred by this
+repository.
 
 The safe default follows RFPro's native analysis launch path, preserving the
 same Auto reuse policy and native confirmation behavior used when starting the
@@ -418,7 +394,7 @@ For an explicit scripted launch:
 ```python
 scripting.run(
     r"C:\path\to\rfpro_scripts\run_analysis_reuse_existing.py",
-    ["--analysis", "My RF Analysis", "--max-concurrent", "4", "--yes"],
+    ["--analysis", "My RF Analysis", "--yes"],
 )
 ```
 
@@ -426,8 +402,6 @@ Useful runner options:
 
 ```text
 --analysis NAME
---max-concurrent COUNT
---continue-on-error
 --yes
 ```
 
@@ -557,6 +531,7 @@ near the top of the exporter:
 DEFAULT_FREQUENCY_MODE = "ask"  # ask, native, points, or step
 DEFAULT_FREQUENCY_POINTS = 201
 DEFAULT_FREQUENCY_STEP = "100 MHz"
+DEFAULT_BYPASS_RESULT_REGISTRATION = False
 ```
 
 The exporter uses `empro.output.AnalysisOutput` to enumerate analysis result
@@ -567,6 +542,34 @@ from each simulation output path, and the leaf directory is selected by
 simulation ID. Parameter values come from the result metadata, with the
 configured analysis sweep as a fallback when its expanded case count matches
 the results.
+
+At the start of collection, the exporter reports three independent counts:
+configured sweep cases, RFPro-registered results, and raw circuit-result
+directories. The configured-case comparison never filters results; it only
+controls whether positional geometry values are a safe metadata fallback.
+Without `--skip-errors`, any per-result failure stops the export rather than
+silently producing a partial file.
+
+If RFPro registers fewer results than actually exist on disk, enable the
+explicit bypass:
+
+```python
+DEFAULT_BYPASS_RESULT_REGISTRATION = True
+```
+
+or pass `--bypass-design-point-check` (also available as
+`--bypass-result-registration`). The bypass scans the selected analysis's
+direct `simulationGroupPath` children for the public RFPro EM result layouts
+`emds_dsn/design/design.sio` and `work/proj.sio`, then exports those raw result
+directories instead of limiting collection to
+`AnalysisOutput.getAvailableSimulationIds()`. If all 48 raw directories exist
+and match 48 configured cases, all 48 can be assigned their positional sweep
+metadata. If only 45 raw result directories exist, no bypass can supply the
+three missing S-matrices.
+
+This option can include stale or orphaned result directories that RFPro no
+longer associates with the analysis. Review the printed inventory and restore
+the safe `False` default after the exceptional export.
 
 The output contains one block per result:
 
@@ -601,6 +604,7 @@ Useful exporter options:
 --frequency-points 401
 --frequency-step "25 MHz"
 --skip-errors
+--bypass-design-point-check
 --overwrite
 ```
 
@@ -678,10 +682,9 @@ Update 2.1 and EMPro 2026 corpus:
 - `empro.toolkit.analysis.runAnalysis()` and its documented `saveProject=True`
   and `reuseExistingIfPossible=True` options for saving and explicitly starting
   only after the user confirms.
-- `SimulationList.isQueueHeld`, `Simulation.setQueued(bool)`,
-  `Simulation.status`, and the public
-  `empro.toolkit.simulation.wait()` status set for safely staging and polling a
-  bounded SiteCluster submission window.
+- The shipped command-line simulation example was checked to distinguish its
+  supported `createSimulation(False)` followed by `setQueued(True)` lifecycle
+  from RFPro analysis simulations created and owned by `runAnalysis()`.
 - `empro.toolkit.scripting.run()` for direct in-application loading and
   `main()` invocation.
 - Qt for Python's public `QAction.trigger()`, `QFileDialog.selectFile()`,

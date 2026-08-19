@@ -8,9 +8,8 @@ by editable global options. The safe default preserves RFPro's native
 Auto/reuse launch policy instead of silently authorizing overwrite behavior.
 Required private FEM environment overrides are applied to the RFPro process
 before submission and remain set for the rest of the current RFPro session so
-asynchronously launched solvers inherit them. Simulations selected by RFPro
-are staged under a native queue hold and released through a configurable
-bounded window so SiteCluster does not receive the entire sweep at once.
+asynchronously launched solvers inherit them. RFPro retains sole ownership of
+its analysis simulation table and native queue lifecycle.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -31,21 +29,11 @@ DEFAULT_REUSE_EXISTING_RESULTS = True
 # Keep this True to follow the same native RFPro reuse/confirmation path used
 # when starting an analysis from the GUI with its reuse policy set to Auto.
 DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY = True
-# SiteCluster/RFPro job throttle. A value of 1 submits exactly one simulation
-# and waits for it to finish before submitting the next. Larger values maintain
-# that many active simulations with a sliding window.
-DEFAULT_MAX_CONCURRENT_SIMULATIONS = 1
-DEFAULT_STOP_SUBMITTING_ON_ERROR = True
-DEFAULT_BATCH_POLL_SECONDS = 0.5
 DEFAULT_RUN_ENVIRONMENT = {
     "FEMIZER_WAVEGUIDE_HORIZONTAL_FACTOR": "0.5",
     "FEMIZER_WAVEGUIDE_VERTICAL_FACTOR": "2.0",
     "FEM_ALWAYS_SOLVE_ON_FINEST_MESH": "on",
 }
-
-_ONGOING_SIMULATION_STATUSES = frozenset(
-    {"Queued", "Running", "PostProcessing", "Interrupting", "Killing"}
-)
 
 
 @dataclass(frozen=True)
@@ -55,21 +43,6 @@ class QtRuntime:
     plugin_file: Path | None
     application_was_created: bool
     environment_was_restored: bool
-
-
-@dataclass(frozen=True)
-class BatchRunResult:
-    """Outcome of a bounded-concurrency RFPro queue run."""
-
-    staged_count: int
-    submitted_ids: tuple[str, ...]
-    completed_ids: tuple[str, ...]
-    failed: tuple[tuple[str, str], ...]
-    remaining_ids: tuple[str, ...]
-
-    @property
-    def submitted_count(self) -> int:
-        return len(self.submitted_ids)
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -325,8 +298,6 @@ def build_run_preview(
     result_count: int,
     reuse_existing: bool,
     use_native_reuse_policy: bool = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
-    max_concurrent_simulations: int = DEFAULT_MAX_CONCURRENT_SIMULATIONS,
-    stop_submitting_on_error: bool = DEFAULT_STOP_SUBMITTING_ON_ERROR,
 ) -> str:
     environment_preview = "\n".join(
         f"  {name}={value}" for name, value in DEFAULT_RUN_ENVIRONMENT.items()
@@ -359,12 +330,6 @@ def build_run_preview(
             reuse_preview[0],
             f"Submission option: waitForConfirmation={bool(use_native_reuse_policy)}",
             f"Submission option: reuseExistingIfPossible={bool(reuse_existing)}",
-            f"Maximum active simulations: {max_concurrent_simulations}",
-            (
-                "Failure policy: stop submitting new jobs after the first error"
-                if stop_submitting_on_error
-                else "Failure policy: continue submitting remaining jobs after errors"
-            ),
             "",
             "FEM run environment:",
             environment_preview,
@@ -372,10 +337,11 @@ def build_run_preview(
             reuse_preview[1],
             reuse_preview[2],
             "The active RFPro project will be saved before submission.",
-            "The RFPro queue must be idle. Jobs selected by RFPro will be staged "
-            "under queue hold, then released through the configured sliding window.",
+            "RFPro will own the native simulation table and queue lifecycle.",
+            "No RFPro-side concurrency limit will be applied; SiteCluster may "
+            "receive every required simulation immediately.",
             "The FEM environment will remain set for the current RFPro session.",
-            "This script stays open until every submitted simulation finishes.",
+            "This action starts the analysis now.",
         )
     )
 
@@ -439,265 +405,6 @@ def save_and_run_analysis(
     )
 
 
-def _simulation_status(simulation: Any) -> str:
-    return str(simulation.status)
-
-
-def _simulation_label(simulation: Any) -> str:
-    """Return a stable, readable simulation identifier without assuming bindings."""
-
-    for attribute_name in ("id", "simulationPath"):
-        value = getattr(simulation, attribute_name, None)
-        try:
-            value = value() if callable(value) else value
-        except Exception:
-            continue
-        if value in (None, ""):
-            continue
-        text = str(value)
-        if attribute_name == "simulationPath":
-            leaf = Path(text).name
-            if leaf:
-                return leaf
-        return text
-    return f"simulation@{id(simulation):x}"
-
-
-def _pump_simulation_events(
-    _simulations: Any,
-    process_events: Callable[[], None],
-) -> None:
-    # Match empro.toolkit.simulation.wait(): Qt event processing updates each
-    # live Simulation.status. SimulationList.refresh() is intentionally avoided
-    # because the public wait implementation does not require it.
-    process_events()
-
-
-def _ongoing_simulations(simulations: Any) -> list[Any]:
-    return [
-        simulation
-        for simulation in list(simulations)
-        if _simulation_status(simulation) in _ONGOING_SIMULATION_STATUSES
-    ]
-
-
-def _format_simulation_list(simulations: Sequence[Any]) -> str:
-    labels = [_simulation_label(simulation) for simulation in simulations]
-    return ", ".join(labels[:10]) + (" ..." if len(labels) > 10 else "")
-
-
-def stage_analysis_simulations(
-    simulations: Any,
-    submit_analysis: Callable[[], Any],
-    process_events: Callable[[], None],
-) -> list[Any]:
-    """Create RFPro-selected jobs under queue hold, then safely unqueue them.
-
-    This requires exclusive ownership of an idle RFPro queue. If RFPro cannot
-    be proven to have unqueued every staged job, the queue is deliberately left
-    held so SiteCluster cannot receive the full sweep simultaneously.
-    """
-
-    _pump_simulation_events(simulations, process_events)
-    ongoing_before = _ongoing_simulations(simulations)
-    if ongoing_before:
-        raise RuntimeError(
-            "Bounded submission requires an idle RFPro queue. These simulations "
-            f"are already active: {_format_simulation_list(ongoing_before)}. "
-            "Wait for them to finish or remove them from the queue, then run the "
-            "script again. Nothing new was submitted."
-        )
-    if bool(simulations.isQueueHeld):
-        raise RuntimeError(
-            "The RFPro queue is already held. Release the existing hold after "
-            "checking the Simulation window, then run the script again. Nothing "
-            "new was submitted."
-        )
-
-    queue_hold_was_set = False
-    try:
-        simulations.isQueueHeld = True
-        queue_hold_was_set = True
-        if not bool(simulations.isQueueHeld):
-            raise RuntimeError("RFPro did not accept the requested queue hold.")
-
-        submit_analysis()
-        _pump_simulation_events(simulations, process_events)
-        if not bool(simulations.isQueueHeld):
-            raise RuntimeError(
-                "RFPro released the queue hold while preparing the analysis."
-            )
-
-        staged = [
-            simulation
-            for simulation in list(simulations)
-            if _simulation_status(simulation) == "Queued"
-        ]
-        if not staged:
-            simulations.isQueueHeld = False
-            return []
-
-        for simulation in staged:
-            simulation.setQueued(False)
-        _pump_simulation_events(simulations, process_events)
-        still_queued = [
-            simulation
-            for simulation in staged
-            if _simulation_status(simulation) == "Queued"
-        ]
-        if still_queued:
-            raise RuntimeError(
-                "RFPro did not remove every staged simulation from the queue: "
-                f"{_format_simulation_list(still_queued)}."
-            )
-
-        simulations.isQueueHeld = False
-        return staged
-    except Exception as error:
-        if queue_hold_was_set:
-            # Reassert the hold before inspecting state. Even if RFPro changed it
-            # unexpectedly, queued jobs must not fan out to SiteCluster.
-            try:
-                simulations.isQueueHeld = True
-            except Exception:
-                pass
-            try:
-                ongoing = _ongoing_simulations(simulations)
-            except Exception:
-                ongoing = []
-            if ongoing:
-                raise RuntimeError(
-                    "Could not safely stage the RFPro simulations for bounded "
-                    "SiteCluster submission. The RFPro queue was left HELD so "
-                    "no additional queued jobs can launch. Inspect the Simulation "
-                    "window before releasing it. Active or queued simulations: "
-                    f"{_format_simulation_list(ongoing)}."
-                ) from error
-            try:
-                simulations.isQueueHeld = False
-            except Exception:
-                pass
-        raise
-
-
-def run_staged_simulations_with_limit(
-    simulations: Any,
-    staged: Sequence[Any],
-    max_concurrent_simulations: int,
-    stop_submitting_on_error: bool,
-    process_events: Callable[[], None],
-    sleep: Callable[[float], None] = time.sleep,
-    poll_seconds: float = DEFAULT_BATCH_POLL_SECONDS,
-) -> BatchRunResult:
-    """Run staged simulations through a bounded sliding submission window."""
-
-    if max_concurrent_simulations < 1:
-        raise ValueError("Maximum active simulations must be at least 1.")
-    if poll_seconds < 0:
-        raise ValueError("Batch poll seconds cannot be negative.")
-
-    pending = list(staged)
-    active: list[Any] = []
-    submitted_ids: list[str] = []
-    completed_ids: list[str] = []
-    failed: list[tuple[str, str]] = []
-    submission_stopped = False
-
-    while active or (pending and not submission_stopped):
-        while (
-            pending
-            and len(active) < max_concurrent_simulations
-            and not submission_stopped
-        ):
-            simulation = pending.pop(0)
-            label = _simulation_label(simulation)
-            try:
-                simulation.setQueued(True)
-            except Exception as error:
-                failed.append((label, f"submission error: {error}"))
-                print(f"Could not submit simulation {label}: {error}")
-                if stop_submitting_on_error:
-                    submission_stopped = True
-                continue
-            active.append(simulation)
-            submitted_ids.append(label)
-            print(
-                f"Submitted simulation {label} "
-                f"({len(active)}/{max_concurrent_simulations} active slots)."
-            )
-
-        if not active:
-            continue
-
-        _pump_simulation_events(simulations, process_events)
-        still_active: list[Any] = []
-        saw_terminal_status = False
-        for simulation in active:
-            label = _simulation_label(simulation)
-            status = _simulation_status(simulation)
-            if status in _ONGOING_SIMULATION_STATUSES:
-                still_active.append(simulation)
-                continue
-
-            saw_terminal_status = True
-            if status == "Completed":
-                completed_ids.append(label)
-                print(f"Completed simulation {label}.")
-            else:
-                failed.append((label, status))
-                print(f"Simulation {label} ended with status {status!r}.")
-                if stop_submitting_on_error:
-                    submission_stopped = True
-        active = still_active
-
-        if active and not saw_terminal_status:
-            sleep(poll_seconds)
-
-    return BatchRunResult(
-        staged_count=len(staged),
-        submitted_ids=tuple(submitted_ids),
-        completed_ids=tuple(completed_ids),
-        failed=tuple(failed),
-        remaining_ids=tuple(_simulation_label(simulation) for simulation in pending),
-    )
-
-
-def save_and_run_analysis_batched(
-    project: Any,
-    run_analysis: Callable[..., Any],
-    analysis: Any,
-    reuse_existing: bool,
-    max_concurrent_simulations: int,
-    stop_submitting_on_error: bool = DEFAULT_STOP_SUBMITTING_ON_ERROR,
-    use_native_reuse_policy: bool = DEFAULT_USE_RFPRO_NATIVE_REUSE_POLICY,
-    process_events: Callable[[], None] = lambda: None,
-    sleep: Callable[[float], None] = time.sleep,
-    poll_seconds: float = DEFAULT_BATCH_POLL_SECONDS,
-) -> BatchRunResult:
-    """Save, let RFPro select required jobs, then submit them with a limit."""
-
-    if max_concurrent_simulations < 1:
-        raise ValueError("Maximum active simulations must be at least 1.")
-    apply_session_environment(DEFAULT_RUN_ENVIRONMENT)
-    project.saveActiveProject()
-    staged = stage_analysis_simulations(
-        project.simulations,
-        lambda: _submit_analysis(
-            run_analysis, analysis, reuse_existing, use_native_reuse_policy
-        ),
-        process_events,
-    )
-    return run_staged_simulations_with_limit(
-        project.simulations,
-        staged,
-        max_concurrent_simulations,
-        stop_submitting_on_error,
-        process_events,
-        sleep,
-        poll_seconds,
-    )
-
-
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Explicitly save and run RFPro with configurable result reuse.",
@@ -709,53 +416,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--yes", action="store_true", help="start without the confirmation dialog"
     )
-    parser.add_argument(
-        "--max-concurrent",
-        type=int,
-        default=DEFAULT_MAX_CONCURRENT_SIMULATIONS,
-        metavar="COUNT",
-        help="maximum queued/running simulations submitted at one time",
-    )
-    parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="keep submitting remaining simulations after a job fails",
-    )
     arguments, unknown = parser.parse_known_args(argv)
     if unknown:
         print("Ignoring RFPro/launcher arguments: " + " ".join(unknown))
-    if arguments.max_concurrent < 1:
-        parser.error("--max-concurrent must be at least 1")
     return arguments
-
-
-def _batch_summary(analysis: Any, result: BatchRunResult) -> str:
-    if result.staged_count == 0:
-        return (
-            f"Saved the active project. RFPro selected no simulations to run "
-            f"for analysis {analysis.name!r}; existing valid results were left "
-            "untouched. Required FEM settings remain active for this RFPro session."
-        )
-
-    parts = [
-        f"Finished bounded submission for analysis {analysis.name!r}.",
-        f"Staged: {result.staged_count}.",
-        f"Submitted: {result.submitted_count}.",
-        f"Completed: {len(result.completed_ids)}.",
-        f"Failed: {len(result.failed)}.",
-        f"Not submitted: {len(result.remaining_ids)}.",
-    ]
-    if result.failed:
-        failure_text = ", ".join(
-            f"{label} ({status})" for label, status in result.failed[:10]
-        )
-        parts.append(f"Failures: {failure_text}.")
-    if result.remaining_ids:
-        parts.append(
-            "Remaining unsubmitted: " + ", ".join(result.remaining_ids[:10]) + "."
-        )
-    parts.append("Required FEM settings remain active for this RFPro session.")
-    return " ".join(parts)
 
 
 def _print_qt_diagnostics(runtime: QtRuntime) -> None:
@@ -793,32 +457,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         result_count,
         reuse_existing,
         use_native_reuse_policy,
-        arguments.max_concurrent,
-        not arguments.continue_on_error,
     )
     print(preview)
     if not arguments.yes and not _confirm_run(preview):
         print("Run cancelled; no RFPro simulations were started.")
         return
 
-    result = save_and_run_analysis_batched(
+    save_and_run_analysis(
         empro.activeProject,
         runAnalysis,
         analysis,
         reuse_existing,
-        arguments.max_concurrent,
-        not arguments.continue_on_error,
         use_native_reuse_policy,
-        empro.gui.processEvents,
     )
-    summary = _batch_summary(analysis, result)
+    reuse_summary = "enabled" if reuse_existing else "disabled"
+    policy_summary = (
+        "RFPro native Auto/dialog"
+        if use_native_reuse_policy
+        else f"scripted reuse {reuse_summary}"
+    )
+    summary = (
+        f"Saved the active project and started analysis {analysis.name!r} "
+        f"with existing-result policy {policy_summary}. "
+        "Required FEM settings remain active for the current RFPro session."
+    )
     print(summary)
     from PySide6.QtWidgets import QMessageBox
 
-    if result.failed or result.remaining_ids:
-        QMessageBox.warning(None, "RFPro Bounded Run Finished with Errors", summary)
-    else:
-        QMessageBox.information(None, "RFPro Bounded Run Finished", summary)
+    QMessageBox.information(None, "RFPro Analysis Started", summary)
 
 
 if __name__ == "__main__":

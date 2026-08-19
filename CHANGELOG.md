@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.0 - 2026-08-19
+
+- Report configured sweep cases, RFPro-registered results, and raw circuit
+  result-directory counts before MDIF collection.
+- Add `DEFAULT_BYPASS_RESULT_REGISTRATION`,
+  `--bypass-design-point-check`, and `--bypass-result-registration` to export
+  raw `design.sio`/`proj.sio` result directories that RFPro omitted from
+  `AnalysisOutput.getAvailableSimulationIds()`.
+- Retain safe registered-result enumeration by default and warn that the raw
+  bypass can include stale or orphaned results.
+
+## 0.12.2 - 2026-08-18
+
+- Remove the RFPro-side bounded submission implementation after runtime use
+  showed that unqueueing and later requeueing `runAnalysis()`-owned simulations
+  can desynchronize RFPro's native `SimulationsTable`.
+- Restore direct native `runAnalysis()` submission so RFPro retains ownership
+  of analysis expansion, result reuse, and queue state.
+- Document that SiteCluster concurrency must be limited in the external
+  scheduler/site submission configuration, not by mutating RFPro's analysis
+  simulation table.
+
 ## 0.12.1 - 2026-08-18
 
 - Add `DEFAULT_DEDUPLICATE_CASES` and `--allow-duplicate-cases` so append mode

@@ -34,7 +34,16 @@ DEFAULT_REFERENCE_IMPEDANCE_OHMS = 50.0
 DEFAULT_FREQUENCY_MODE = "ask"  # One of: ask, native, points, step.
 DEFAULT_FREQUENCY_POINTS = 1000
 DEFAULT_FREQUENCY_STEP = "1 GHz"
+# Set True to scan the selected analysis's raw simulation-group directories
+# instead of limiting export to AnalysisOutput.getAvailableSimulationIds().
+# This can include stale/orphaned results, so the safe default remains False.
+DEFAULT_BYPASS_RESULT_REGISTRATION = False
 MAX_FREQUENCY_POINTS = 1_000_000
+
+_CIRCUIT_RESULT_RELATIVE_PATHS = (
+    Path("emds_dsn") / "design" / "design.sio",
+    Path("work") / "proj.sio",
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +79,15 @@ class FrequencyRegion:
 
     start_hz: float
     stop_hz: float
+
+
+@dataclass(frozen=True)
+class ResultReference:
+    """One registered or raw RFPro simulation result selected for export."""
+
+    simulation_id: str
+    simulation_path: str
+    metadata: Any | None
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -859,6 +877,88 @@ def _select_parameters(
     return selected
 
 
+def _normalized_path_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return os.path.normcase(os.path.normpath(text)) if text else ""
+
+
+def _registered_result_references(analysis_output: Any) -> list[ResultReference]:
+    references: list[ResultReference] = []
+    for simulation_id in list(analysis_output.getAvailableSimulationIds() or []):
+        simulation_output = analysis_output.getSimulation(simulation_id)
+        simulation_path = str(simulation_output.simulationPath or "")
+        references.append(
+            ResultReference(
+                simulation_id=str(simulation_id),
+                simulation_path=simulation_path,
+                metadata=simulation_output.metadata,
+            )
+        )
+    return references
+
+
+def _result_directory_sort_key(path: Path) -> tuple[int, int | str, str]:
+    name = path.name
+    if name.isdecimal():
+        return (0, int(name), name)
+    return (1, name.casefold(), name)
+
+
+def _raw_circuit_result_directories(analysis: Any) -> list[Path]:
+    """Find direct simulation children containing RFPro EM circuit results."""
+
+    group_text = str(getattr(analysis, "simulationGroupPath", "") or "").strip()
+    if not group_text:
+        return []
+    group_path = Path(group_text).expanduser()
+    if not group_path.is_dir():
+        return []
+
+    result_directories: list[Path] = []
+    try:
+        children = list(group_path.iterdir())
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not inspect RFPro simulation group {group_path}: {error}"
+        ) from error
+    for child in children:
+        if not child.is_dir():
+            continue
+        if any(
+            (child / relative_path).is_file()
+            for relative_path in _CIRCUIT_RESULT_RELATIVE_PATHS
+        ):
+            result_directories.append(child)
+    return sorted(result_directories, key=_result_directory_sort_key)
+
+
+def _raw_result_references(
+    analysis: Any,
+    registered: Sequence[ResultReference],
+) -> list[ResultReference]:
+    registered_by_path = {
+        _normalized_path_text(reference.simulation_path): reference
+        for reference in registered
+        if reference.simulation_path
+    }
+    references: list[ResultReference] = []
+    for result_directory in _raw_circuit_result_directories(analysis):
+        path_text = str(result_directory)
+        registered_reference = registered_by_path.get(_normalized_path_text(path_text))
+        references.append(
+            ResultReference(
+                simulation_id=result_directory.name,
+                simulation_path=path_text,
+                metadata=(
+                    registered_reference.metadata
+                    if registered_reference is not None
+                    else None
+                ),
+            )
+        )
+    return references
+
+
 def collect_analysis_blocks(
     empro_module: Any,
     analysis: Any,
@@ -866,35 +966,60 @@ def collect_analysis_blocks(
     skip_errors: bool,
     frequency_grid_request: FrequencyGridRequest | None = None,
     configured_regions: Sequence[FrequencyRegion] | None = None,
+    bypass_result_registration: bool = DEFAULT_BYPASS_RESULT_REGISTRATION,
 ) -> list[MDIFBlock]:
     """Walk public RFPro analysis outputs and extract every usable S-matrix."""
 
     from empro import toolkit
 
     analysis_output = empro_module.output.AnalysisOutput(analysis)
-    # Preserve the public API's result order. It matches the configured sweep
-    # order when older result metadata does not expose geometry parameters.
-    simulation_ids = list(analysis_output.getAvailableSimulationIds())
-    if not simulation_ids:
-        raise RuntimeError(f"Analysis {analysis.name!r} has no available simulations.")
+    # Preserve the public API's result order by default. It matches the
+    # configured sweep order when older metadata omits geometry parameters.
+    registered_references = _registered_result_references(analysis_output)
+    raw_references = _raw_result_references(analysis, registered_references)
+    references = raw_references if bypass_result_registration else registered_references
+    if not references:
+        source = (
+            "raw circuit-result directories"
+            if bypass_result_registration
+            else "registered simulations"
+        )
+        raise RuntimeError(f"Analysis {analysis.name!r} has no {source}.")
 
     configured_cases = configured_parameter_cases(analysis.simulationSettings)
-    configured_matches = len(configured_cases) == len(simulation_ids)
+    print(
+        "RFPro result inventory: "
+        f"configured sweep cases={len(configured_cases)}, "
+        f"registered results={len(registered_references)}, "
+        f"raw circuit-result directories={len(raw_references)}."
+    )
+    if bypass_result_registration:
+        print(
+            "Result-registration bypass is ENABLED; exporting raw simulation "
+            "directories, including any stale or orphaned results found there."
+        )
+
+    configured_matches = len(configured_cases) == len(references)
     if configured_cases and not configured_matches:
         print(
-            "Configured sweep-case count does not match available result count; "
+            "Configured sweep-case count does not match selected result count; "
             "result metadata will be required."
         )
 
     blocks: list[MDIFBlock] = []
     parameter_order: list[str] | None = list(parameter_names) if parameter_names else None
-    for index, simulation_id in enumerate(simulation_ids):
+    for index, reference in enumerate(references):
+        simulation_id = reference.simulation_id
         result_context = ""
         try:
-            simulation_output = analysis_output.getSimulation(simulation_id)
-            metadata = simulation_output.metadata()
             mapping = configured_cases[index].copy() if configured_matches else {}
-            mapping.update(simulation_parameters(metadata))
+            if reference.metadata is not None:
+                metadata = (
+                    reference.metadata()
+                    if callable(reference.metadata)
+                    else reference.metadata
+                )
+                mapping.update(simulation_parameters(metadata))
             selected = _select_parameters(mapping, parameter_order or ())
             if parameter_order is None:
                 if not selected:
@@ -907,7 +1032,7 @@ def collect_analysis_blocks(
             else:
                 selected = _select_parameters(mapping, parameter_order)
 
-            simulation_path = str(simulation_output.simulationPath)
+            simulation_path = reference.simulation_path
             if not simulation_path:
                 raise ValueError("simulation output has no result path")
             # RFPro may set analysis.simulationPath to this same case directory,
@@ -1212,6 +1337,17 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="skip result cases that cannot produce a complete S-matrix",
     )
     parser.add_argument(
+        "--bypass-design-point-check",
+        "--bypass-result-registration",
+        dest="bypass_result_registration",
+        action="store_true",
+        default=DEFAULT_BYPASS_RESULT_REGISTRATION,
+        help=(
+            "scan raw simulation-group result directories instead of limiting "
+            "export to RFPro's registered available-simulation list"
+        ),
+    )
+    parser.add_argument(
         "--overwrite", action="store_true", help="replace an existing output file"
     )
     arguments, unknown = parser.parse_known_args(argv)
@@ -1279,11 +1415,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         skip_errors=arguments.skip_errors,
         frequency_grid_request=frequency_grid_request,
         configured_regions=frequency_regions,
+        bypass_result_registration=arguments.bypass_result_registration,
     )
     write_mdif_atomic(output_path, blocks, arguments.reference_impedance)
     summary = (
         f"Exported {len(blocks)} RFPro result cases from analysis {analysis.name!r} "
-        f"to {output_path} using {frequency_grid_description(frequency_grid_request)}."
+        f"to {output_path} using {frequency_grid_description(frequency_grid_request)}. "
+        "Raw result-registration bypass was "
+        f"{'enabled' if arguments.bypass_result_registration else 'disabled'}."
     )
     print(summary)
     from PySide6.QtWidgets import QMessageBox

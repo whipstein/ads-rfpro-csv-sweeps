@@ -401,6 +401,12 @@ class MDIFExportTests(unittest.TestCase):
             MODULE._frequency_request_from_arguments(step_arguments),
             MODULE.FrequencyGridRequest("step", step_hz=25.0e6),
         )
+        self.assertFalse(MODULE._parse_arguments([]).bypass_result_registration)
+        self.assertTrue(
+            MODULE._parse_arguments(
+                ["--bypass-design-point-check"]
+            ).bypass_result_registration
+        )
 
     def test_inconsistent_sparameter_frequency_grid_is_rejected(self) -> None:
         matrix = FakeMatrix()
@@ -438,6 +444,90 @@ class MDIFExportTests(unittest.TestCase):
         block = MODULE.smatrix_to_block(FakeMatrix(), "1", {"bad name": "1 mm"})
         with self.assertRaisesRegex(ValueError, "not a valid"):
             MODULE.render_mdif([block], 50.0)
+
+    def test_registration_bypass_exports_raw_unregistered_result_directories(self) -> None:
+        calls: list[tuple[object, object]] = []
+        fake_toolkit = types.ModuleType("empro.toolkit")
+
+        def get_circuit_matrix(
+            proj: object = None, sim: object = None
+        ) -> FakeCircuitMatrix:
+            calls.append((proj, sim))
+            return FakeCircuitMatrix()
+
+        fake_toolkit.getCircuitMatrix = get_circuit_matrix  # type: ignore[attr-defined]
+        fake_empro_package = types.ModuleType("empro")
+        fake_empro_package.toolkit = fake_toolkit  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as directory:
+            group_path = Path(directory) / "000100"
+            for simulation_id in ("000001", "000002", "000003"):
+                result_file = (
+                    group_path
+                    / simulation_id
+                    / "emds_dsn"
+                    / "design"
+                    / "design.sio"
+                )
+                result_file.parent.mkdir(parents=True)
+                result_file.write_text("result marker", encoding="utf-8")
+
+            class RawSweepSettings:
+                parameterSequences = [
+                    [FakeSweep("W", ["1 mm", "2 mm", "3 mm"])]
+                ]
+
+            analysis = types.SimpleNamespace(
+                name="RF Analysis",
+                simulationGroupPath=str(group_path),
+                simulationSettings=RawSweepSettings(),
+            )
+
+            class PartialAnalysisOutput:
+                def __init__(self, _analysis: object) -> None:
+                    pass
+
+                @staticmethod
+                def getAvailableSimulationIds() -> list[str]:
+                    return ["000001", "000002"]
+
+                @staticmethod
+                def getSimulation(simulation_id: str) -> object:
+                    return types.SimpleNamespace(
+                        simulationPath=str(group_path / simulation_id),
+                        metadata=lambda: object(),
+                    )
+
+            empro_module = types.SimpleNamespace(
+                output=types.SimpleNamespace(AnalysisOutput=PartialAnalysisOutput)
+            )
+            modules = {
+                "empro": fake_empro_package,
+                "empro.toolkit": fake_toolkit,
+            }
+
+            with mock.patch.dict(sys.modules, modules):
+                blocks = MODULE.collect_analysis_blocks(
+                    empro_module,
+                    analysis,
+                    parameter_names=("W",),
+                    skip_errors=False,
+                    bypass_result_registration=True,
+                )
+
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(
+            [dict(block.parameters)["W"] for block in blocks],
+            ["1 mm", "2 mm", "3 mm"],
+        )
+        self.assertEqual(
+            calls,
+            [
+                (str(group_path), "000001"),
+                (str(group_path), "000002"),
+                (str(group_path), "000003"),
+            ],
+        )
 
     def test_smatrix_uses_parent_result_context_and_simulation_id(self) -> None:
         calls: list[tuple[object, object]] = []
