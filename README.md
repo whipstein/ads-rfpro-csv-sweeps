@@ -3,6 +3,11 @@
 This repository provides RFPro workflow and diagnostic scripts that run
 directly in an open Keysight RFPro process:
 
+- `rfpro_scripts/rfpro_workflow.py` opens one dropdown for CSV import,
+  analysis execution, MDIF export, or Geometry/Mesh/Ports inspection.
+- `rfpro_scripts/rfpro_diagnostics.py` opens one dropdown for the duplicate
+  condition audit, reuse/result mapping report, reusable-cache inventory, or
+  Geometry/Mesh/Ports inspection.
 - `rfpro_scripts/import_csv_parameter_sweeps.py` installs correlated geometry
   cases from CSV into an existing RFPro analysis.
 - `rfpro_scripts/export_analysis_mdif.py` exports all available swept
@@ -17,15 +22,20 @@ directly in an open Keysight RFPro process:
   mappings, per-condition cache files, and reuse-related logs.
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
+- `rfpro_scripts/diagnose_duplicate_sweep_conditions.py` expands the configured
+  parameter sequences and reports conditions that evaluate to the same RFPro
+  reference-unit values.
 
-The current release is **0.13.0**.
+The current release is **0.14.0**.
 
 ## Execution model
 
 These are in-application RFPro scripts. They use the active
 `empro.activeProject` and must not be run with an unrelated system Python.
-Each file is self-contained, including Qt startup, so RFPro can load any
-file without installing this repository as a Python package.
+The standalone tools are self-contained, including Qt startup. The two compact
+combined entry scripts delegate to their sibling shared launcher, which carries
+the same Qt startup implementation. The repository does not need to be
+installed as a Python package.
 
 From RFPro's Python console, run a script with the documented scripting
 loader:
@@ -37,6 +47,41 @@ scripting.run(
     r"C:\path\to\ads-rfpro-csv-sweeps\rfpro_scripts\import_csv_parameter_sweeps.py"
 )
 ```
+
+For the combined dropdowns, use:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(r"C:\path\to\rfpro_scripts\rfpro_workflow.py")
+scripting.run(r"C:\path\to\rfpro_scripts\rfpro_diagnostics.py")
+```
+
+The workflow dropdown contains **Import CSV parameter sweeps**, **Save and run
+analysis**, **Export analysis results to MDIF**, and **Geometry and Mesh/Ports
+inspector**. The diagnostics dropdown contains **Duplicate sweep-condition
+audit**, **Analysis reuse and result mappings**, **Reusable simulation-cache
+inventory**, and the same geometry inspector. Each selection delegates through
+`empro.toolkit.scripting.run()` to the existing tested script, so its own
+preview, confirmation, and settings remain authoritative.
+
+The launcher first selects the operation and then the analysis. To preselect
+both without showing those two chooser dialogs, pass their keys directly:
+
+```python
+scripting.run(
+    r"C:\path\to\rfpro_scripts\rfpro_workflow.py",
+    ["--operation", "geometry_inspector", "--analysis", "My RF Analysis"],
+)
+scripting.run(
+    r"C:\path\to\rfpro_scripts\rfpro_diagnostics.py",
+    ["--operation", "duplicate_conditions", "--analysis", "My RF Analysis"],
+)
+```
+
+Run a standalone child script when it needs additional command-line options;
+the combined launchers intentionally pass only the selected analysis and let
+interactive child dialogs collect the rest.
 
 With no arguments, the importer opens dialogs for the analysis and CSV file,
 then explicitly asks whether to replace all existing sweep sequences or append
@@ -405,10 +450,33 @@ Useful runner options:
 --yes
 ```
 
-## Reuse diagnostics
+## Diagnostics
 
-Both reuse diagnostics are read-only: they do not save the project, modify an
-analysis, create simulations, or alter result files.
+All three console diagnostics are read-only: they do not save the project,
+modify an analysis, create simulations, or alter result files.
+
+To investigate a configured-point count that is larger than the submitted or
+registered-result count, run the duplicate-condition audit:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(
+    r"C:\path\to\rfpro_scripts\diagnose_duplicate_sweep_conditions.py",
+    ["--analysis", "My RF Analysis"],
+)
+```
+
+The audit expands every native `ParameterSequence`, evaluates public
+`SingleParameterSweep.parameterValues` in RFPro reference units, and compares
+complete parameter mappings with the same relative/absolute tolerance model as
+the CSV importer. It prints the sequence and combination numbers for each
+duplicate group, the configured and Python-expanded point counts, registered
+simulation IDs/paths, and RFPro's sequence/result mappings. If the number of
+redundant entries equals the registered-result shortfall—for example, three
+redundant conditions alongside 48 configured entries and 45 results—the report
+marks coalescing of repeated conditions as consistent with the counts, while
+making clear that the count match alone is not proof.
 
 To inspect the current analysis/result association, registered condition paths,
 required FEM cache files, private flow version, and relevant solver-log lines:
@@ -454,6 +522,7 @@ scripting.run(
 Useful diagnostic options:
 
 ```text
+diagnose_duplicate_sweep_conditions.py: --analysis NAME --match-rel-tol FACTOR --match-abs-tol REFERENCE_VALUE
 diagnose_analysis_reuse.py: --analysis NAME --log-limit 20
 find_reusable_simulation_caches.py: --analysis NAME --root PATH --parent-levels 2
 ```

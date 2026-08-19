@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.14.0 - 2026-08-19
+
+- Add `rfpro_workflow.py`, a combined dropdown for CSV import, native analysis
+  execution, MDIF export, and Geometry/Mesh/Ports inspection.
+- Add `rfpro_diagnostics.py`, a combined dropdown for duplicate-condition,
+  reuse/result-mapping, cache-inventory, and geometry diagnostics.
+- Delegate each launcher choice through the documented
+  `empro.toolkit.scripting.run()` loader so the existing scripts retain their
+  own tested dialogs, settings, confirmations, and entry points.
+- Add a read-only duplicate sweep-condition audit that expands every native
+  sequence, compares evaluated parameter mappings in RFPro reference units,
+  and correlates redundant configured entries with missing registered results.
+- Carry the resilient Keysight Qt bootstrap in the shared launcher, including
+  reuse of RFPro's existing `QApplication` and automatic platform-plugin
+  discovery for script-owned applications.
+
 ## 0.13.0 - 2026-08-19
 
 - Report configured sweep cases, RFPro-registered results, and raw circuit
