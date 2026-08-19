@@ -26,17 +26,18 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.1**.
+The current release is **0.14.2**.
 
 ## Execution model
 
 These are in-application RFPro scripts. They use the active
 `empro.activeProject` and must not be run with an unrelated system Python.
 The standalone tools and both combined entry scripts are self-contained,
-including Qt startup. The combined scripts delegate only the selected operation
-to its existing sibling production script. They do not import or load a shared
-launcher module, and the repository does not need to be installed as a Python
-package.
+including Qt startup. Each combined script contains compressed, integrity-
+checked copies of all its operations and executes the selected tool as an
+in-memory module. It does not import, locate, or load another repository file,
+so either combined `.py` file can be copied and run by itself. The repository
+does not need to be installed as a Python package.
 
 From RFPro's Python console, run a script with the documented scripting
 loader:
@@ -63,8 +64,9 @@ analysis**, **Export analysis results to MDIF**, and **Geometry and Mesh/Ports
 inspector**. The diagnostics dropdown contains **Duplicate sweep-condition
 audit**, **Analysis reuse and result mappings**, **Reusable simulation-cache
 inventory**, and the same geometry inspector. Each selection delegates through
-`empro.toolkit.scripting.run()` to the existing tested script, so its own
-preview, confirmation, and settings remain authoritative.
+an in-memory module containing the exact tested operation source, so its own
+preview, confirmation, and settings remain authoritative. No subsequent script
+path is resolved through `empro.toolkit.scripting.run()`.
 
 The launcher first selects the operation and then the analysis. To preselect
 both without showing those two chooser dialogs, pass their keys directly:
@@ -83,6 +85,15 @@ scripting.run(
 Run a standalone child script when it needs additional command-line options;
 the combined launchers intentionally pass only the selected analysis and let
 interactive child dialogs collect the rest.
+
+The readable standalone operation scripts remain the development source of
+truth. After editing one, regenerate both committed single-file bundles and
+verify that they are current:
+
+```bash
+python scripts/build_rfpro_bundles.py
+python scripts/build_rfpro_bundles.py --check
+```
 
 With no arguments, the importer opens dialogs for the analysis and CSV file,
 then explicitly asks whether to replace all existing sweep sequences or append
@@ -713,6 +724,7 @@ The RFPro API is imported only inside `main()`, allowing CSV and MDIF logic to
 be tested without Keysight software:
 
 ```bash
+python scripts/build_rfpro_bundles.py --check
 python -m py_compile rfpro_scripts/*.py scripts/*.py
 python -m unittest discover -s tests -v
 ```

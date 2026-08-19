@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.2 - 2026-08-19
+
+- Convert both combined launchers into true single-file bundles containing all
+  selected operation implementations; no subsequent repository script is
+  located or opened at runtime.
+- Execute each selected operation as a registered in-memory module, preserving
+  RFPro child-script behavior and Python `@dataclass` compatibility without
+  another `empro.toolkit.scripting.run()` call.
+- Compress the embedded source and verify its SHA-256 digest before execution,
+  with readable standalone operation scripts retained as the source of truth.
+- Add `scripts/build_rfpro_bundles.py` and regression checks that ensure every
+  committed payload exactly matches its standalone source and loads without
+  filesystem delegation.
+
 ## 0.14.1 - 2026-08-19
 
 - Make `rfpro_workflow.py` and `rfpro_diagnostics.py` self-contained by
