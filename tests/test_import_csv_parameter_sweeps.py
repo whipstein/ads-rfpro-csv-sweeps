@@ -287,6 +287,46 @@ class CSVImportTests(unittest.TestCase):
         self.assertEqual(settings.parameterSequences.append_calls, 0)
         self.assertIs(settings.parameterSequences[0], existing)
 
+    def test_duplicate_matching_can_be_completely_disabled_for_append(self) -> None:
+        existing = evaluated_sequence(W=[1.0e-3])
+        exact_existing_match = evaluated_sequence(W=[1.0e-3])
+        first_csv_value = evaluated_sequence(W=[2.0e-3])
+        duplicate_csv_value = evaluated_sequence(W=[2.0e-3])
+        settings = FakeSettings([existing], enabled=True)
+
+        plan = MODULE.plan_parameter_sequence_import(
+            settings,
+            [exact_existing_match, first_csv_value, duplicate_csv_value],
+            "append",
+            relative_tolerance=0.0,
+            absolute_tolerance=0.0,
+            deduplicate_cases=False,
+        )
+
+        self.assertFalse(plan.deduplicate_cases)
+        self.assertEqual(plan.reused_existing_count, 0)
+        self.assertEqual(plan.duplicate_csv_count, 0)
+        self.assertEqual(plan.added_count, 3)
+        self.assertEqual(
+            plan.append_sequences,
+            (exact_existing_match, first_csv_value, duplicate_csv_value),
+        )
+
+        before, after = MODULE.apply_parameter_sequence_import_plan(settings, plan)
+        self.assertEqual((before, after), (1, 4))
+        self.assertEqual(settings.parameterSequences.append_calls, 3)
+
+    def test_disabling_duplicate_matching_requires_append_mode(self) -> None:
+        settings = FakeSettings([evaluated_sequence(W=[1.0e-3])], enabled=True)
+
+        with self.assertRaisesRegex(ValueError, "supported only in append mode"):
+            MODULE.plan_parameter_sequence_import(
+                settings,
+                [evaluated_sequence(W=[2.0e-3])],
+                "replace",
+                deduplicate_cases=False,
+            )
+
     def test_replace_that_only_adds_points_uses_append_without_clear(self) -> None:
         existing = evaluated_sequence(W=[1.0e-3])
         matching = evaluated_sequence(W=[1.0e-3 + 5.0e-13])
@@ -405,6 +445,10 @@ class CSVImportTests(unittest.TestCase):
         self.assertTrue(
             MODULE._parse_arguments(["--allow-destructive-replace"])
             .allow_destructive_replace
+        )
+        self.assertTrue(MODULE._parse_arguments([]).deduplicate_cases)
+        self.assertFalse(
+            MODULE._parse_arguments(["--allow-duplicate-cases"]).deduplicate_cases
         )
         with self.assertRaisesRegex(ValueError, "Unknown import mode"):
             MODULE._choose_import_mode(settings, "invalid")

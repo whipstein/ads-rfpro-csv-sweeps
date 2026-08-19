@@ -38,6 +38,9 @@ DEFAULT_VALUE_SCALE = 1.0
 # Evaluated RFPro sweep values are compared in reference units with math.isclose().
 DEFAULT_MATCH_REL_TOLERANCE = 1.0e-9
 DEFAULT_MATCH_ABS_TOLERANCE = 1.0e-15
+# Set False to append every enabled CSV row without comparing it to existing
+# RFPro cases or to other rows in the CSV. This is supported only in append mode.
+DEFAULT_DEDUPLICATE_CASES = True
 # A destructive replace can invalidate result reuse, so it requires opt-in.
 DEFAULT_ALLOW_DESTRUCTIVE_REPLACE = False
 
@@ -81,6 +84,7 @@ class SequenceImportPlan:
     duplicate_csv_count: int
     removed_existing_count: int
     sweep_was_enabled: bool
+    deduplicate_cases: bool
     blocked_reason: str = ""
 
     @property
@@ -563,12 +567,18 @@ def plan_parameter_sequence_import(
     mode: str,
     relative_tolerance: float = DEFAULT_MATCH_REL_TOLERANCE,
     absolute_tolerance: float = DEFAULT_MATCH_ABS_TOLERANCE,
+    deduplicate_cases: bool = DEFAULT_DEDUPLICATE_CASES,
     allow_destructive_replace: bool = DEFAULT_ALLOW_DESTRUCTIVE_REPLACE,
 ) -> SequenceImportPlan:
     """Plan a safe append or an explicitly authorized all-new rebuild."""
 
     if mode not in {"replace", "append"}:
         raise ValueError(f"Unknown import mode: {mode!r}")
+    if not deduplicate_cases and mode != "append":
+        raise ValueError(
+            "Disabling duplicate matching is supported only in append mode. "
+            "Use mode='append' to append every enabled CSV row."
+        )
     relative_tolerance = validated_match_tolerance(
         relative_tolerance, "Duplicate-match relative tolerance"
     )
@@ -588,7 +598,7 @@ def plan_parameter_sequence_import(
 
     for candidate in candidates:
         candidate_values = _evaluated_sequence_values(candidate)
-        if any(
+        if deduplicate_cases and any(
             _sequence_values_match(
                 candidate_values,
                 previous_values,
@@ -600,20 +610,22 @@ def plan_parameter_sequence_import(
             duplicate_csv_count += 1
             continue
 
-        matching_existing_index = next(
-            (
-                index
-                for index, values in enumerate(existing_values)
-                if index not in used_existing_indices
-                and _sequence_values_match(
-                    candidate_values,
-                    values,
-                    relative_tolerance,
-                    absolute_tolerance,
-                )
-            ),
-            None,
-        )
+        matching_existing_index = None
+        if deduplicate_cases:
+            matching_existing_index = next(
+                (
+                    index
+                    for index, values in enumerate(existing_values)
+                    if index not in used_existing_indices
+                    and _sequence_values_match(
+                        candidate_values,
+                        values,
+                        relative_tolerance,
+                        absolute_tolerance,
+                    )
+                ),
+                None,
+            )
         if matching_existing_index is not None:
             used_existing_indices.add(matching_existing_index)
             reused_existing_count += 1
@@ -660,6 +672,7 @@ def plan_parameter_sequence_import(
         duplicate_csv_count=duplicate_csv_count,
         removed_existing_count=removed_existing_count,
         sweep_was_enabled=bool(settings.parameterSweepEnabled),
+        deduplicate_cases=bool(deduplicate_cases),
         blocked_reason=blocked_reason,
     )
 
@@ -864,9 +877,15 @@ def _preview_text(
         "Parameters: " + ", ".join(parameter_names),
     ]
     if import_plan is not None:
+        matching_policy = (
+            "enabled; evaluated matches will be retained/skipped"
+            if import_plan.deduplicate_cases
+            else "DISABLED; every enabled CSV row will be appended"
+        )
         lines.extend(
             [
                 f"Planned operation: {import_plan.operation}",
+                f"Duplicate matching: {matching_policy}",
                 f"Matching existing cases retained: "
                 f"{import_plan.reused_existing_count}",
                 f"New cases to add: {import_plan.added_count}",
@@ -880,6 +899,11 @@ def _preview_text(
             lines.append(
                 "WARNING: destructive rebuild explicitly enabled; all native "
                 "sequence objects will be recreated and result reuse may be lost."
+            )
+        if not import_plan.deduplicate_cases:
+            lines.append(
+                "WARNING: duplicate matching is disabled; exact duplicate RFPro "
+                "conditions and repeated CSV rows will also be appended."
             )
         if import_plan.blocked:
             lines.append("BLOCKED: " + import_plan.blocked_reason)
@@ -937,6 +961,16 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_MATCH_ABS_TOLERANCE,
         help="absolute reference-unit tolerance for matching sweep values",
+    )
+    parser.add_argument(
+        "--allow-duplicate-cases",
+        action="store_false",
+        dest="deduplicate_cases",
+        default=DEFAULT_DEDUPLICATE_CASES,
+        help=(
+            "append every enabled CSV row without comparing it to existing "
+            "RFPro cases or other CSV rows; append mode only"
+        ),
     )
     parser.add_argument(
         "--allow-destructive-replace",
@@ -1003,6 +1037,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         validated_match_tolerance(
             arguments.match_abs_tol, "Duplicate-match absolute tolerance"
         ),
+        arguments.deduplicate_cases,
         arguments.allow_destructive_replace,
     )
 

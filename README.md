@@ -18,7 +18,7 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/find_reusable_simulation_caches.py` inventories unique FEM
   caches and distinguishes registered paths from historical/orphaned paths.
 
-The current release is **0.12.0**.
+The current release is **0.12.1**.
 
 ## Execution model
 
@@ -146,6 +146,22 @@ equivalent unit expressions compare in RFPro reference units. It uses
 skipped, and removed counts before confirmation. The script never creates or
 queues simulations.
 
+Setting both tolerances to zero disables only approximate matching; exact
+evaluated matches are still duplicates. To bypass matching completely in
+append mode, set:
+
+```python
+DEFAULT_DEDUPLICATE_CASES = False
+```
+
+or pass `--allow-duplicate-cases`. With this explicit override, every enabled
+CSV row is appended without comparing it to existing RFPro conditions or to
+earlier CSV rows. The confirmation preview states that duplicate matching is
+disabled. Exact duplicates will also be appended, so restore the default after
+the intended import if repeated conditions are not desired. This override is
+rejected in replace mode because it cannot safely determine which existing
+native sequences should be retained.
+
 For non-interactive use, pass `--mode replace` or `--mode append`. You can also
 set `DEFAULT_IMPORT_MODE` near the top of the script to either value to make it
 the fixed behavior for launches that cannot pass arguments.
@@ -159,6 +175,7 @@ Useful importer options:
 --scale FACTOR
 --match-rel-tol FACTOR
 --match-abs-tol REFERENCE_VALUE
+--allow-duplicate-cases
 --allow-destructive-replace
 --no-save
 --yes

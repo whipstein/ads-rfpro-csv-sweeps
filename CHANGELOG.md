@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.1 - 2026-08-18
+
+- Add `DEFAULT_DEDUPLICATE_CASES` and `--allow-duplicate-cases` so append mode
+  can bypass both existing-condition matching and duplicate-CSV-row matching.
+- Make the confirmation preview explicitly identify when every enabled CSV row
+  will be appended, including exact duplicates.
+- Reject disabled duplicate matching in replace mode, where safely retaining
+  existing native sequence objects requires comparison.
+
 ## 0.12.0 - 2026-08-18
 
 - Add bounded SiteCluster submission to the explicit RFPro runner, with an
