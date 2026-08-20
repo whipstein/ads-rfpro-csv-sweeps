@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.4 - 2026-08-20
+
+- Enable and verify RFPro's **View Faces** and **Ports** controls whenever the
+  geometry inspector loads a saved FEM or Momentum Mesh/Ports result.
+- Disable the active Mesh renderer before changing geometry points, loading the
+  next result during PDF export, or restoring the original geometry.
+- Support RFPro visibility state exposed as checkable menu actions, buttons,
+  or item-view rows, and report discovered controls when an expected option is
+  unavailable instead of silently displaying stale view state.
+- Regenerate both self-contained launchers with the updated inspector.
+
 ## 0.14.3 - 2026-08-20
 
 - Fix saved Mesh/Ports loading by passing RFPro's native FEM and Momentum view

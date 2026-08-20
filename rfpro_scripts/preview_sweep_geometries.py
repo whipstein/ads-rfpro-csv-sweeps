@@ -659,6 +659,488 @@ def _action_is_enabled(action: Any) -> bool:
     return bool(enabled)
 
 
+def _control_is_checkable(control: Any) -> bool:
+    """Return whether a Qt or EMPro view control exposes checked state."""
+
+    checkable = _call_or_value(
+        _getattr_or_default(control, "isCheckable"),
+        _call_or_value(_getattr_or_default(control, "checkable"), None),
+    )
+    if checkable is not None:
+        return bool(checkable)
+    return (
+        _getattr_or_default(control, "isChecked") is not None
+        or _getattr_or_default(control, "checked") is not None
+    )
+
+
+def _control_is_checked(control: Any) -> bool:
+    checked = _call_or_value(
+        _getattr_or_default(control, "isChecked"),
+        _call_or_value(_getattr_or_default(control, "checked"), None),
+    )
+    if checked is None:
+        raise RuntimeError(
+            f"RFPro view control {_action_text(control)!r} exposes no checked state."
+        )
+    return bool(checked)
+
+
+def _control_is_visible(control: Any) -> bool:
+    visible = _call_or_value(
+        _getattr_or_default(control, "isVisible"),
+        _call_or_value(_getattr_or_default(control, "visible"), True),
+    )
+    return bool(visible)
+
+
+def _control_metadata(control: Any) -> tuple[str, ...]:
+    values: list[str] = []
+    for label in _getattr_or_default(control, "_rfpro_labels", ()):
+        text = str(label or "").strip()
+        if text and text not in values:
+            values.append(text)
+    for attribute_name in (
+        "text",
+        "objectName",
+        "toolTip",
+        "accessibleName",
+    ):
+        raw = _call_or_value(
+            _getattr_or_default(control, attribute_name), ""
+        )
+        text = str(raw or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return tuple(values)
+
+
+class _QtItemCheckControl:
+    """Adapt one checkable Qt item-model cell to the view-control helpers."""
+
+    def __init__(
+        self,
+        view: Any,
+        model: Any,
+        index: Any,
+        labels: Sequence[str],
+        qt_namespace: Any,
+    ) -> None:
+        self._view = view
+        self._model = model
+        self._index = index
+        self._rfpro_labels = tuple(labels)
+        self._check_state_role = qt_namespace.ItemDataRole.CheckStateRole
+        self._checked = qt_namespace.CheckState.Checked
+        self._unchecked = qt_namespace.CheckState.Unchecked
+        self._item_is_enabled = qt_namespace.ItemFlag.ItemIsEnabled
+        self._item_is_user_checkable = qt_namespace.ItemFlag.ItemIsUserCheckable
+
+    def text(self) -> str:
+        return self._rfpro_labels[0] if self._rfpro_labels else ""
+
+    def isCheckable(self) -> bool:
+        try:
+            if self._model.data(self._index, self._check_state_role) is not None:
+                return True
+            return bool(self._model.flags(self._index) & self._item_is_user_checkable)
+        except Exception:
+            return False
+
+    def isChecked(self) -> bool:
+        state = self._model.data(self._index, self._check_state_role)
+        state_value = getattr(state, "value", state)
+        checked_value = getattr(self._checked, "value", self._checked)
+        return state_value == checked_value
+
+    def setChecked(self, checked: bool) -> None:
+        state = self._checked if checked else self._unchecked
+        accepted = self._model.setData(
+            self._index,
+            state,
+            self._check_state_role,
+        )
+        if accepted is False:
+            raise RuntimeError(
+                f"RFPro rejected the view-state update for {self.text()!r}."
+            )
+
+    def isEnabled(self) -> bool:
+        try:
+            return bool(self._model.flags(self._index) & self._item_is_enabled)
+        except Exception:
+            return True
+
+    def isVisible(self) -> bool:
+        return bool(
+            _call_or_value(_getattr_or_default(self._view, "isVisible"), True)
+        )
+
+
+def _iter_checkable_item_view_controls(
+    view: Any,
+    qt_namespace: Any,
+    maximum_cells: int = 5000,
+) -> Iterable[_QtItemCheckControl]:
+    """Yield checkable rows from RFPro visibility tables and trees."""
+
+    model = _call_or_value(_getattr_or_default(view, "model"), None)
+    if model is None:
+        return
+    try:
+        from PySide6.QtCore import QModelIndex
+
+        root_index = QModelIndex()
+    except Exception:
+        root_index = None
+
+    display_role = qt_namespace.ItemDataRole.DisplayRole
+    check_state_role = qt_namespace.ItemDataRole.CheckStateRole
+    item_is_user_checkable = qt_namespace.ItemFlag.ItemIsUserCheckable
+    pending = [root_index]
+    visited_cells = 0
+    while pending and visited_cells < maximum_cells:
+        parent = pending.pop()
+        try:
+            row_count = int(model.rowCount(parent))
+            column_count = max(1, int(model.columnCount(parent)))
+        except Exception:
+            continue
+        for row in range(row_count):
+            indices: list[Any] = []
+            labels: list[str] = []
+            checkable_indices: list[Any] = []
+            for column in range(column_count):
+                if visited_cells >= maximum_cells:
+                    break
+                visited_cells += 1
+                try:
+                    index = model.index(row, column, parent)
+                    if not bool(_call_or_value(getattr(index, "isValid", None), True)):
+                        continue
+                    indices.append(index)
+                    display = model.data(index, display_role)
+                    text = str(display or "").strip()
+                    if text and text not in labels:
+                        labels.append(text)
+                    state = model.data(index, check_state_role)
+                    flags = model.flags(index)
+                    if state is not None or bool(flags & item_is_user_checkable):
+                        checkable_indices.append(index)
+                except Exception:
+                    continue
+            for index in checkable_indices:
+                yield _QtItemCheckControl(
+                    view,
+                    model,
+                    index,
+                    labels,
+                    qt_namespace,
+                )
+            if indices:
+                pending.append(indices[0])
+
+
+def _normalized_control_text(text: str) -> str:
+    camel_case_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(text))
+    return _normalized_action_text(camel_case_split)
+
+
+_RFPRO_VIEW_OPTION_ALIASES = {
+    "faces": frozenset(("faces", "view faces", "show faces")),
+    "ports": frozenset(("ports", "view ports", "show ports")),
+    "mesh": frozenset(
+        (
+            "mesh",
+            "meshes",
+            "view mesh",
+            "show mesh",
+            "fem mesh",
+            "momentum mesh",
+            "mesh ports",
+            "view mesh ports",
+        )
+    ),
+}
+
+
+def _control_matches_view_option(control: Any, option_name: str) -> bool:
+    aliases = _RFPRO_VIEW_OPTION_ALIASES[option_name]
+    compact_aliases = {alias.replace(" ", "") for alias in aliases}
+    ignored_suffixes = (" check box", " checkbox", " toggle", " action", " button")
+    for raw_text in _control_metadata(control):
+        normalized = _normalized_control_text(raw_text)
+        variants = {normalized, normalized.replace(" ", "")}
+        for suffix in ignored_suffixes:
+            if normalized.endswith(suffix):
+                trimmed = normalized[: -len(suffix)].strip()
+                variants.add(trimmed)
+                variants.add(trimmed.replace(" ", ""))
+        if variants.intersection(aliases) or variants.intersection(compact_aliases):
+            return True
+    return False
+
+
+def _iter_rfpro_view_controls(
+    project_view: Any,
+    application: Any,
+    qt_action_type: type[Any] | None = None,
+    qt_button_type: type[Any] | None = None,
+    qt_item_view_type: type[Any] | None = None,
+    qt_namespace: Any = None,
+) -> Iterable[tuple[Any, str, tuple[Any, ...], int]]:
+    """Yield live RFPro view controls with owners and a source preference."""
+
+    seen_controls: set[int] = set()
+
+    try:
+        view_menu = project_view.menu("view")
+    except Exception:
+        view_menu = None
+    if view_menu is not None:
+        for control, owners in _iter_menu_actions_with_owners(
+            view_menu, (project_view,)
+        ):
+            seen_controls.add(id(control))
+            yield control, "RFPro View menu", owners, 300
+
+    if qt_action_type is None:
+        try:
+            from PySide6.QtGui import QAction
+
+            qt_action_type = QAction
+        except Exception:
+            qt_action_type = None
+    if qt_button_type is None:
+        try:
+            from PySide6.QtWidgets import QAbstractButton
+
+            qt_button_type = QAbstractButton
+        except Exception:
+            qt_button_type = None
+    if qt_item_view_type is None or qt_namespace is None:
+        try:
+            from PySide6.QtCore import Qt
+            from PySide6.QtWidgets import QAbstractItemView
+
+            qt_item_view_type = qt_item_view_type or QAbstractItemView
+            qt_namespace = qt_namespace or Qt
+        except Exception:
+            qt_item_view_type = None
+            qt_namespace = None
+
+    top_levels = _call_or_value(
+        _getattr_or_default(application, "topLevelWidgets"), []
+    ) or []
+    for top_level in top_levels:
+        window_title = str(
+            _call_or_value(
+                _getattr_or_default(top_level, "windowTitle"), ""
+            )
+            or ""
+        )
+        normalized_title = window_title.casefold()
+        if "rfpro sweep geometry inspector" in normalized_title:
+            continue
+        source_score = (
+            500
+            if "rfpro" in normalized_title or "empro" in normalized_title
+            else 350
+        )
+        find_children = _getattr_or_default(top_level, "findChildren")
+        if not callable(find_children):
+            continue
+        for control_type in (qt_action_type, qt_button_type):
+            if control_type is None:
+                continue
+            try:
+                controls = find_children(control_type)
+            except Exception:
+                continue
+            for control in controls:
+                if id(control) in seen_controls:
+                    continue
+                seen_controls.add(id(control))
+                yield (
+                    control,
+                    f"Qt window {window_title!r}",
+                    (top_level, control),
+                    source_score,
+                )
+        if qt_item_view_type is None or qt_namespace is None:
+            continue
+        try:
+            item_views = find_children(qt_item_view_type)
+        except Exception:
+            continue
+        for view in item_views:
+            view_metadata = " ".join(_control_metadata(view))
+            view_description = view_metadata or type(view).__name__
+            normalized_view = _normalized_control_text(view_description)
+            view_score = source_score + (
+                30
+                if any(
+                    token in normalized_view
+                    for token in ("visibility", "geometry", "view")
+                )
+                else 0
+            )
+            for control in _iter_checkable_item_view_controls(
+                view,
+                qt_namespace,
+            ):
+                yield (
+                    control,
+                    f"Qt window {window_title!r} item view {view_description!r}",
+                    (top_level, view, control),
+                    view_score,
+                )
+
+
+def find_rfpro_view_option_control(
+    project_view: Any,
+    application: Any,
+    option_name: str,
+    qt_action_type: type[Any] | None = None,
+    qt_button_type: type[Any] | None = None,
+) -> tuple[Any, str, tuple[Any, ...]]:
+    """Find one checkable Faces, Ports, or Mesh control in RFPro's live view."""
+
+    if option_name not in _RFPRO_VIEW_OPTION_ALIASES:
+        raise ValueError(f"Unsupported RFPro view option: {option_name!r}")
+
+    candidates: list[tuple[int, Any, str, tuple[Any, ...]]] = []
+    discovered: list[str] = []
+    for control, source, owners, source_score in _iter_rfpro_view_controls(
+        project_view,
+        application,
+        qt_action_type=qt_action_type,
+        qt_button_type=qt_button_type,
+    ):
+        metadata = _control_metadata(control)
+        label = metadata[0] if metadata else type(control).__name__
+        if _control_is_checkable(control):
+            discovered.append(f"{source}: {label}")
+        if not _control_matches_view_option(control, option_name):
+            continue
+        if not _qt_object_is_valid(control):
+            discovered.append(f"{source}: {label} is already deleted")
+            continue
+        if not _control_is_checkable(control):
+            discovered.append(f"{source}: {label} is not checkable")
+            continue
+        if not _action_is_enabled(control):
+            discovered.append(f"{source}: {label} is disabled")
+            continue
+        score = source_score + (20 if _control_is_visible(control) else 0)
+        candidates.append(
+            (score, control, f"{source} > {label}", owners)
+        )
+
+    if not candidates:
+        details = "\n  ".join(discovered[-60:]) or "no checkable controls found"
+        requested = "/".join(sorted(_RFPRO_VIEW_OPTION_ALIASES[option_name]))
+        raise RuntimeError(
+            f"RFPro's checkable {option_name} view control was not found "
+            f"(accepted labels: {requested}). Discovered view state:\n  {details}"
+        )
+    candidates.sort(key=lambda record: record[0], reverse=True)
+    _score, control, description, owners = candidates[0]
+    return control, description, owners
+
+
+def set_rfpro_view_option(
+    empro_module: Any,
+    application: Any,
+    option_name: str,
+    checked: bool,
+    qt_action_type: type[Any] | None = None,
+    qt_button_type: type[Any] | None = None,
+) -> str:
+    """Set and verify one live RFPro view option through its checkable control."""
+
+    project_view = empro_module.gui.activeProjectView()
+    control, description, owner_references = find_rfpro_view_option_control(
+        project_view,
+        application,
+        option_name,
+        qt_action_type=qt_action_type,
+        qt_button_type=qt_button_type,
+    )
+    desired = bool(checked)
+    if _control_is_checked(control) != desired:
+        trigger = _getattr_or_default(control, "trigger")
+        click = _getattr_or_default(control, "click")
+        on_triggered = _getattr_or_default(control, "onTriggered")
+        if callable(trigger):
+            trigger()
+        elif callable(click):
+            click()
+        elif callable(on_triggered):
+            try:
+                setattr(control, "checked", desired)
+            except Exception:
+                pass
+            try:
+                on_triggered(desired)
+            except TypeError:
+                on_triggered()
+        else:
+            set_checked = _getattr_or_default(control, "setChecked")
+            if not callable(set_checked):
+                raise RuntimeError(
+                    f"{description} cannot be activated from Python."
+                )
+            set_checked(desired)
+        empro_module.gui.processEvents()
+
+    # Some wrapper controls expose a trigger but do not toggle themselves when
+    # invoked outside their owning widget. Use setChecked only as a verified
+    # fallback, then require the final state to match.
+    if _control_is_checked(control) != desired:
+        set_checked = _getattr_or_default(control, "setChecked")
+        if callable(set_checked):
+            set_checked(desired)
+            empro_module.gui.processEvents()
+    if _control_is_checked(control) != desired:
+        state = "checked" if desired else "unchecked"
+        raise RuntimeError(f"{description} could not be set {state}.")
+
+    # Retain transient QMenu/QAction wrappers through activation and event
+    # delivery, matching the lifetime discipline used by Export Image.
+    _ = owner_references
+    return description
+
+
+def enable_mesh_ports_view_options(
+    empro_module: Any,
+    application: Any,
+) -> tuple[str, str]:
+    """Enable RFPro's View Faces and Ports controls for a loaded mesh."""
+
+    faces = set_rfpro_view_option(empro_module, application, "faces", True)
+    ports = set_rfpro_view_option(empro_module, application, "ports", True)
+    geometry_view = empro_module.gui.activeProjectView().geometryView()
+    geometry_view.updateView()
+    empro_module.gui.processEvents()
+    return faces, ports
+
+
+def unload_mesh_ports_view(empro_module: Any, application: Any) -> str:
+    """Disable and verify RFPro's loaded Mesh layer before showing geometry."""
+
+    description = set_rfpro_view_option(
+        empro_module,
+        application,
+        "mesh",
+        False,
+    )
+    geometry_view = empro_module.gui.activeProjectView().geometryView()
+    geometry_view.updateView()
+    empro_module.gui.processEvents()
+    return description
+
+
 def _action_can_trigger(action: Any) -> bool:
     return callable(_getattr_or_default(action, "trigger")) or callable(
         _getattr_or_default(action, "onTriggered")
@@ -2094,6 +2576,7 @@ def create_inspector_dialog(
             self._restored = False
             self._applying = False
             self._active_view_text = "Geometry"
+            self._mesh_view_active = False
             self._mesh_inventory: MeshPortsInventory | None = None
             self._statuses: list[tuple[bool | None, str] | None] = [
                 None for _ in points
@@ -2176,7 +2659,8 @@ def create_inspector_dialog(
             )
             close_button.clicked.connect(self.close)
             self.load_selected_button.setToolTip(
-                "Regenerate and display the parameter combination in the highlighted row."
+                "Unload any displayed mesh, then regenerate and display the "
+                "parameter combination in the highlighted row."
             )
             self.fit_button.setToolTip(
                 "Fit the geometry currently displayed; this does not load a table row."
@@ -2308,6 +2792,26 @@ def create_inspector_dialog(
                 return False
             self._applying = True
             try:
+                if self._mesh_view_active:
+                    try:
+                        unloaded_by = unload_mesh_ports_view(
+                            empro_module,
+                            QApplication.instance(),
+                        )
+                    except Exception as error:
+                        QMessageBox.warning(
+                            self,
+                            "Could not unload previous Mesh/Ports view",
+                            "The selected geometry was not changed because RFPro's "
+                            f"previous mesh could not be unloaded:\n{error}",
+                        )
+                        print(
+                            "Could not switch geometry points because the previous "
+                            f"Mesh/Ports view could not be unloaded: {error}"
+                        )
+                        return False
+                    self._mesh_view_active = False
+                    print(f"Unloaded previous Mesh/Ports view via {unloaded_by}.")
                 update_report = apply_sweep_point_to_geometry(
                     project, baseline_formulas, points[row]
                 )
@@ -2370,7 +2874,19 @@ def create_inspector_dialog(
                 )
                 return
             try:
+                if self._mesh_view_active:
+                    unloaded_by = unload_mesh_ports_view(
+                        empro_module,
+                        QApplication.instance(),
+                    )
+                    self._mesh_view_active = False
+                    print(f"Unloaded previous Mesh/Ports view via {unloaded_by}.")
                 display_mesh_ports_result(empro_module, analysis, result, True)
+                self._mesh_view_active = True
+                faces_control, ports_control = enable_mesh_ports_view_options(
+                    empro_module,
+                    QApplication.instance(),
+                )
             except Exception as error:
                 QMessageBox.warning(
                     self,
@@ -2384,7 +2900,8 @@ def create_inspector_dialog(
             self._update_summary(row)
             print(
                 f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
-                f"result from simulation {result.simulation_id}."
+                f"result from simulation {result.simulation_id}; enabled "
+                f"View Faces via {faces_control}; enabled Ports via {ports_control}."
             )
 
         def _fit_view(self) -> None:
@@ -2480,7 +2997,22 @@ def create_inspector_dialog(
                     f"{safe_simulation_id}_mesh_ports.png"
                 )
                 try:
+                    if self._mesh_view_active:
+                        unloaded_by = unload_mesh_ports_view(
+                            empro_module,
+                            QApplication.instance(),
+                        )
+                        self._mesh_view_active = False
+                        print(
+                            "Unloaded previous Mesh/Ports view before the next "
+                            f"report point via {unloaded_by}."
+                        )
                     display_mesh_ports_result(empro_module, analysis, result, True)
+                    self._mesh_view_active = True
+                    enable_mesh_ports_view_options(
+                        empro_module,
+                        QApplication.instance(),
+                    )
                     self._active_view_text = (
                         f"{result.mesh_kind} Mesh/Ports - simulation "
                         f"{result.simulation_id}"
@@ -2757,6 +3289,22 @@ def create_inspector_dialog(
             if self._restored:
                 return
             self._restored = True
+            if self._mesh_view_active:
+                try:
+                    unloaded_by = unload_mesh_ports_view(
+                        empro_module,
+                        QApplication.instance(),
+                    )
+                    self._mesh_view_active = False
+                    print(
+                        "Unloaded the active Mesh/Ports view before restoring "
+                        f"the original geometry via {unloaded_by}."
+                    )
+                except Exception as error:
+                    print(
+                        "WARNING: could not unload the active Mesh/Ports view "
+                        f"before restoring the original geometry: {error}"
+                    )
             try:
                 update_report = restore_parameter_formulas_and_geometry(
                     project, baseline_formulas

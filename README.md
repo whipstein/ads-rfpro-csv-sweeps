@@ -26,7 +26,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.3**.
+The current release is **0.14.4**.
 
 ## Execution model
 
@@ -344,6 +344,15 @@ that result's `simulationPath` onto the analysis only for the native display
 call, then restores the analysis's exact original path even if loading fails.
 This view-only operation does not save the project or alter the path used by a
 later simulation run.
+
+After loading a mesh, the inspector enables and verifies RFPro's checkable
+**View Faces** and **Ports** visibility controls. It supports both QAction or
+button controls and the checkable rows used by RFPro's Visibility item view.
+Before selecting another raw geometry point, loading the next saved mesh, or
+restoring the original geometry, it unchecks and verifies the active **Mesh**
+control so the prior result is no longer rendered. If RFPro does not expose a
+matching checkable control, the transition stops and reports all discovered
+control labels instead of silently leaving a stale mesh over another point.
 
 **Mesh/Ports PDF** scans again, then loads and exports every available saved
 Mesh/Ports result through RFPro's same **View > Export Image** command used by

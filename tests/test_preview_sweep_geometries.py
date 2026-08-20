@@ -167,6 +167,23 @@ class FakeAction:
             self.on_trigger()
 
 
+class FakeCheckableAction(FakeAction):
+    def __init__(self, text: str, checked: bool = False) -> None:
+        super().__init__(text)
+        self.checkable = True
+        self.checked = checked
+
+    def isCheckable(self) -> bool:
+        return self.checkable
+
+    def isChecked(self) -> bool:
+        return self.checked
+
+    def trigger(self) -> None:
+        self.checked = not self.checked
+        super().trigger()
+
+
 class FakeMenu:
     def __init__(self, actions) -> None:
         self._actions = list(actions)
@@ -651,6 +668,137 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         self.assertEqual(geometry_view.fem_mesh_paths, ["results/000004"])
         self.assertEqual(analysis.simulationPath, "results/original")
+
+    def test_mesh_view_enables_faces_and_ports_and_can_unload_mesh(self) -> None:
+        faces = FakeCheckableAction("&View Faces", checked=False)
+        ports = FakeCheckableAction("Ports", checked=False)
+        mesh = FakeCheckableAction("Mesh", checked=True)
+        view_menu = FakeMenu(
+            [FakeAction("Visibility", menu=FakeMenu([faces, ports, mesh]))]
+        )
+        geometry_view = FakeGeometryViewController()
+        project_view = FakeProjectView(geometry_view, view_menu)
+        empro_module = type(
+            "FakeEmpro", (), {"gui": FakeCaptureGui(project_view)}
+        )()
+
+        enabled = MODULE.enable_mesh_ports_view_options(
+            empro_module,
+            FakeApplication(),
+        )
+
+        self.assertTrue(faces.checked)
+        self.assertTrue(ports.checked)
+        self.assertTrue(mesh.checked)
+        self.assertEqual(faces.trigger_calls, 1)
+        self.assertEqual(ports.trigger_calls, 1)
+        self.assertIn("View Faces", enabled[0])
+        self.assertIn("Ports", enabled[1])
+
+        unloaded = MODULE.unload_mesh_ports_view(
+            empro_module,
+            FakeApplication(),
+        )
+
+        self.assertFalse(mesh.checked)
+        self.assertEqual(mesh.trigger_calls, 1)
+        self.assertIn("Mesh", unloaded)
+        self.assertEqual(geometry_view.update_calls, 2)
+
+    def test_mesh_view_does_not_retrigger_already_enabled_controls(self) -> None:
+        faces = FakeCheckableAction("View Faces", checked=True)
+        ports = FakeCheckableAction("Ports", checked=True)
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu([faces, ports]),
+        )
+        empro_module = type(
+            "FakeEmpro", (), {"gui": FakeCaptureGui(project_view)}
+        )()
+
+        MODULE.enable_mesh_ports_view_options(
+            empro_module,
+            FakeApplication(),
+        )
+
+        self.assertEqual(faces.trigger_calls, 0)
+        self.assertEqual(ports.trigger_calls, 0)
+
+    def test_item_model_checkbox_adapter_sets_and_verifies_view_state(self) -> None:
+        class FakeQt:
+            class ItemDataRole:
+                CheckStateRole = 10
+
+            class CheckState:
+                Unchecked = 0
+                Checked = 2
+
+            class ItemFlag:
+                ItemIsEnabled = 1
+                ItemIsUserCheckable = 2
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.state = FakeQt.CheckState.Unchecked
+                self.calls = []
+
+            def data(self, _index, role):
+                return self.state if role == FakeQt.ItemDataRole.CheckStateRole else None
+
+            def flags(self, _index):
+                return (
+                    FakeQt.ItemFlag.ItemIsEnabled
+                    | FakeQt.ItemFlag.ItemIsUserCheckable
+                )
+
+            def setData(self, index, value, role):
+                self.calls.append((index, value, role))
+                self.state = value
+                return True
+
+        model = FakeModel()
+        index = object()
+        control = MODULE._QtItemCheckControl(
+            object(),
+            model,
+            index,
+            ("View Faces",),
+            FakeQt,
+        )
+
+        self.assertTrue(control.isCheckable())
+        self.assertFalse(control.isChecked())
+        self.assertTrue(MODULE._control_matches_view_option(control, "faces"))
+        control.setChecked(True)
+
+        self.assertTrue(control.isChecked())
+        self.assertEqual(
+            model.calls,
+            [(index, FakeQt.CheckState.Checked, FakeQt.ItemDataRole.CheckStateRole)],
+        )
+
+    def test_missing_mesh_view_control_reports_discovered_checkboxes(self) -> None:
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu(
+                [
+                    FakeCheckableAction("View Faces"),
+                    FakeCheckableAction("Ports"),
+                ]
+            ),
+        )
+        empro_module = type(
+            "FakeEmpro", (), {"gui": FakeCaptureGui(project_view)}
+        )()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "(?s)checkable mesh view control was not found.*View Faces",
+        ):
+            MODULE.unload_mesh_ports_view(
+                empro_module,
+                FakeApplication(),
+            )
 
     def test_export_image_action_is_found_recursively_in_the_view_menu(self) -> None:
         export_action = FakeAction("&Export Image...")
