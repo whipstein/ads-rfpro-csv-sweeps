@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.14.5 - 2026-08-20
+
+- Load each saved Mesh/Ports result through a retained deep-copy of the RFPro
+  `Analysis`, with parameter-sweep interpretation disabled only on the clone
+  and the selected result's `simulationPath` left valid for the renderer's
+  complete lifetime.
+- Prevent RFPro from substituting the first sweep point and automatically
+  acknowledge only the exact native first-sweep-point mesh notification if a
+  release still presents it.
+- Remove direct writes to RFPro's proprietary Qt item models, which could cross
+  PySide/C++ ownership boundaries and terminate RFPro without a Python
+  traceback; view controls now use live actions or buttons only.
+- Retain the temporary Analysis until RFPro confirms that the Mesh layer has
+  been unloaded, then release it before loading another point or restoring raw
+  geometry.
+- Regenerate both self-contained launchers with the corrected inspector.
+
 ## 0.14.4 - 2026-08-20
 
 - Enable and verify RFPro's **View Faces** and **Ports** controls whenever the

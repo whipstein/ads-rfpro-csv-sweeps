@@ -35,6 +35,27 @@ class FakeSettings:
         self.numberOfParameterInstances = 0
 
 
+class FakeMeshAnalysis:
+    def __init__(
+        self,
+        simulation_path: str = "results/original",
+        sweep_enabled: bool = True,
+    ) -> None:
+        self.simulationPath = simulation_path
+        self.simulationSettings = FakeSettings([], enabled=sweep_enabled)
+        self.clone_calls = 0
+        self.clones = []
+
+    def clone(self):
+        self.clone_calls += 1
+        cloned = FakeMeshAnalysis(
+            self.simulationPath,
+            self.simulationSettings.parameterSweepEnabled,
+        )
+        self.clones.append(cloned)
+        return cloned
+
+
 class FakeParameters:
     def __init__(self, formulas: dict[str, object]) -> None:
         self.formulas = dict(formulas)
@@ -118,15 +139,19 @@ class FakeDialog:
 
 
 class FakeApplication:
-    def __init__(self, top_levels=None) -> None:
+    def __init__(self, top_levels=None, active_modal=None) -> None:
         self.process_events_calls = 0
         self.top_levels = list(top_levels or [])
+        self.active_modal = active_modal
 
     def processEvents(self) -> None:
         self.process_events_calls += 1
 
     def topLevelWidgets(self):
         return list(self.top_levels)
+
+    def activeModalWidget(self):
+        return self.active_modal
 
 
 class FakeGeometryViewController:
@@ -592,17 +617,23 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         project_view = FakeProjectView(geometry_view)
         gui = FakeCaptureGui(project_view)
         empro_module = type("FakeEmpro", (), {"gui": gui})()
-        analysis = type(
-            "FakeAnalysis", (), {"simulationPath": "results/original"}
-        )()
+        analysis = FakeMeshAnalysis()
 
-        MODULE.display_mesh_ports_result(empro_module, analysis, result, True)
+        handle = MODULE.display_mesh_ports_result(
+            empro_module, analysis, result, True
+        )
 
         self.assertEqual(project_view.show_calls, 1)
-        self.assertEqual(geometry_view.fem_mesh_calls, [analysis])
+        self.assertEqual(analysis.clone_calls, 1)
+        self.assertEqual(geometry_view.fem_mesh_calls, [handle.view_analysis])
         self.assertEqual(geometry_view.fem_mesh_paths, ["results/000002"])
         self.assertEqual(geometry_view.momentum_mesh_calls, [])
         self.assertEqual(analysis.simulationPath, "results/original")
+        self.assertTrue(analysis.simulationSettings.parameterSweepEnabled)
+        self.assertFalse(
+            handle.view_analysis.simulationSettings.parameterSweepEnabled
+        )
+        self.assertFalse(handle.sweep_notice_dismissed)
         self.assertEqual(geometry_view.zoom_calls, 1)
         self.assertGreaterEqual(gui.process_events_calls, 3)
 
@@ -621,14 +652,16 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         project_view = FakeProjectView(geometry_view)
         gui = FakeCaptureGui(project_view)
         empro_module = type("FakeEmpro", (), {"gui": gui})()
-        analysis = type(
-            "FakeAnalysis", (), {"simulationPath": "results/original"}
-        )()
+        analysis = FakeMeshAnalysis()
 
-        MODULE.display_mesh_ports_result(empro_module, analysis, result, False)
+        handle = MODULE.display_mesh_ports_result(
+            empro_module, analysis, result, False
+        )
 
         self.assertEqual(geometry_view.fem_mesh_calls, [])
-        self.assertEqual(geometry_view.momentum_mesh_calls, [analysis])
+        self.assertEqual(
+            geometry_view.momentum_mesh_calls, [handle.view_analysis]
+        )
         self.assertEqual(geometry_view.momentum_mesh_paths, ["results/000003"])
         self.assertEqual(analysis.simulationPath, "results/original")
         self.assertEqual(geometry_view.zoom_calls, 0)
@@ -654,9 +687,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             (),
             {"gui": FakeCaptureGui(FakeProjectView(geometry_view))},
         )()
-        analysis = type(
-            "FakeAnalysis", (), {"simulationPath": "results/original"}
-        )()
+        analysis = FakeMeshAnalysis()
 
         with self.assertRaisesRegex(RuntimeError, "mesh load failed"):
             MODULE.display_mesh_ports_result(
@@ -724,57 +755,148 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertEqual(faces.trigger_calls, 0)
         self.assertEqual(ports.trigger_calls, 0)
 
-    def test_item_model_checkbox_adapter_sets_and_verifies_view_state(self) -> None:
-        class FakeQt:
-            class ItemDataRole:
-                CheckStateRole = 10
-
-            class CheckState:
-                Unchecked = 0
-                Checked = 2
-
-            class ItemFlag:
-                ItemIsEnabled = 1
-                ItemIsUserCheckable = 2
-
-        class FakeModel:
+    def test_mesh_sweep_notice_is_dismissed_but_unrelated_dialog_is_not(self) -> None:
+        class FakeTimer:
             def __init__(self) -> None:
-                self.state = FakeQt.CheckState.Unchecked
-                self.calls = []
+                self.timeout = FakeSignal()
+                self.running = False
 
-            def data(self, _index, role):
-                return self.state if role == FakeQt.ItemDataRole.CheckStateRole else None
+            def setInterval(self, _interval: int) -> None:
+                pass
 
-            def flags(self, _index):
-                return (
-                    FakeQt.ItemFlag.ItemIsEnabled
-                    | FakeQt.ItemFlag.ItemIsUserCheckable
-                )
+            def start(self) -> None:
+                self.running = True
 
-            def setData(self, index, value, role):
-                self.calls.append((index, value, role))
-                self.state = value
+            def stop(self) -> None:
+                self.running = False
+
+        class FakeNoticeDialog:
+            def __init__(self, text: str) -> None:
+                self.message = text
+                self.accept_calls = 0
+
+            def windowTitle(self) -> str:
+                return "RFPro Mesh"
+
+            def text(self) -> str:
+                return self.message
+
+            def isVisible(self) -> bool:
                 return True
 
-        model = FakeModel()
-        index = object()
-        control = MODULE._QtItemCheckControl(
-            object(),
-            model,
-            index,
-            ("View Faces",),
-            FakeQt,
+            def findChildren(self, _child_type):
+                return []
+
+            def accept(self) -> None:
+                self.accept_calls += 1
+
+        notice = FakeNoticeDialog(
+            "Mesh can only be displayed for the first parameter sweep point."
+        )
+        automation = MODULE.QtMeshSweepNoticeAutomation(
+            FakeApplication([notice], active_modal=notice),
+            timer_type=FakeTimer,
+            label_type=object,
+            button_type=object,
         )
 
-        self.assertTrue(control.isCheckable())
-        self.assertFalse(control.isChecked())
-        self.assertTrue(MODULE._control_matches_view_option(control, "faces"))
-        control.setChecked(True)
+        automation.start()
+        automation._poll()
 
-        self.assertTrue(control.isChecked())
+        self.assertTrue(automation.dismissed)
+        self.assertEqual(notice.accept_calls, 1)
+        self.assertFalse(automation.timer.running)
+
+        unrelated = FakeNoticeDialog("The selected mesh could not be loaded.")
+        unrelated_automation = MODULE.QtMeshSweepNoticeAutomation(
+            FakeApplication([unrelated], active_modal=unrelated),
+            timer_type=FakeTimer,
+            label_type=object,
+            button_type=object,
+        )
+        unrelated_automation.start()
+        unrelated_automation._poll()
+
+        self.assertFalse(unrelated_automation.dismissed)
+        self.assertEqual(unrelated.accept_calls, 0)
+        self.assertTrue(unrelated_automation.timer.running)
+        unrelated_automation.stop()
+
+    def test_mesh_display_scopes_and_stops_notice_automation(self) -> None:
+        class FakeNoticeAutomation:
+            dismissed = True
+
+            def __init__(self, application) -> None:
+                self.application = application
+                self.started = False
+                self.stopped = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        created = []
+
+        def automation_factory(application):
+            automation = FakeNoticeAutomation(application)
+            created.append(automation)
+            return automation
+
+        result = MODULE.MeshPortsResult(
+            simulation_id="000005",
+            simulation_output=FakeSimulationOutput(
+                Path("results/000005"), FakeSimulationMetadata()
+            ),
+            parameters=(),
+            mesh_kind="FEM",
+            mesh_file=Path("mesh.ovm"),
+        )
+        geometry_view = FakeGeometryViewController()
+        empro_module = type(
+            "FakeEmpro",
+            (),
+            {"gui": FakeCaptureGui(FakeProjectView(geometry_view))},
+        )()
+        application = FakeApplication()
+
+        handle = MODULE.display_mesh_ports_result(
+            empro_module,
+            FakeMeshAnalysis(),
+            result,
+            False,
+            application=application,
+            notice_automation_factory=automation_factory,
+        )
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(created[0].application, application)
+        self.assertTrue(created[0].started)
+        self.assertTrue(created[0].stopped)
+        self.assertTrue(handle.sweep_notice_dismissed)
+
+    def test_mesh_view_never_mutates_rfpro_item_models_directly(self) -> None:
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("_QtItemCheckControl", source)
+        self.assertNotIn("model.setData(", source)
+
+    def test_mesh_display_handle_is_retained_on_the_rfpro_application(self) -> None:
+        application = FakeApplication()
+        handle = MODULE.MeshPortsDisplayHandle(FakeMeshAnalysis(), False)
+
+        MODULE._retain_mesh_display_handle(application, handle)
+        MODULE._retain_mesh_display_handle(application, handle)
+
+        retained = getattr(
+            application, MODULE._MESH_HANDLE_REGISTRY_ATTRIBUTE
+        )
+        self.assertEqual(retained, [handle])
+
+        MODULE._release_mesh_display_handle(application, handle)
+
         self.assertEqual(
-            model.calls,
-            [(index, FakeQt.CheckState.Checked, FakeQt.ItemDataRole.CheckStateRole)],
+            getattr(application, MODULE._MESH_HANDLE_REGISTRY_ATTRIBUTE), []
         )
 
     def test_missing_mesh_view_control_reports_discovered_checkboxes(self) -> None:

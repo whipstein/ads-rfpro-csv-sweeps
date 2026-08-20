@@ -32,6 +32,7 @@ DEFAULT_ZOOM_TO_EXTENTS = False
 # Number of digits after the decimal point for PDF geometry values in um.
 DEFAULT_REPORT_PARAMETER_DECIMAL_PLACES = 3
 _INSPECTOR_REGISTRY_ATTRIBUTE = "_rfpro_sweep_geometry_inspectors"
+_MESH_HANDLE_REGISTRY_ATTRIBUTE = "_rfpro_mesh_display_handles"
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,47 @@ class MeshPortsInventory:
             for point_index, result in self.results_by_point
             if result.mesh_file is not None and result.mesh_kind is not None
         )
+
+
+@dataclass(frozen=True)
+class MeshPortsDisplayHandle:
+    """Objects that must outlive RFPro's native Mesh/Ports renderer."""
+
+    view_analysis: Any
+    sweep_notice_dismissed: bool
+
+
+def _retain_mesh_display_handle(
+    application: Any,
+    handle: MeshPortsDisplayHandle,
+) -> None:
+    """Keep a native renderer dependency alive independently of its dialog."""
+
+    retained = list(
+        getattr(application, _MESH_HANDLE_REGISTRY_ATTRIBUTE, [])
+    )
+    if not any(candidate is handle for candidate in retained):
+        retained.append(handle)
+        setattr(application, _MESH_HANDLE_REGISTRY_ATTRIBUTE, retained)
+
+
+def _release_mesh_display_handle(
+    application: Any,
+    handle: MeshPortsDisplayHandle | None,
+) -> None:
+    """Release a renderer dependency only after RFPro unloads its mesh."""
+
+    if handle is None:
+        return
+    retained = list(
+        getattr(application, _MESH_HANDLE_REGISTRY_ATTRIBUTE, [])
+    )
+    retained = [
+        candidate
+        for candidate in retained
+        if candidate is not handle
+    ]
+    setattr(application, _MESH_HANDLE_REGISTRY_ATTRIBUTE, retained)
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -715,132 +757,6 @@ def _control_metadata(control: Any) -> tuple[str, ...]:
     return tuple(values)
 
 
-class _QtItemCheckControl:
-    """Adapt one checkable Qt item-model cell to the view-control helpers."""
-
-    def __init__(
-        self,
-        view: Any,
-        model: Any,
-        index: Any,
-        labels: Sequence[str],
-        qt_namespace: Any,
-    ) -> None:
-        self._view = view
-        self._model = model
-        self._index = index
-        self._rfpro_labels = tuple(labels)
-        self._check_state_role = qt_namespace.ItemDataRole.CheckStateRole
-        self._checked = qt_namespace.CheckState.Checked
-        self._unchecked = qt_namespace.CheckState.Unchecked
-        self._item_is_enabled = qt_namespace.ItemFlag.ItemIsEnabled
-        self._item_is_user_checkable = qt_namespace.ItemFlag.ItemIsUserCheckable
-
-    def text(self) -> str:
-        return self._rfpro_labels[0] if self._rfpro_labels else ""
-
-    def isCheckable(self) -> bool:
-        try:
-            if self._model.data(self._index, self._check_state_role) is not None:
-                return True
-            return bool(self._model.flags(self._index) & self._item_is_user_checkable)
-        except Exception:
-            return False
-
-    def isChecked(self) -> bool:
-        state = self._model.data(self._index, self._check_state_role)
-        state_value = getattr(state, "value", state)
-        checked_value = getattr(self._checked, "value", self._checked)
-        return state_value == checked_value
-
-    def setChecked(self, checked: bool) -> None:
-        state = self._checked if checked else self._unchecked
-        accepted = self._model.setData(
-            self._index,
-            state,
-            self._check_state_role,
-        )
-        if accepted is False:
-            raise RuntimeError(
-                f"RFPro rejected the view-state update for {self.text()!r}."
-            )
-
-    def isEnabled(self) -> bool:
-        try:
-            return bool(self._model.flags(self._index) & self._item_is_enabled)
-        except Exception:
-            return True
-
-    def isVisible(self) -> bool:
-        return bool(
-            _call_or_value(_getattr_or_default(self._view, "isVisible"), True)
-        )
-
-
-def _iter_checkable_item_view_controls(
-    view: Any,
-    qt_namespace: Any,
-    maximum_cells: int = 5000,
-) -> Iterable[_QtItemCheckControl]:
-    """Yield checkable rows from RFPro visibility tables and trees."""
-
-    model = _call_or_value(_getattr_or_default(view, "model"), None)
-    if model is None:
-        return
-    try:
-        from PySide6.QtCore import QModelIndex
-
-        root_index = QModelIndex()
-    except Exception:
-        root_index = None
-
-    display_role = qt_namespace.ItemDataRole.DisplayRole
-    check_state_role = qt_namespace.ItemDataRole.CheckStateRole
-    item_is_user_checkable = qt_namespace.ItemFlag.ItemIsUserCheckable
-    pending = [root_index]
-    visited_cells = 0
-    while pending and visited_cells < maximum_cells:
-        parent = pending.pop()
-        try:
-            row_count = int(model.rowCount(parent))
-            column_count = max(1, int(model.columnCount(parent)))
-        except Exception:
-            continue
-        for row in range(row_count):
-            indices: list[Any] = []
-            labels: list[str] = []
-            checkable_indices: list[Any] = []
-            for column in range(column_count):
-                if visited_cells >= maximum_cells:
-                    break
-                visited_cells += 1
-                try:
-                    index = model.index(row, column, parent)
-                    if not bool(_call_or_value(getattr(index, "isValid", None), True)):
-                        continue
-                    indices.append(index)
-                    display = model.data(index, display_role)
-                    text = str(display or "").strip()
-                    if text and text not in labels:
-                        labels.append(text)
-                    state = model.data(index, check_state_role)
-                    flags = model.flags(index)
-                    if state is not None or bool(flags & item_is_user_checkable):
-                        checkable_indices.append(index)
-                except Exception:
-                    continue
-            for index in checkable_indices:
-                yield _QtItemCheckControl(
-                    view,
-                    model,
-                    index,
-                    labels,
-                    qt_namespace,
-                )
-            if indices:
-                pending.append(indices[0])
-
-
 def _normalized_control_text(text: str) -> str:
     camel_case_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(text))
     return _normalized_action_text(camel_case_split)
@@ -886,8 +802,6 @@ def _iter_rfpro_view_controls(
     application: Any,
     qt_action_type: type[Any] | None = None,
     qt_button_type: type[Any] | None = None,
-    qt_item_view_type: type[Any] | None = None,
-    qt_namespace: Any = None,
 ) -> Iterable[tuple[Any, str, tuple[Any, ...], int]]:
     """Yield live RFPro view controls with owners and a source preference."""
 
@@ -918,17 +832,6 @@ def _iter_rfpro_view_controls(
             qt_button_type = QAbstractButton
         except Exception:
             qt_button_type = None
-    if qt_item_view_type is None or qt_namespace is None:
-        try:
-            from PySide6.QtCore import Qt
-            from PySide6.QtWidgets import QAbstractItemView
-
-            qt_item_view_type = qt_item_view_type or QAbstractItemView
-            qt_namespace = qt_namespace or Qt
-        except Exception:
-            qt_item_view_type = None
-            qt_namespace = None
-
     top_levels = _call_or_value(
         _getattr_or_default(application, "topLevelWidgets"), []
     ) or []
@@ -966,34 +869,6 @@ def _iter_rfpro_view_controls(
                     f"Qt window {window_title!r}",
                     (top_level, control),
                     source_score,
-                )
-        if qt_item_view_type is None or qt_namespace is None:
-            continue
-        try:
-            item_views = find_children(qt_item_view_type)
-        except Exception:
-            continue
-        for view in item_views:
-            view_metadata = " ".join(_control_metadata(view))
-            view_description = view_metadata or type(view).__name__
-            normalized_view = _normalized_control_text(view_description)
-            view_score = source_score + (
-                30
-                if any(
-                    token in normalized_view
-                    for token in ("visibility", "geometry", "view")
-                )
-                else 0
-            )
-            for control in _iter_checkable_item_view_controls(
-                view,
-                qt_namespace,
-            ):
-                yield (
-                    control,
-                    f"Qt window {window_title!r} item view {view_description!r}",
-                    (top_level, view, control),
-                    view_score,
                 )
 
 
@@ -1338,6 +1213,157 @@ def find_rfpro_export_image_action(
         "Every discovered RFPro Export Image action was invalid or disabled:\n  "
         + details
     )
+
+
+def _is_mesh_sweep_notice_text(text: str) -> bool:
+    """Recognize only RFPro's first-sweep-point mesh information notice."""
+
+    normalized = _normalized_action_text(text)
+    tokens = set(normalized.split())
+    return (
+        "mesh" in tokens
+        and "first" in tokens
+        and "only" in tokens
+        and bool(tokens.intersection(("sweep", "parameter")))
+        and bool(tokens.intersection(("display", "displayed", "show", "shown")))
+    )
+
+
+class QtMeshSweepNoticeAutomation:
+    """Acknowledge only RFPro's native first-sweep-point mesh notice."""
+
+    def __init__(
+        self,
+        application: Any,
+        timer_type: type[Any] | None = None,
+        label_type: type[Any] | None = None,
+        button_type: type[Any] | None = None,
+    ) -> None:
+        if timer_type is None:
+            from PySide6.QtCore import QTimer
+
+            timer_type = QTimer
+        if label_type is None or button_type is None:
+            from PySide6.QtWidgets import QAbstractButton, QLabel
+
+            label_type = label_type or QLabel
+            button_type = button_type or QAbstractButton
+
+        self.application = application
+        self.label_type = label_type
+        self.button_type = button_type
+        self.timer = timer_type()
+        self.timer.setInterval(25)
+        self.timer.timeout.connect(self._poll)
+        self.dismissed = False
+        self.dismiss_method = "not dismissed"
+        self.observed_dialogs: list[str] = []
+
+    def start(self) -> None:
+        self.timer.start()
+
+    def stop(self) -> None:
+        self.timer.stop()
+
+    def diagnostics(self) -> str:
+        observed = ", ".join(self.observed_dialogs) or "no modal dialog observed"
+        return (
+            f"dismissed={self.dismissed}; method={self.dismiss_method}; "
+            f"observed={observed}"
+        )
+
+    def _visible_dialogs(self) -> list[Any]:
+        dialogs: list[Any] = []
+        active = _call_or_value(
+            _getattr_or_default(self.application, "activeModalWidget"), None
+        )
+        if active is not None:
+            dialogs.append(active)
+        top_levels = _call_or_value(
+            _getattr_or_default(self.application, "topLevelWidgets"), []
+        ) or []
+        for widget in top_levels:
+            if widget in dialogs:
+                continue
+            visible = bool(
+                _call_or_value(_getattr_or_default(widget, "isVisible"), True)
+            )
+            if visible:
+                dialogs.append(widget)
+        return dialogs
+
+    def _dialog_text(self, dialog: Any) -> str:
+        values: list[str] = []
+        for attribute_name in (
+            "windowTitle",
+            "text",
+            "informativeText",
+            "detailedText",
+        ):
+            value = str(
+                _call_or_value(
+                    _getattr_or_default(dialog, attribute_name), ""
+                )
+                or ""
+            ).strip()
+            if value and value not in values:
+                values.append(value)
+        find_children = _getattr_or_default(dialog, "findChildren")
+        if callable(find_children):
+            try:
+                labels = find_children(self.label_type)
+            except Exception:
+                labels = []
+            for label in labels:
+                value = str(
+                    _call_or_value(_getattr_or_default(label, "text"), "")
+                    or ""
+                ).strip()
+                if value and value not in values:
+                    values.append(value)
+        return "\n".join(values)
+
+    def _accept_dialog(self, dialog: Any) -> bool:
+        accept = _getattr_or_default(dialog, "accept")
+        if callable(accept):
+            accept()
+            self.dismiss_method = "dialog.accept()"
+            return True
+        find_children = _getattr_or_default(dialog, "findChildren")
+        if not callable(find_children):
+            return False
+        try:
+            buttons = find_children(self.button_type)
+        except Exception:
+            return False
+        for button in buttons:
+            text = _normalized_action_text(
+                _call_or_value(_getattr_or_default(button, "text"), "")
+            )
+            click = _getattr_or_default(button, "click")
+            if text in ("ok", "close", "continue") and callable(click):
+                click()
+                self.dismiss_method = f"button {text!r}"
+                return True
+        return False
+
+    def _poll(self) -> None:
+        for dialog in self._visible_dialogs():
+            if not _qt_object_is_valid(dialog):
+                continue
+            dialog_text = self._dialog_text(dialog)
+            description = (
+                f"{type(dialog).__name__}"
+                f"({_call_or_value(_getattr_or_default(dialog, 'windowTitle'), '')!r})"
+            )
+            if description not in self.observed_dialogs:
+                self.observed_dialogs.append(description)
+            if not _is_mesh_sweep_notice_text(dialog_text):
+                continue
+            if self._accept_dialog(dialog):
+                self.dismissed = True
+                self.timer.stop()
+                return
 
 
 class QtSaveDialogAutomation:
@@ -2213,12 +2239,73 @@ def discover_mesh_ports_results(
     )
 
 
+def _clone_analysis_for_mesh_result(analysis: Any, target_path: str) -> Any:
+    """Create a retained, non-swept Analysis for one saved mesh result."""
+
+    clone = _getattr_or_default(analysis, "clone")
+    if not callable(clone):
+        raise RuntimeError(
+            "This RFPro Analysis does not expose the documented clone() API; "
+            "the selected mesh was not loaded because changing the live swept "
+            "analysis is unsafe."
+        )
+    view_analysis = clone()
+    if view_analysis is None or view_analysis is analysis:
+        raise RuntimeError(
+            "RFPro did not return an independent Analysis clone for the mesh view."
+        )
+
+    original_settings = _getattr_or_default(analysis, "simulationSettings")
+    view_settings = _getattr_or_default(view_analysis, "simulationSettings")
+    if view_settings is None:
+        raise RuntimeError(
+            "The cloned RFPro Analysis has no simulationSettings object."
+        )
+    original_sweep_enabled = _getattr_or_default(
+        original_settings, "parameterSweepEnabled"
+    )
+    try:
+        view_settings.parameterSweepEnabled = False
+    except Exception as error:
+        raise RuntimeError(
+            "Could not disable parameter-sweep interpretation on the temporary "
+            "mesh-view Analysis clone."
+        ) from error
+
+    # Selectable.clone() is documented as a deep copy. Refuse to continue if a
+    # product build unexpectedly shares this setting with the live analysis.
+    if original_settings is not None and original_sweep_enabled is not None:
+        current_original_value = _getattr_or_default(
+            original_settings, "parameterSweepEnabled"
+        )
+        if current_original_value != original_sweep_enabled:
+            try:
+                original_settings.parameterSweepEnabled = original_sweep_enabled
+            except Exception:
+                pass
+            raise RuntimeError(
+                "RFPro's Analysis clone unexpectedly shared sweep settings with "
+                "the live analysis; the mesh was not loaded."
+            )
+
+    try:
+        view_analysis.simulationPath = target_path
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not assign saved simulationPath {target_path!r} to the "
+            "temporary mesh-view Analysis."
+        ) from error
+    return view_analysis
+
+
 def display_mesh_ports_result(
     empro_module: Any,
     analysis: Any,
     result: MeshPortsResult,
     zoom_to_extents: bool = True,
-) -> None:
+    application: Any | None = None,
+    notice_automation_factory: Any = None,
+) -> MeshPortsDisplayHandle:
     """Load one saved result using RFPro's Analysis-based mesh-view binding."""
 
     if result.mesh_kind is None or result.mesh_file is None:
@@ -2246,22 +2333,34 @@ def display_mesh_ports_result(
         raise RuntimeError(
             f"Simulation {result.simulation_id} has no saved simulationPath."
         )
-    original_path = getattr(analysis, "simulationPath", "")
-    path_was_changed = False
+    view_analysis = _clone_analysis_for_mesh_result(analysis, target_path)
+    notice_automation = None
+    if application is not None:
+        automation_factory = (
+            notice_automation_factory or QtMeshSweepNoticeAutomation
+        )
+        notice_automation = automation_factory(application)
+        notice_automation.start()
     try:
-        analysis.simulationPath = target_path
-        path_was_changed = True
         # ADS/EMPro 2026 Update 2.1's shipped viewMesh() passes its Analysis
-        # argument to these bindings. A SimulationOutput is used only to find
-        # the selected sweep result's path and is not convertible to Analysis.
-        display_method(analysis)
+        # argument to these bindings. Use a deep-copied Analysis with sweep
+        # interpretation disabled so the native renderer opens exactly the
+        # selected result path instead of forcing its first-sweep-point path.
+        display_method(view_analysis)
+        # Keep the selected path and the temporary Analysis alive while RFPro
+        # completes deferred native view work.
+        empro_module.gui.processEvents()
     finally:
-        if path_was_changed:
-            analysis.simulationPath = original_path
-    empro_module.gui.processEvents()
+        if notice_automation is not None:
+            notice_automation.stop()
     if zoom_to_extents:
         geometry_view.zoomGeometryViewToExtents()
         empro_module.gui.processEvents()
+    notice_dismissed = bool(
+        notice_automation is not None
+        and _getattr_or_default(notice_automation, "dismissed", False)
+    )
+    return MeshPortsDisplayHandle(view_analysis, notice_dismissed)
 
 
 def mesh_ports_inventory_summary(
@@ -2577,6 +2676,7 @@ def create_inspector_dialog(
             self._applying = False
             self._active_view_text = "Geometry"
             self._mesh_view_active = False
+            self._mesh_display_handle: MeshPortsDisplayHandle | None = None
             self._mesh_inventory: MeshPortsInventory | None = None
             self._statuses: list[tuple[bool | None, str] | None] = [
                 None for _ in points
@@ -2810,7 +2910,11 @@ def create_inspector_dialog(
                             f"Mesh/Ports view could not be unloaded: {error}"
                         )
                         return False
+                    _release_mesh_display_handle(
+                        QApplication.instance(), self._mesh_display_handle
+                    )
                     self._mesh_view_active = False
+                    self._mesh_display_handle = None
                     print(f"Unloaded previous Mesh/Ports view via {unloaded_by}.")
                 update_report = apply_sweep_point_to_geometry(
                     project, baseline_formulas, points[row]
@@ -2879,9 +2983,23 @@ def create_inspector_dialog(
                         empro_module,
                         QApplication.instance(),
                     )
+                    _release_mesh_display_handle(
+                        QApplication.instance(), self._mesh_display_handle
+                    )
                     self._mesh_view_active = False
+                    self._mesh_display_handle = None
                     print(f"Unloaded previous Mesh/Ports view via {unloaded_by}.")
-                display_mesh_ports_result(empro_module, analysis, result, True)
+                display_handle = display_mesh_ports_result(
+                    empro_module,
+                    analysis,
+                    result,
+                    True,
+                    application=QApplication.instance(),
+                )
+                self._mesh_display_handle = display_handle
+                _retain_mesh_display_handle(
+                    QApplication.instance(), display_handle
+                )
                 self._mesh_view_active = True
                 faces_control, ports_control = enable_mesh_ports_view_options(
                     empro_module,
@@ -2901,7 +3019,8 @@ def create_inspector_dialog(
             print(
                 f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
                 f"result from simulation {result.simulation_id}; enabled "
-                f"View Faces via {faces_control}; enabled Ports via {ports_control}."
+                f"View Faces via {faces_control}; enabled Ports via {ports_control}; "
+                f"native sweep notice dismissed={display_handle.sweep_notice_dismissed}."
             )
 
         def _fit_view(self) -> None:
@@ -3002,12 +3121,26 @@ def create_inspector_dialog(
                             empro_module,
                             QApplication.instance(),
                         )
+                        _release_mesh_display_handle(
+                            QApplication.instance(), self._mesh_display_handle
+                        )
                         self._mesh_view_active = False
+                        self._mesh_display_handle = None
                         print(
                             "Unloaded previous Mesh/Ports view before the next "
                             f"report point via {unloaded_by}."
                         )
-                    display_mesh_ports_result(empro_module, analysis, result, True)
+                    display_handle = display_mesh_ports_result(
+                        empro_module,
+                        analysis,
+                        result,
+                        True,
+                        application=QApplication.instance(),
+                    )
+                    self._mesh_display_handle = display_handle
+                    _retain_mesh_display_handle(
+                        QApplication.instance(), display_handle
+                    )
                     self._mesh_view_active = True
                     enable_mesh_ports_view_options(
                         empro_module,
@@ -3295,7 +3428,11 @@ def create_inspector_dialog(
                         empro_module,
                         QApplication.instance(),
                     )
+                    _release_mesh_display_handle(
+                        QApplication.instance(), self._mesh_display_handle
+                    )
                     self._mesh_view_active = False
+                    self._mesh_display_handle = None
                     print(
                         "Unloaded the active Mesh/Ports view before restoring "
                         f"the original geometry via {unloaded_by}."

@@ -26,7 +26,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.4**.
+The current release is **0.14.5**.
 
 ## Execution model
 
@@ -339,15 +339,26 @@ mesh data is missing.
 
 RFPro's native `displayFemMesh()` and `displayMomMesh()` bindings require the
 selected `empro.analysis.Analysis`; an `empro.output.SimulationOutput` cannot
-be converted to that type. To display one sweep result, the inspector scopes
-that result's `simulationPath` onto the analysis only for the native display
-call, then restores the analysis's exact original path even if loading fails.
-This view-only operation does not save the project or alter the path used by a
-later simulation run.
+be converted to that type. To display one sweep result safely, the inspector
+uses the documented deep-copy `Analysis.clone()` API, disables parameter-sweep
+interpretation only on that temporary clone, and assigns the selected result's
+`simulationPath` to it. This prevents RFPro from substituting the first sweep
+point and normally prevents the native first-sweep-point notification from
+opening. A narrowly scoped Qt handler acknowledges that exact notification if
+a product build still opens it; unrelated warnings and errors are left open.
+The live analysis and its simulation settings are never changed or saved.
+
+The temporary cloned Analysis is retained for as long as RFPro renders the
+mesh and is released only after the Mesh layer is successfully unloaded. This
+avoids leaving the native renderer with a deleted Python/C++ Analysis wrapper
+while it completes deferred view work.
 
 After loading a mesh, the inspector enables and verifies RFPro's checkable
 **View Faces** and **Ports** visibility controls. It supports both QAction or
-button controls and the checkable rows used by RFPro's Visibility item view.
+button controls exposed through RFPro's live View UI. It deliberately does not
+write directly into RFPro's private Qt item models; those C++-owned models are
+not a supported scripting API and direct `model.setData()` calls can terminate
+RFPro without a Python exception.
 Before selecting another raw geometry point, loading the next saved mesh, or
 restoring the original geometry, it unchecks and verifies the active **Mesh**
 control so the prior result is no longer rendered. If RFPro does not expose a
