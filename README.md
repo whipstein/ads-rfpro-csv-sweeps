@@ -26,7 +26,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.2**.
+The current release is **0.14.3**.
 
 ## Execution model
 
@@ -336,6 +336,14 @@ saved `*.ovm` under `<simulationPath>/emds_dsn/design`; Momentum results use
 the saved `*.ovm` under `<simulationPath>/work`. The table distinguishes an
 available result, an unmatched or unsolved point, and a saved result whose
 mesh data is missing.
+
+RFPro's native `displayFemMesh()` and `displayMomMesh()` bindings require the
+selected `empro.analysis.Analysis`; an `empro.output.SimulationOutput` cannot
+be converted to that type. To display one sweep result, the inspector scopes
+that result's `simulationPath` onto the analysis only for the native display
+call, then restores the analysis's exact original path even if loading fails.
+This view-only operation does not save the project or alter the path used by a
+later simulation run.
 
 **Mesh/Ports PDF** scans again, then loads and exports every available saved
 Mesh/Ports result through RFPro's same **View > Export Image** command used by

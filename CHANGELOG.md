@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.3 - 2026-08-20
+
+- Fix saved Mesh/Ports loading by passing RFPro's native FEM and Momentum view
+  bindings the required `empro.analysis.Analysis`, rather than the selected
+  `empro.output.SimulationOutput` that cannot be converted to `Analysis`.
+- Temporarily point the analysis at the selected result's `simulationPath`
+  during the display call and restore its exact original path afterward,
+  including when RFPro raises an error.
+- Regenerate both self-contained launchers with the corrected geometry and
+  Mesh/Ports inspector payload.
+
 ## 0.14.2 - 2026-08-19
 
 - Convert both combined launchers into true single-file bundles containing all

@@ -134,7 +134,9 @@ class FakeGeometryViewController:
         self.update_calls = 0
         self.zoom_calls = 0
         self.fem_mesh_calls = []
+        self.fem_mesh_paths = []
         self.momentum_mesh_calls = []
+        self.momentum_mesh_paths = []
 
     def updateView(self) -> None:
         self.update_calls += 1
@@ -142,11 +144,13 @@ class FakeGeometryViewController:
     def zoomGeometryViewToExtents(self) -> None:
         self.zoom_calls += 1
 
-    def displayFemMesh(self, simulation_output) -> None:
-        self.fem_mesh_calls.append(simulation_output)
+    def displayFemMesh(self, analysis) -> None:
+        self.fem_mesh_calls.append(analysis)
+        self.fem_mesh_paths.append(analysis.simulationPath)
 
-    def displayMomMesh(self, simulation_output) -> None:
-        self.momentum_mesh_calls.append(simulation_output)
+    def displayMomMesh(self, analysis) -> None:
+        self.momentum_mesh_calls.append(analysis)
+        self.momentum_mesh_paths.append(analysis.simulationPath)
 
 
 class FakeAction:
@@ -557,7 +561,9 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertEqual(inventory.missing_mesh_point_indices, (0, 1))
 
     def test_mesh_ports_display_uses_verified_geometry_view_binding(self) -> None:
-        simulation_output = object()
+        simulation_output = FakeSimulationOutput(
+            Path("results/000002"), FakeSimulationMetadata()
+        )
         result = MODULE.MeshPortsResult(
             simulation_id="000002",
             simulation_output=simulation_output,
@@ -569,17 +575,24 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         project_view = FakeProjectView(geometry_view)
         gui = FakeCaptureGui(project_view)
         empro_module = type("FakeEmpro", (), {"gui": gui})()
+        analysis = type(
+            "FakeAnalysis", (), {"simulationPath": "results/original"}
+        )()
 
-        MODULE.display_mesh_ports_result(empro_module, result, True)
+        MODULE.display_mesh_ports_result(empro_module, analysis, result, True)
 
         self.assertEqual(project_view.show_calls, 1)
-        self.assertEqual(geometry_view.fem_mesh_calls, [simulation_output])
+        self.assertEqual(geometry_view.fem_mesh_calls, [analysis])
+        self.assertEqual(geometry_view.fem_mesh_paths, ["results/000002"])
         self.assertEqual(geometry_view.momentum_mesh_calls, [])
+        self.assertEqual(analysis.simulationPath, "results/original")
         self.assertEqual(geometry_view.zoom_calls, 1)
         self.assertGreaterEqual(gui.process_events_calls, 3)
 
     def test_momentum_mesh_ports_display_uses_momentum_binding(self) -> None:
-        simulation_output = object()
+        simulation_output = FakeSimulationOutput(
+            Path("results/000003"), FakeSimulationMetadata()
+        )
         result = MODULE.MeshPortsResult(
             simulation_id="000003",
             simulation_output=simulation_output,
@@ -591,12 +604,53 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         project_view = FakeProjectView(geometry_view)
         gui = FakeCaptureGui(project_view)
         empro_module = type("FakeEmpro", (), {"gui": gui})()
+        analysis = type(
+            "FakeAnalysis", (), {"simulationPath": "results/original"}
+        )()
 
-        MODULE.display_mesh_ports_result(empro_module, result, False)
+        MODULE.display_mesh_ports_result(empro_module, analysis, result, False)
 
         self.assertEqual(geometry_view.fem_mesh_calls, [])
-        self.assertEqual(geometry_view.momentum_mesh_calls, [simulation_output])
+        self.assertEqual(geometry_view.momentum_mesh_calls, [analysis])
+        self.assertEqual(geometry_view.momentum_mesh_paths, ["results/000003"])
+        self.assertEqual(analysis.simulationPath, "results/original")
         self.assertEqual(geometry_view.zoom_calls, 0)
+
+    def test_mesh_display_failure_restores_analysis_simulation_path(self) -> None:
+        class FailingGeometryView(FakeGeometryViewController):
+            def displayFemMesh(self, analysis) -> None:
+                super().displayFemMesh(analysis)
+                raise RuntimeError("mesh load failed")
+
+        result = MODULE.MeshPortsResult(
+            simulation_id="000004",
+            simulation_output=FakeSimulationOutput(
+                Path("results/000004"), FakeSimulationMetadata()
+            ),
+            parameters=(),
+            mesh_kind="FEM",
+            mesh_file=Path("mesh.ovm"),
+        )
+        geometry_view = FailingGeometryView()
+        empro_module = type(
+            "FakeEmpro",
+            (),
+            {"gui": FakeCaptureGui(FakeProjectView(geometry_view))},
+        )()
+        analysis = type(
+            "FakeAnalysis", (), {"simulationPath": "results/original"}
+        )()
+
+        with self.assertRaisesRegex(RuntimeError, "mesh load failed"):
+            MODULE.display_mesh_ports_result(
+                empro_module,
+                analysis,
+                result,
+                False,
+            )
+
+        self.assertEqual(geometry_view.fem_mesh_paths, ["results/000004"])
+        self.assertEqual(analysis.simulationPath, "results/original")
 
     def test_export_image_action_is_found_recursively_in_the_view_menu(self) -> None:
         export_action = FakeAction("&Export Image...")

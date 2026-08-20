@@ -1733,10 +1733,11 @@ def discover_mesh_ports_results(
 
 def display_mesh_ports_result(
     empro_module: Any,
+    analysis: Any,
     result: MeshPortsResult,
     zoom_to_extents: bool = True,
 ) -> None:
-    """Load one saved result through RFPro's Mesh/Ports geometry-view binding."""
+    """Load one saved result using RFPro's Analysis-based mesh-view binding."""
 
     if result.mesh_kind is None or result.mesh_file is None:
         raise RuntimeError(
@@ -1755,7 +1756,26 @@ def display_mesh_ports_result(
         raise RuntimeError(
             f"RFPro's geometry view does not expose {method_name}() in this release."
         )
-    display_method(result.simulation_output)
+
+    target_path = str(
+        getattr(result.simulation_output, "simulationPath", "") or ""
+    ).strip()
+    if not target_path:
+        raise RuntimeError(
+            f"Simulation {result.simulation_id} has no saved simulationPath."
+        )
+    original_path = getattr(analysis, "simulationPath", "")
+    path_was_changed = False
+    try:
+        analysis.simulationPath = target_path
+        path_was_changed = True
+        # ADS/EMPro 2026 Update 2.1's shipped viewMesh() passes its Analysis
+        # argument to these bindings. A SimulationOutput is used only to find
+        # the selected sweep result's path and is not convertible to Analysis.
+        display_method(analysis)
+    finally:
+        if path_was_changed:
+            analysis.simulationPath = original_path
     empro_module.gui.processEvents()
     if zoom_to_extents:
         geometry_view.zoomGeometryViewToExtents()
@@ -2350,7 +2370,7 @@ def create_inspector_dialog(
                 )
                 return
             try:
-                display_mesh_ports_result(empro_module, result, True)
+                display_mesh_ports_result(empro_module, analysis, result, True)
             except Exception as error:
                 QMessageBox.warning(
                     self,
@@ -2460,7 +2480,7 @@ def create_inspector_dialog(
                     f"{safe_simulation_id}_mesh_ports.png"
                 )
                 try:
-                    display_mesh_ports_result(empro_module, result, True)
+                    display_mesh_ports_result(empro_module, analysis, result, True)
                     self._active_view_text = (
                         f"{result.mesh_kind} Mesh/Ports - simulation "
                         f"{result.simulation_id}"
