@@ -26,7 +26,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.5**.
+The current release is **0.14.6**.
 
 ## Execution model
 
@@ -354,16 +354,27 @@ avoids leaving the native renderer with a deleted Python/C++ Analysis wrapper
 while it completes deferred view work.
 
 After loading a mesh, the inspector enables and verifies RFPro's checkable
-**View Faces** and **Ports** visibility controls. It supports both QAction or
-button controls exposed through RFPro's live View UI. It deliberately does not
-write directly into RFPro's private Qt item models; those C++-owned models are
-not a supported scripting API and direct `model.setData()` calls can terminate
-RFPro without a Python exception.
+**Boundary Faces** and **Port Faces** visibility controls (including the older
+**View Faces** and **Ports** labels). The loaded layer is identified by the
+release-specific **3-D Mesh** control or its older **Mesh** label. Exact aliases
+prevent unrelated controls such as **Shaded Mesh**, **Background Mesh**, and
+**View Mesh Information** from being selected. The inspector supports QAction
+or button controls exposed through RFPro's live View UI. It deliberately does
+not write directly into RFPro's private Qt item models; those C++-owned models
+are not a supported scripting API and direct `model.setData()` calls can
+terminate RFPro without a Python exception.
+
+Mesh loading and visibility configuration are reported separately. If the
+native mesh opens but a visibility control cannot be configured, the inspector
+keeps the mesh active and reports **Mesh loaded; view options were not fully
+applied** instead of incorrectly saying that the result failed to load.
+
 Before selecting another raw geometry point, loading the next saved mesh, or
-restoring the original geometry, it unchecks and verifies the active **Mesh**
-control so the prior result is no longer rendered. If RFPro does not expose a
-matching checkable control, the transition stops and reports all discovered
-control labels instead of silently leaving a stale mesh over another point.
+restoring the original geometry, it unchecks and verifies the active **3-D
+Mesh** (or older **Mesh**) control so the prior result is no longer rendered.
+If RFPro does not expose a matching checkable control, the transition stops and
+reports all discovered control labels instead of silently leaving a stale mesh
+over another point.
 
 **Mesh/Ports PDF** scans again, then loads and exports every available saved
 Mesh/Ports result through RFPro's same **View > Export Image** command used by

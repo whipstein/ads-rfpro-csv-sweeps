@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.14.6 - 2026-08-20
+
+- Recognize RFPro 2026 Update 2.1's exact **Boundary Faces**, **Port Faces**,
+  and **3-D Mesh** control labels when configuring or unloading the saved mesh
+  view.
+- Keep control matching exact so similarly named commands such as **Shaded
+  Mesh**, **Background Mesh**, and **View Mesh Information** are never toggled
+  as substitutes.
+- Separate native mesh-load failures from post-load visibility-control errors;
+  a successfully displayed mesh is now reported as loaded and retained even if
+  a later view option cannot be applied.
+- Regenerate both self-contained launchers with the updated inspector.
+
 ## 0.14.5 - 2026-08-20
 
 - Load each saved Mesh/Ports result through a retained deep-copy of the RFPro

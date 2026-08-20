@@ -763,12 +763,32 @@ def _normalized_control_text(text: str) -> str:
 
 
 _RFPRO_VIEW_OPTION_ALIASES = {
-    "faces": frozenset(("faces", "view faces", "show faces")),
-    "ports": frozenset(("ports", "view ports", "show ports")),
+    "faces": frozenset(
+        (
+            "faces",
+            "view faces",
+            "show faces",
+            "boundary faces",
+            "view boundary faces",
+            "show boundary faces",
+        )
+    ),
+    "ports": frozenset(
+        (
+            "ports",
+            "view ports",
+            "show ports",
+            "port faces",
+            "view port faces",
+            "show port faces",
+        )
+    ),
     "mesh": frozenset(
         (
             "mesh",
             "meshes",
+            "3 d mesh",
+            "3d mesh",
             "view mesh",
             "show mesh",
             "fem mesh",
@@ -3001,10 +3021,6 @@ def create_inspector_dialog(
                     QApplication.instance(), display_handle
                 )
                 self._mesh_view_active = True
-                faces_control, ports_control = enable_mesh_ports_view_options(
-                    empro_module,
-                    QApplication.instance(),
-                )
             except Exception as error:
                 QMessageBox.warning(
                     self,
@@ -3012,10 +3028,30 @@ def create_inspector_dialog(
                     f"Simulation {result.simulation_id}: {error}",
                 )
                 return
+
             self._active_view_text = (
                 f"{result.mesh_kind} Mesh/Ports - simulation {result.simulation_id}"
             )
             self._update_summary(row)
+            try:
+                faces_control, ports_control = enable_mesh_ports_view_options(
+                    empro_module,
+                    QApplication.instance(),
+                )
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "Mesh loaded; view options were not fully applied",
+                    f"Simulation {result.simulation_id} is loaded and remains "
+                    "visible, but RFPro's Boundary Faces and Port Faces controls "
+                    f"could not both be enabled:\n{error}",
+                )
+                print(
+                    f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
+                    f"result from simulation {result.simulation_id}, but view "
+                    f"options were not fully applied: {error}"
+                )
+                return
             print(
                 f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
                 f"result from simulation {result.simulation_id}; enabled "

@@ -701,11 +701,17 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertEqual(analysis.simulationPath, "results/original")
 
     def test_mesh_view_enables_faces_and_ports_and_can_unload_mesh(self) -> None:
-        faces = FakeCheckableAction("&View Faces", checked=False)
-        ports = FakeCheckableAction("Ports", checked=False)
-        mesh = FakeCheckableAction("Mesh", checked=True)
+        faces = FakeCheckableAction("Boundary Faces", checked=False)
+        ports = FakeCheckableAction("Port Faces", checked=False)
+        mesh = FakeCheckableAction("3-D Mesh", checked=True)
+        shaded_mesh = FakeCheckableAction("Shaded Mesh", checked=True)
         view_menu = FakeMenu(
-            [FakeAction("Visibility", menu=FakeMenu([faces, ports, mesh]))]
+            [
+                FakeAction(
+                    "Visibility",
+                    menu=FakeMenu([faces, ports, mesh, shaded_mesh]),
+                )
+            ]
         )
         geometry_view = FakeGeometryViewController()
         project_view = FakeProjectView(geometry_view, view_menu)
@@ -723,8 +729,8 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertTrue(mesh.checked)
         self.assertEqual(faces.trigger_calls, 1)
         self.assertEqual(ports.trigger_calls, 1)
-        self.assertIn("View Faces", enabled[0])
-        self.assertIn("Ports", enabled[1])
+        self.assertIn("Boundary Faces", enabled[0])
+        self.assertIn("Port Faces", enabled[1])
 
         unloaded = MODULE.unload_mesh_ports_view(
             empro_module,
@@ -732,8 +738,9 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         )
 
         self.assertFalse(mesh.checked)
+        self.assertTrue(shaded_mesh.checked)
         self.assertEqual(mesh.trigger_calls, 1)
-        self.assertIn("Mesh", unloaded)
+        self.assertIn("3-D Mesh", unloaded)
         self.assertEqual(geometry_view.update_calls, 2)
 
     def test_mesh_view_does_not_retrigger_already_enabled_controls(self) -> None:
