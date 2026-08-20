@@ -701,15 +701,28 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertEqual(analysis.simulationPath, "results/original")
 
     def test_mesh_view_enables_faces_and_ports_and_can_unload_mesh(self) -> None:
-        faces = FakeCheckableAction("Boundary Faces", checked=False)
+        faces = FakeCheckableAction("Shaded Mesh", checked=False)
         ports = FakeCheckableAction("Port Faces", checked=False)
         mesh = FakeCheckableAction("3-D Mesh", checked=True)
-        shaded_mesh = FakeCheckableAction("Shaded Mesh", checked=True)
+        background = FakeCheckableAction("Background Mesh", checked=True)
+        boundary = FakeCheckableAction("Boundary Faces", checked=True)
+        information = FakeCheckableAction(
+            "View Mesh Information", checked=True
+        )
         view_menu = FakeMenu(
             [
                 FakeAction(
                     "Visibility",
-                    menu=FakeMenu([faces, ports, mesh, shaded_mesh]),
+                    menu=FakeMenu(
+                        [
+                            faces,
+                            ports,
+                            mesh,
+                            background,
+                            boundary,
+                            information,
+                        ]
+                    ),
                 )
             ]
         )
@@ -729,7 +742,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         self.assertTrue(mesh.checked)
         self.assertEqual(faces.trigger_calls, 1)
         self.assertEqual(ports.trigger_calls, 1)
-        self.assertIn("Boundary Faces", enabled[0])
+        self.assertIn("Shaded Mesh", enabled[0])
         self.assertIn("Port Faces", enabled[1])
 
         unloaded = MODULE.unload_mesh_ports_view(
@@ -738,10 +751,15 @@ class PreviewSweepGeometryTests(unittest.TestCase):
         )
 
         self.assertFalse(mesh.checked)
-        self.assertTrue(shaded_mesh.checked)
+        self.assertFalse(faces.checked)
+        self.assertFalse(ports.checked)
+        self.assertFalse(background.checked)
+        self.assertFalse(boundary.checked)
+        self.assertTrue(information.checked)
         self.assertEqual(mesh.trigger_calls, 1)
         self.assertIn("3-D Mesh", unloaded)
         self.assertEqual(geometry_view.update_calls, 2)
+        self.assertEqual(project_view.show_calls, 1)
 
     def test_mesh_view_does_not_retrigger_already_enabled_controls(self) -> None:
         faces = FakeCheckableAction("View Faces", checked=True)
@@ -761,6 +779,113 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         self.assertEqual(faces.trigger_calls, 0)
         self.assertEqual(ports.trigger_calls, 0)
+
+    def test_rfpro_view_wrapper_callback_is_preferred_over_trigger(self) -> None:
+        class FakeWrapperAction(FakeCheckableAction):
+            def __init__(self) -> None:
+                super().__init__("Shaded Mesh", checked=False)
+                self.callback_calls = []
+                self.onTriggered = self._on_triggered
+
+            def _on_triggered(self, desired: bool) -> None:
+                self.callback_calls.append(desired)
+                self.checked = desired
+
+            def trigger(self) -> None:
+                raise AssertionError("generic trigger must not bypass onTriggered")
+
+        control = FakeWrapperAction()
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu([control]),
+        )
+        empro_module = type(
+            "FakeEmpro", (), {"gui": FakeCaptureGui(project_view)}
+        )()
+
+        description = MODULE.set_rfpro_view_option(
+            empro_module,
+            FakeApplication(),
+            "faces",
+            True,
+        )
+
+        self.assertTrue(control.checked)
+        self.assertEqual(control.callback_calls, [True])
+        self.assertIn("RFPro View menu", description)
+
+        MODULE.set_rfpro_view_option(
+            empro_module,
+            FakeApplication(),
+            "faces",
+            False,
+        )
+        MODULE.set_rfpro_view_option(
+            empro_module,
+            FakeApplication(),
+            "faces",
+            False,
+            force_activation=True,
+        )
+
+        self.assertFalse(control.checked)
+        self.assertEqual(control.callback_calls, [True, False, False])
+
+    def test_rfpro_view_wrapper_is_preferred_over_duplicate_live_qaction(self) -> None:
+        wrapper_control = FakeCheckableAction("Shaded Mesh", checked=False)
+        live_control = FakeCheckableAction("Shaded Mesh", checked=False)
+
+        class FakeControlWindow:
+            def windowTitle(self) -> str:
+                return "RFPro Setup"
+
+            def findChildren(self, control_type):
+                if control_type is FakeCheckableAction:
+                    return [live_control]
+                return []
+
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu([wrapper_control]),
+        )
+
+        control, description, _owners = MODULE.find_rfpro_view_option_control(
+            project_view,
+            FakeApplication([FakeControlWindow()]),
+            "faces",
+            qt_action_type=FakeCheckableAction,
+            qt_button_type=FakeCheckableAction,
+        )
+
+        self.assertIs(control, wrapper_control)
+        self.assertIn("RFPro View menu", description)
+
+    def test_failed_trigger_is_not_masked_by_checked_state_only_fallback(self) -> None:
+        class FakeNonTogglingAction(FakeCheckableAction):
+            def trigger(self) -> None:
+                FakeAction.trigger(self)
+
+            def setChecked(self, checked: bool) -> None:
+                self.checked = checked
+
+        control = FakeNonTogglingAction("Shaded Mesh", checked=False)
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu([control]),
+        )
+        empro_module = type(
+            "FakeEmpro", (), {"gui": FakeCaptureGui(project_view)}
+        )()
+
+        with self.assertRaisesRegex(RuntimeError, "could not be set checked"):
+            MODULE.set_rfpro_view_option(
+                empro_module,
+                FakeApplication(),
+                "faces",
+                True,
+            )
+
+        self.assertFalse(control.checked)
 
     def test_mesh_sweep_notice_is_dismissed_but_unrelated_dialog_is_not(self) -> None:
         class FakeTimer:

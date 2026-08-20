@@ -768,9 +768,9 @@ _RFPRO_VIEW_OPTION_ALIASES = {
             "faces",
             "view faces",
             "show faces",
-            "boundary faces",
-            "view boundary faces",
-            "show boundary faces",
+            "shaded mesh",
+            "view shaded mesh",
+            "show shaded mesh",
         )
     ),
     "ports": frozenset(
@@ -797,6 +797,8 @@ _RFPRO_VIEW_OPTION_ALIASES = {
             "view mesh ports",
         )
     ),
+    "background": frozenset(("background mesh",)),
+    "boundary": frozenset(("boundary faces",)),
 }
 
 
@@ -836,7 +838,10 @@ def _iter_rfpro_view_controls(
             view_menu, (project_view,)
         ):
             seen_controls.add(id(control))
-            yield control, "RFPro View menu", owners, 300
+            # This is RFPro's scripting wrapper around its own View menu and
+            # exposes the product callback as onTriggered. Prefer it over a
+            # similarly labelled QAction found by walking unrelated windows.
+            yield control, "RFPro View menu", owners, 700
 
     if qt_action_type is None:
         try:
@@ -899,7 +904,7 @@ def find_rfpro_view_option_control(
     qt_action_type: type[Any] | None = None,
     qt_button_type: type[Any] | None = None,
 ) -> tuple[Any, str, tuple[Any, ...]]:
-    """Find one checkable Faces, Ports, or Mesh control in RFPro's live view."""
+    """Find one exact checkable mesh-view control in RFPro's live view."""
 
     if option_name not in _RFPRO_VIEW_OPTION_ALIASES:
         raise ValueError(f"Unsupported RFPro view option: {option_name!r}")
@@ -951,6 +956,7 @@ def set_rfpro_view_option(
     checked: bool,
     qt_action_type: type[Any] | None = None,
     qt_button_type: type[Any] | None = None,
+    force_activation: bool = False,
 ) -> str:
     """Set and verify one live RFPro view option through its checkable control."""
 
@@ -963,15 +969,12 @@ def set_rfpro_view_option(
         qt_button_type=qt_button_type,
     )
     desired = bool(checked)
-    if _control_is_checked(control) != desired:
+    initial_state = _control_is_checked(control)
+    if initial_state != desired or force_activation:
         trigger = _getattr_or_default(control, "trigger")
         click = _getattr_or_default(control, "click")
         on_triggered = _getattr_or_default(control, "onTriggered")
-        if callable(trigger):
-            trigger()
-        elif callable(click):
-            click()
-        elif callable(on_triggered):
+        if callable(on_triggered):
             try:
                 setattr(control, "checked", desired)
             except Exception:
@@ -980,23 +983,33 @@ def set_rfpro_view_option(
                 on_triggered(desired)
             except TypeError:
                 on_triggered()
+        elif callable(trigger):
+            trigger()
+            empro_module.gui.processEvents()
+            if initial_state == desired and force_activation:
+                trigger()
+        elif callable(click):
+            click()
+            empro_module.gui.processEvents()
+            if initial_state == desired and force_activation:
+                click()
         else:
             set_checked = _getattr_or_default(control, "setChecked")
             if not callable(set_checked):
                 raise RuntimeError(
                     f"{description} cannot be activated from Python."
                 )
+            if initial_state == desired and force_activation:
+                raise RuntimeError(
+                    f"{description} exposes checked state but no callback that "
+                    "can reapply it to RFPro's renderer."
+                )
             set_checked(desired)
         empro_module.gui.processEvents()
 
-    # Some wrapper controls expose a trigger but do not toggle themselves when
-    # invoked outside their owning widget. Use setChecked only as a verified
-    # fallback, then require the final state to match.
-    if _control_is_checked(control) != desired:
-        set_checked = _getattr_or_default(control, "setChecked")
-        if callable(set_checked):
-            set_checked(desired)
-            empro_module.gui.processEvents()
+    # Do not convert a failed native activation into apparent success by only
+    # editing QAction checked state. A trigger/click must update the state
+    # through RFPro's callback; otherwise the renderer did not accept it.
     if _control_is_checked(control) != desired:
         state = "checked" if desired else "unchecked"
         raise RuntimeError(f"{description} could not be set {state}.")
@@ -1011,7 +1024,7 @@ def enable_mesh_ports_view_options(
     empro_module: Any,
     application: Any,
 ) -> tuple[str, str]:
-    """Enable RFPro's View Faces and Ports controls for a loaded mesh."""
+    """Enable RFPro's Shaded Mesh and Port Faces controls."""
 
     faces = set_rfpro_view_option(empro_module, application, "faces", True)
     ports = set_rfpro_view_option(empro_module, application, "ports", True)
@@ -1022,18 +1035,41 @@ def enable_mesh_ports_view_options(
 
 
 def unload_mesh_ports_view(empro_module: Any, application: Any) -> str:
-    """Disable and verify RFPro's loaded Mesh layer before showing geometry."""
+    """Disable every visible mesh layer, then return to raw geometry view."""
 
-    description = set_rfpro_view_option(
-        empro_module,
-        application,
-        "mesh",
-        False,
+    descriptions: list[str] = []
+    # These exact auxiliary controls are optional across releases. Disable all
+    # that exist so no shaded, background, boundary, or port mesh survives a
+    # point transition even when RFPro retains the result renderer internally.
+    for option_name in ("ports", "faces", "background", "boundary"):
+        try:
+            descriptions.append(
+                set_rfpro_view_option(
+                    empro_module,
+                    application,
+                    option_name,
+                    False,
+                    force_activation=True,
+                )
+            )
+        except RuntimeError:
+            pass
+    descriptions.append(
+        set_rfpro_view_option(
+            empro_module,
+            application,
+            "mesh",
+            False,
+            force_activation=True,
+        )
     )
-    geometry_view = empro_module.gui.activeProjectView().geometryView()
+    project_view = empro_module.gui.activeProjectView()
+    project_view.showGeometryView()
+    empro_module.gui.processEvents()
+    geometry_view = project_view.geometryView()
     geometry_view.updateView()
     empro_module.gui.processEvents()
-    return description
+    return "; ".join(descriptions)
 
 
 def _action_can_trigger(action: Any) -> bool:
@@ -3043,7 +3079,7 @@ def create_inspector_dialog(
                     self,
                     "Mesh loaded; view options were not fully applied",
                     f"Simulation {result.simulation_id} is loaded and remains "
-                    "visible, but RFPro's Boundary Faces and Port Faces controls "
+                    "visible, but RFPro's Shaded Mesh and Port Faces controls "
                     f"could not both be enabled:\n{error}",
                 )
                 print(
@@ -3055,7 +3091,8 @@ def create_inspector_dialog(
             print(
                 f"Loaded point {row + 1} saved {result.mesh_kind} Mesh/Ports "
                 f"result from simulation {result.simulation_id}; enabled "
-                f"View Faces via {faces_control}; enabled Ports via {ports_control}; "
+                f"Shaded Mesh via {faces_control}; enabled Port Faces via "
+                f"{ports_control}; "
                 f"native sweep notice dismissed={display_handle.sweep_notice_dismissed}."
             )
 
@@ -3542,6 +3579,34 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # RFPro owns the active project and the 3-D view used by this inspector.
     import empro
+
+    # A prior script revision may have left a mesh visible while its QAction
+    # already reports unchecked. Force RFPro's callbacks once before capturing
+    # the raw-geometry baseline so the new inspector starts from a known view.
+    try:
+        startup_unload = unload_mesh_ports_view(
+            empro,
+            qt_runtime.application,
+        )
+        retained_handles = list(
+            getattr(
+                qt_runtime.application,
+                _MESH_HANDLE_REGISTRY_ATTRIBUTE,
+                [],
+            )
+        )
+        for retained_handle in retained_handles:
+            _release_mesh_display_handle(
+                qt_runtime.application,
+                retained_handle,
+            )
+        print(
+            "Reset RFPro to raw geometry view before opening the inspector via "
+            f"{startup_unload}."
+        )
+    except RuntimeError:
+        # Mesh-only controls may not exist until a result has been displayed.
+        pass
 
     project = empro.activeProject
     analysis = _choose_analysis(project, arguments.analysis)

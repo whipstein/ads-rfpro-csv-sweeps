@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.14.7 - 2026-08-20
+
+- Correct the displayed-state mapping to RFPro's actual **Shaded Mesh** and
+  **Port Faces** controls; **Boundary Faces** is now treated only as a mesh
+  layer to clear during unload.
+- Prefer RFPro's View-menu scripting wrapper and invoke its `onTriggered`
+  product callback before considering generic Qt actions with the same label.
+- Remove the checked-state-only fallback that could report success without
+  changing RFPro's renderer.
+- On point changes and inspector close, disable the shaded, background,
+  boundary, and port mesh layers, uncheck **3-D Mesh**, explicitly return to the
+  geometry view, and repaint before releasing the retained Analysis clone.
+  Reapply the unload callback even when Qt already reports a control unchecked.
+- Force the same reset once when opening a new inspector so a mesh left visible
+  by an older script revision does not contaminate the first geometry point.
+- Regenerate both self-contained launchers with the corrected inspector.
+
 ## 0.14.6 - 2026-08-20
 
 - Recognize RFPro 2026 Update 2.1's exact **Boundary Faces**, **Port Faces**,
