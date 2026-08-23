@@ -26,7 +26,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.7**.
+The current release is **0.14.8**.
 
 ## Execution model
 
@@ -355,10 +355,13 @@ while it completes deferred view work.
 
 After loading a mesh, the inspector enables and verifies RFPro's checkable
 **Shaded Mesh** and **Port Faces** controls (including the older **View Faces**
-and **Ports** labels). The loaded layer is identified by the release-specific
-**3-D Mesh** control or its older **Mesh** label. RFPro's own View-menu scripting
-wrapper is preferred over similarly labelled actions found in other Qt windows,
-and its product callback is invoked directly. A checked-state change without a
+and **Ports** labels). RFPro's View-menu scripting wrapper is preferred when it
+exposes the control; otherwise the visible mesh-toolbar button is preferred over
+its backing QAction. Display callbacks are forced even when Qt already reports
+the option checked, preventing stale action state from suppressing shading or
+ports. The mesh-specific **Shaded Mesh** and **Port Faces** labels outrank
+generic legacy **View Faces** and **Ports** entries, even when the generic entry
+comes from the preferred View-menu wrapper. A checked-state change without a
 successful RFPro callback is treated as a failure rather than proof that the
 renderer changed.
 
@@ -374,12 +377,13 @@ applied** instead of incorrectly saying that the result failed to load.
 Before selecting another raw geometry point, loading the next saved mesh, or
 restoring the original geometry, it disables **Port Faces**, **Shaded Mesh**,
 **Background Mesh**, and **Boundary Faces** when those controls are available,
-then unchecks the required **3-D Mesh** (or older **Mesh**) control and explicitly
-returns RFPro to its geometry view. The native callback is reapplied during
-unload even when a control already reports unchecked, preventing stale QAction
-state from suppressing the renderer update. If RFPro does not expose the
-required main control, the transition stops and reports all discovered control
-labels instead of silently leaving a stale mesh over another point.
+then explicitly returns RFPro to its raw geometry view. **3-D Mesh** is an
+exclusive mesh-view mode, not a visibility toggle, so the inspector deliberately
+does not try to uncheck it. The native layer callbacks are reapplied during
+unload even when controls already report unchecked, preventing stale QAction
+state from suppressing the renderer update. If the required Shaded Mesh or Port
+Faces control cannot be operated, the transition stops and reports all
+discovered controls instead of silently leaving a stale mesh over another point.
 
 Opening a new inspector also performs this forced reset once before capturing
 the first raw-geometry state. This clears a mesh left visible by an older script

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.14.8 - 2026-08-20
+
+- Treat **3-D Mesh** correctly as an exclusive mesh-view mode rather than a
+  checkable visibility layer; it is no longer used as the unload gate.
+- Prefer the visible RFPro mesh-toolbar button over its backing QAction when a
+  View-menu scripting wrapper is unavailable.
+- Rank exact **Shaded Mesh** and **Port Faces** controls above generic legacy
+  **View Faces** and **Ports** wrappers so geometry-view actions cannot shadow
+  mesh-specific toolbar controls.
+- Force real off/on callbacks for **Shaded Mesh** and **Port Faces** even when
+  Qt begins in the requested checked state.
+- Unload visually by clearing port, shaded, background, and boundary mesh
+  layers and returning to raw geometry view, avoiding the impossible attempt to
+  uncheck **3-D Mesh**.
+- Regenerate both self-contained launchers with the corrected inspector.
+
 ## 0.14.7 - 2026-08-20
 
 - Correct the displayed-state mapping to RFPro's actual **Shaded Mesh** and

@@ -801,6 +801,14 @@ _RFPRO_VIEW_OPTION_ALIASES = {
     "boundary": frozenset(("boundary faces",)),
 }
 
+_RFPRO_PRIMARY_VIEW_OPTION_LABELS = {
+    "faces": frozenset(("shaded mesh",)),
+    "ports": frozenset(("port faces",)),
+    "background": frozenset(("background mesh",)),
+    "boundary": frozenset(("boundary faces",)),
+    "mesh": frozenset(("3 d mesh", "3d mesh")),
+}
+
 
 def _control_matches_view_option(control: Any, option_name: str) -> bool:
     aliases = _RFPRO_VIEW_OPTION_ALIASES[option_name]
@@ -817,6 +825,18 @@ def _control_matches_view_option(control: Any, option_name: str) -> bool:
         if variants.intersection(aliases) or variants.intersection(compact_aliases):
             return True
     return False
+
+
+def _primary_view_option_match_score(control: Any, option_name: str) -> int:
+    """Prefer release-specific mesh controls over generic legacy aliases."""
+
+    primary = _RFPRO_PRIMARY_VIEW_OPTION_LABELS.get(option_name, frozenset())
+    compact_primary = {label.replace(" ", "") for label in primary}
+    for raw_text in _control_metadata(control):
+        normalized = _normalized_control_text(raw_text)
+        if normalized in primary or normalized.replace(" ", "") in compact_primary:
+            return 300
+    return 0
 
 
 def _iter_rfpro_view_controls(
@@ -878,7 +898,13 @@ def _iter_rfpro_view_controls(
         find_children = _getattr_or_default(top_level, "findChildren")
         if not callable(find_children):
             continue
-        for control_type in (qt_action_type, qt_button_type):
+        # Prefer a visible toolbar/button control over its backing QAction.
+        # RFPro's mesh toolbar can attach additional behavior to the button's
+        # click path even when QAction.trigger() only changes Qt state.
+        for control_type, control_score in (
+            (qt_button_type, 80),
+            (qt_action_type, 0),
+        ):
             if control_type is None:
                 continue
             try:
@@ -893,7 +919,7 @@ def _iter_rfpro_view_controls(
                     control,
                     f"Qt window {window_title!r}",
                     (top_level, control),
-                    source_score,
+                    source_score + control_score,
                 )
 
 
@@ -932,9 +958,18 @@ def find_rfpro_view_option_control(
         if not _action_is_enabled(control):
             discovered.append(f"{source}: {label} is disabled")
             continue
-        score = source_score + (20 if _control_is_visible(control) else 0)
+        score = (
+            source_score
+            + (20 if _control_is_visible(control) else 0)
+            + _primary_view_option_match_score(control, option_name)
+        )
         candidates.append(
-            (score, control, f"{source} > {label}", owners)
+            (
+                score,
+                control,
+                f"{source} > {label} [{type(control).__name__}]",
+                owners,
+            )
         )
 
     if not candidates:
@@ -1026,8 +1061,20 @@ def enable_mesh_ports_view_options(
 ) -> tuple[str, str]:
     """Enable RFPro's Shaded Mesh and Port Faces controls."""
 
-    faces = set_rfpro_view_option(empro_module, application, "faces", True)
-    ports = set_rfpro_view_option(empro_module, application, "ports", True)
+    faces = set_rfpro_view_option(
+        empro_module,
+        application,
+        "faces",
+        True,
+        force_activation=True,
+    )
+    ports = set_rfpro_view_option(
+        empro_module,
+        application,
+        "ports",
+        True,
+        force_activation=True,
+    )
     geometry_view = empro_module.gui.activeProjectView().geometryView()
     geometry_view.updateView()
     empro_module.gui.processEvents()
@@ -1038,10 +1085,21 @@ def unload_mesh_ports_view(empro_module: Any, application: Any) -> str:
     """Disable every visible mesh layer, then return to raw geometry view."""
 
     descriptions: list[str] = []
-    # These exact auxiliary controls are optional across releases. Disable all
-    # that exist so no shaded, background, boundary, or port mesh survives a
-    # point transition even when RFPro retains the result renderer internally.
-    for option_name in ("ports", "faces", "background", "boundary"):
+    # Shading and port faces are the layers this inspector enables, so their
+    # real RFPro callbacks must succeed during unload.
+    for option_name in ("ports", "faces"):
+        descriptions.append(
+            set_rfpro_view_option(
+                empro_module,
+                application,
+                option_name,
+                False,
+                force_activation=True,
+            )
+        )
+    # Background and boundary layers are release-specific and optional. Clear
+    # them when present so no residual mesh lines remain over raw geometry.
+    for option_name in ("background", "boundary"):
         try:
             descriptions.append(
                 set_rfpro_view_option(
@@ -1054,15 +1112,8 @@ def unload_mesh_ports_view(empro_module: Any, application: Any) -> str:
             )
         except RuntimeError:
             pass
-    descriptions.append(
-        set_rfpro_view_option(
-            empro_module,
-            application,
-            "mesh",
-            False,
-            force_activation=True,
-        )
-    )
+    # 3-D Mesh is an exclusive mesh-view mode and cannot be unchecked. Clearing
+    # all of its visible layers is the valid transition back to raw geometry.
     project_view = empro_module.gui.activeProjectView()
     project_view.showGeometryView()
     empro_module.gui.processEvents()

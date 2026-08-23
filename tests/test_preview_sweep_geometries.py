@@ -750,18 +750,18 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             FakeApplication(),
         )
 
-        self.assertFalse(mesh.checked)
+        self.assertTrue(mesh.checked)
         self.assertFalse(faces.checked)
         self.assertFalse(ports.checked)
         self.assertFalse(background.checked)
         self.assertFalse(boundary.checked)
         self.assertTrue(information.checked)
-        self.assertEqual(mesh.trigger_calls, 1)
-        self.assertIn("3-D Mesh", unloaded)
+        self.assertEqual(mesh.trigger_calls, 0)
+        self.assertNotIn("3-D Mesh", unloaded)
         self.assertEqual(geometry_view.update_calls, 2)
         self.assertEqual(project_view.show_calls, 1)
 
-    def test_mesh_view_does_not_retrigger_already_enabled_controls(self) -> None:
+    def test_mesh_view_reapplies_already_enabled_controls(self) -> None:
         faces = FakeCheckableAction("View Faces", checked=True)
         ports = FakeCheckableAction("Ports", checked=True)
         project_view = FakeProjectView(
@@ -777,8 +777,8 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             FakeApplication(),
         )
 
-        self.assertEqual(faces.trigger_calls, 0)
-        self.assertEqual(ports.trigger_calls, 0)
+        self.assertEqual(faces.trigger_calls, 2)
+        self.assertEqual(ports.trigger_calls, 2)
 
     def test_rfpro_view_wrapper_callback_is_preferred_over_trigger(self) -> None:
         class FakeWrapperAction(FakeCheckableAction):
@@ -859,6 +859,75 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         self.assertIs(control, wrapper_control)
         self.assertIn("RFPro View menu", description)
+
+    def test_visible_mesh_toolbar_button_is_preferred_over_backing_qaction(self) -> None:
+        class FakeToolbarButton(FakeCheckableAction):
+            pass
+
+        class FakeQtAction(FakeCheckableAction):
+            pass
+
+        button = FakeToolbarButton("Port Faces", checked=False)
+        action = FakeQtAction("Port Faces", checked=False)
+
+        class FakeControlWindow:
+            def windowTitle(self) -> str:
+                return "RFPro Setup"
+
+            def findChildren(self, control_type):
+                if control_type is FakeToolbarButton:
+                    return [button]
+                if control_type is FakeQtAction:
+                    return [action]
+                return []
+
+        project_view = FakeProjectView(FakeGeometryViewController())
+
+        control, description, _owners = MODULE.find_rfpro_view_option_control(
+            project_view,
+            FakeApplication([FakeControlWindow()]),
+            "ports",
+            qt_action_type=FakeQtAction,
+            qt_button_type=FakeToolbarButton,
+        )
+
+        self.assertIs(control, button)
+        self.assertIn("FakeToolbarButton", description)
+
+    def test_specific_port_faces_button_outranks_generic_ports_wrapper(self) -> None:
+        class FakeToolbarButton(FakeCheckableAction):
+            pass
+
+        class FakeQtAction(FakeCheckableAction):
+            pass
+
+        generic_wrapper = FakeCheckableAction("Ports", checked=False)
+        specific_button = FakeToolbarButton("Port Faces", checked=False)
+
+        class FakeControlWindow:
+            def windowTitle(self) -> str:
+                return "RFPro Setup"
+
+            def findChildren(self, control_type):
+                if control_type is FakeToolbarButton:
+                    return [specific_button]
+                return []
+
+        project_view = FakeProjectView(
+            FakeGeometryViewController(),
+            FakeMenu([generic_wrapper]),
+        )
+
+        control, description, _owners = MODULE.find_rfpro_view_option_control(
+            project_view,
+            FakeApplication([FakeControlWindow()]),
+            "ports",
+            qt_action_type=FakeQtAction,
+            qt_button_type=FakeToolbarButton,
+        )
+
+        self.assertIs(control, specific_button)
+        self.assertIn("Port Faces", description)
 
     def test_failed_trigger_is_not_masked_by_checked_state_only_fallback(self) -> None:
         class FakeNonTogglingAction(FakeCheckableAction):
@@ -1031,13 +1100,12 @@ class PreviewSweepGeometryTests(unittest.TestCase):
             getattr(application, MODULE._MESH_HANDLE_REGISTRY_ATTRIBUTE), []
         )
 
-    def test_missing_mesh_view_control_reports_discovered_checkboxes(self) -> None:
+    def test_missing_required_port_view_control_reports_discovered_checkboxes(self) -> None:
         project_view = FakeProjectView(
             FakeGeometryViewController(),
             FakeMenu(
                 [
-                    FakeCheckableAction("View Faces"),
-                    FakeCheckableAction("Ports"),
+                    FakeCheckableAction("Shaded Mesh"),
                 ]
             ),
         )
@@ -1047,7 +1115,7 @@ class PreviewSweepGeometryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "(?s)checkable mesh view control was not found.*View Faces",
+            "(?s)checkable ports view control was not found.*Shaded Mesh",
         ):
             MODULE.unload_mesh_ports_view(
                 empro_module,
