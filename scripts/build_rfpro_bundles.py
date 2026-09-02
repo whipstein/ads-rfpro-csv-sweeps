@@ -26,6 +26,7 @@ BUNDLES = {
     "rfpro_workflow.py": (
         ("import_csv", "import_csv_parameter_sweeps.py"),
         ("run_analysis", "run_analysis_reuse_existing.py"),
+        ("duplicate_analysis", "duplicate_analysis_with_results.py"),
         ("export_mdif", "export_analysis_mdif.py"),
         ("geometry_inspector", "preview_sweep_geometries.py"),
     ),

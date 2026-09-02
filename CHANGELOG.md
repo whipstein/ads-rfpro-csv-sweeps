@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.0 - 2026-09-02
+
+- Add **Duplicate analysis and solved data** to the RFPro workflow dropdown.
+- Deep-copy the selected public `Analysis`, allocate a distinct simulation
+  group, and atomically copy the complete saved result group—including hidden
+  reuse hashes, reusable markers, meshes, and circuit results.
+- Remap the duplicate's simulation path and verify through public
+  `AnalysisOutput` APIs that every registered source result ID resolves inside
+  the new group before saving the project.
+- Refuse duplication while any simulation is running or queued, never launch a
+  solve, never overwrite an existing group directory, and preserve the source
+  analysis and source result tree.
+- Provide a standalone self-contained duplicate script with the complete ADS
+  Qt-runtime bootstrap and embed the exact tested source in `rfpro_workflow.py`.
+
 ## 0.14.8 - 2026-08-20
 
 - Treat **3-D Mesh** correctly as an exclusive mesh-view mode rather than a

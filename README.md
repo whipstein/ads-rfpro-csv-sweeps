@@ -4,7 +4,8 @@ This repository provides RFPro workflow and diagnostic scripts that run
 directly in an open Keysight RFPro process:
 
 - `rfpro_scripts/rfpro_workflow.py` opens one dropdown for CSV import,
-  analysis execution, MDIF export, or Geometry/Mesh/Ports inspection.
+  analysis duplication, analysis execution, MDIF export, or
+  Geometry/Mesh/Ports inspection.
 - `rfpro_scripts/rfpro_diagnostics.py` opens one dropdown for the duplicate
   condition audit, reuse/result mapping report, reusable-cache inventory, or
   Geometry/Mesh/Ports inspection.
@@ -15,6 +16,9 @@ directly in an open Keysight RFPro process:
 - `rfpro_scripts/run_analysis_reuse_existing.py` explicitly starts an analysis
   later while requesting reuse of valid existing results through RFPro's native
   analysis queue lifecycle.
+- `rfpro_scripts/duplicate_analysis_with_results.py` deep-copies an analysis
+  and copies its complete saved result group to a new independent RFPro
+  simulation-group ID without starting a simulation.
 - `rfpro_scripts/preview_sweep_geometries.py` expands every configured sweep
   point, displays its regenerated geometry, and loads or exports available
   saved Mesh/Ports results in RFPro for inspection.
@@ -26,7 +30,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.14.8**.
+The current release is **0.15.0**.
 
 ## Execution model
 
@@ -60,13 +64,14 @@ scripting.run(r"C:\path\to\rfpro_scripts\rfpro_diagnostics.py")
 ```
 
 The workflow dropdown contains **Import CSV parameter sweeps**, **Save and run
-analysis**, **Export analysis results to MDIF**, and **Geometry and Mesh/Ports
-inspector**. The diagnostics dropdown contains **Duplicate sweep-condition
-audit**, **Analysis reuse and result mappings**, **Reusable simulation-cache
-inventory**, and the same geometry inspector. Each selection delegates through
-an in-memory module containing the exact tested operation source, so its own
-preview, confirmation, and settings remain authoritative. No subsequent script
-path is resolved through `empro.toolkit.scripting.run()`.
+analysis**, **Duplicate analysis and solved data**, **Export analysis results
+to MDIF**, and **Geometry and Mesh/Ports inspector**. The diagnostics dropdown
+contains **Duplicate sweep-condition audit**, **Analysis reuse and result
+mappings**, **Reusable simulation-cache inventory**, and the same geometry
+inspector. Each selection delegates through an in-memory module containing the
+exact tested operation source, so its own preview, confirmation, and settings
+remain authoritative. No subsequent script path is resolved through
+`empro.toolkit.scripting.run()`.
 
 The launcher first selects the operation and then the analysis. To preselect
 both without showing those two chooser dialogs, pass their keys directly:
@@ -409,6 +414,65 @@ Useful inspector options:
 ```text
 --analysis NAME
 --zoom-to-extents
+```
+
+## Duplicate an analysis with solved data
+
+Choose **Duplicate analysis and solved data** from `rfpro_workflow.py`, or run
+the standalone operation directly:
+
+```python
+from empro.toolkit import scripting
+
+scripting.run(
+    r"C:\path\to\rfpro_scripts\duplicate_analysis_with_results.py"
+)
+```
+
+The operation asks for a new analysis name and shows the source group, new
+group, registered-result count, and copy size before making changes. It uses
+the documented deep-copy `Analysis.clone()` API for the setup, obtains a new
+ID from `project.simulations.getNextSimulationGroup()`, copies the complete
+`simulationGroupPath` directory to that new sibling group, and registers the
+clone with `project.analyses.append()`. This produces an independent analysis
+and result tree; changing or deleting the duplicate does not reuse the source
+directory by reference.
+
+The directory copy includes hidden reuse metadata, mesh files, circuit-result
+files, logs, and any other saved artifacts in the source group. The operation
+does not start or queue a simulation. It refuses to proceed while any RFPro
+simulation is running or queued, when the source group is missing, when a
+registered result path falls outside the source group, when no solved result is
+registered, or when the proposed destination already exists. Enough free space
+for the complete uncompressed copy is required.
+
+Files are first copied to a private sibling staging directory and published
+under the new group name only after the copy completes. Before saving the
+modified project, the script refreshes RFPro's public simulation list and uses
+`empro.output.AnalysisOutput` to verify that the duplicate exposes the same
+registered result IDs and that every duplicate path exists under the copied
+group. A failed pre-save verification rolls back the new analysis and result
+directory while leaving the source untouched.
+
+For an explicit direct launch:
+
+```python
+scripting.run(
+    r"C:\path\to\rfpro_scripts\duplicate_analysis_with_results.py",
+    [
+        "--analysis", "My RF Analysis",
+        "--new-name", "My RF Analysis Copy",
+        "--yes",
+    ],
+)
+```
+
+Useful options:
+
+```text
+--analysis NAME
+--new-name NAME
+--yes
 ```
 
 ## Explicitly run with existing-result reuse

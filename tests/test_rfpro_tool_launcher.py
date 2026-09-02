@@ -56,7 +56,17 @@ class RFProToolLauncherTests(unittest.TestCase):
 
         self.assertEqual(
             set(operations),
-            {"import_csv", "run_analysis", "export_mdif", "geometry_inspector"},
+            {
+                "import_csv",
+                "run_analysis",
+                "duplicate_analysis",
+                "export_mdif",
+                "geometry_inspector",
+            },
+        )
+        self.assertEqual(
+            operations["duplicate_analysis"][3],
+            "duplicate_analysis_with_results.py",
         )
         self.assertEqual(
             operations["geometry_inspector"][3],
@@ -94,6 +104,7 @@ class RFProToolLauncherTests(unittest.TestCase):
     def test_selected_operations_receive_the_analysis_argument_in_memory(self) -> None:
         for module, operation_key in (
             (WORKFLOW, "export_mdif"),
+            (WORKFLOW, "duplicate_analysis"),
             (DIAGNOSTICS, "duplicate_conditions"),
         ):
             operation = module.find_operation(operation_key)
