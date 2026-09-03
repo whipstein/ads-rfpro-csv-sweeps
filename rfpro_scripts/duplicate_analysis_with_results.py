@@ -311,19 +311,33 @@ def path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def remap_group_path(path_text: str, source_group: Path, duplicate_group: Path) -> str:
-    """Map one source-group path to the same relative duplicate-group path."""
+def resolve_result_path(path: Path, group_path: Path) -> Path:
+    """Resolve RFPro's absolute or group-relative result-path representation."""
 
-    if not str(path_text or "").strip():
-        return ""
-    source_path = Path(str(path_text))
-    if not path_is_within(source_path, source_group):
-        raise RuntimeError(
-            f"Analysis simulationPath {source_path} is outside its simulation "
-            f"group {source_group}; it cannot be copied safely."
-        )
-    relative = Path(os.path.relpath(str(source_path), str(source_group)))
-    return str(duplicate_group / relative)
+    if path.is_absolute():
+        return path
+    normalized = Path(os.path.normpath(str(path)))
+    # RFPro can report either ./<group>/<simulation> relative to the RFPro
+    # results root, or ./<simulation> relative to simulationGroupPath.
+    if len(normalized.parts) > 1 and normalized.parts[0] == group_path.name:
+        return group_path.parent / normalized
+    return group_path / normalized
+
+
+def reported_group_path_matches(
+    reported_text: str,
+    expected_path: Path,
+    expected_group: str,
+) -> bool:
+    """Accept RFPro's absolute path or its canonical ./<group> spelling."""
+
+    text = str(reported_text or "").strip()
+    if not text:
+        return False
+    reported = Path(text)
+    if reported.is_absolute():
+        return normalized_path(reported) == normalized_path(expected_path)
+    return os.path.normpath(text) == expected_group
 
 
 def directory_size(path: Path) -> int:
@@ -354,7 +368,7 @@ def prepare_duplicate_plan(
     duplicate_name = validate_duplicate_name(duplicate_name, analysis_names(project))
     output = empro_module.output.AnalysisOutput(source)
     result_ids = tuple(str(value) for value in (output.getAvailableSimulationIds() or []))
-    result_paths = tuple(
+    raw_result_paths = tuple(
         Path(str(value)) for value in (output.getAvailableSimulationPaths() or [])
     )
     if not result_ids:
@@ -362,10 +376,10 @@ def prepare_duplicate_plan(
             f"Analysis {source.name!r} exposes no registered solved results. "
             "There is no public result mapping to duplicate and verify."
         )
-    if len(result_ids) != len(result_paths):
+    if len(result_ids) != len(raw_result_paths):
         raise RuntimeError(
             f"Analysis {source.name!r} has inconsistent public result metadata: "
-            f"{len(result_ids)} simulation IDs and {len(result_paths)} paths. "
+            f"{len(result_ids)} simulation IDs and {len(raw_result_paths)} paths. "
             "Run the analysis reuse diagnostic before duplicating it."
         )
     source_group = _valid_group_id(getattr(source, "simulationGroup", ""))
@@ -380,6 +394,9 @@ def prepare_duplicate_plan(
         raise FileNotFoundError(
             f"The source simulation-group directory does not exist: {source_group_path}"
         )
+    result_paths = tuple(
+        resolve_result_path(path, source_group_path) for path in raw_result_paths
+    )
     outside = [path for path in result_paths if not path_is_within(path, source_group_path)]
     if outside:
         details = "\n  ".join(str(path) for path in outside)
@@ -453,11 +470,8 @@ def clone_analysis_for_plan(source: Any, plan: DuplicatePlan) -> Any:
     duplicate = source.clone()
     duplicate.name = plan.duplicate_name
     duplicate.simulationGroup = plan.duplicate_group
-    duplicate.simulationPath = remap_group_path(
-        str(getattr(source, "simulationPath", "") or ""),
-        plan.source_group_path,
-        plan.duplicate_group_path,
-    )
+    # Do not assign Analysis.simulationPath. Its setter is deprecated in RFPro;
+    # the new simulationGroup and copied group directory are authoritative.
     return duplicate
 
 
@@ -473,8 +487,10 @@ def verify_duplicate_output(
             f"to {actual_group!r}."
         )
     group_path_text = str(getattr(duplicate, "simulationGroupPath", "") or "").strip()
-    if group_path_text and normalized_path(Path(group_path_text)) != normalized_path(
-        plan.duplicate_group_path
+    if not reported_group_path_matches(
+        group_path_text,
+        plan.duplicate_group_path,
+        plan.duplicate_group,
     ):
         raise RuntimeError(
             "RFPro resolved the duplicate analysis to the wrong result group: "
@@ -483,7 +499,7 @@ def verify_duplicate_output(
 
     output = empro_module.output.AnalysisOutput(duplicate)
     result_ids = tuple(str(value) for value in (output.getAvailableSimulationIds() or []))
-    result_paths = tuple(
+    raw_result_paths = tuple(
         Path(str(value)) for value in (output.getAvailableSimulationPaths() or [])
     )
     if sorted(result_ids) != sorted(plan.registered_result_ids):
@@ -492,12 +508,16 @@ def verify_duplicate_output(
             f"Source={list(plan.registered_result_ids)!r}; "
             f"duplicate={list(result_ids)!r}."
         )
-    if len(result_paths) != len(plan.registered_result_paths):
+    if len(raw_result_paths) != len(plan.registered_result_paths):
         raise RuntimeError(
             "RFPro registered a different number of result paths for the "
             f"duplicate: source={len(plan.registered_result_paths)}, "
-            f"duplicate={len(result_paths)}."
+            f"duplicate={len(raw_result_paths)}."
         )
+    result_paths = tuple(
+        resolve_result_path(path, plan.duplicate_group_path)
+        for path in raw_result_paths
+    )
     invalid_paths = [
         path
         for path in result_paths

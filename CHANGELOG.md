@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.1 - 2026-09-02
+
+- Accept RFPro's canonical relative `./<simulation-group>` representation when
+  it is equivalent to the duplicate's expected absolute result-group path.
+- Resolve both group-relative and RFPro-root-relative public simulation paths
+  before verifying that every duplicated result remains inside the copied
+  group.
+- Stop assigning the deprecated `Analysis.simulationPath` property; the new
+  `simulationGroup` and verified copied directory are now the authoritative
+  result association.
+- Add regression coverage for relative duplicate group and result paths.
+
 ## 0.15.0 - 2026-09-02
 
 - Add **Duplicate analysis and solved data** to the RFPro workflow dropdown.

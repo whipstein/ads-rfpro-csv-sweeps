@@ -23,15 +23,19 @@ class FakeAnalysis:
         result_root: Path,
         group: str,
         simulation_path: str,
+        relative_duplicate_group_path: bool = False,
     ) -> None:
         self.name = name
         self.result_root = result_root
         self.simulationGroup = group
         self.simulationPath = simulation_path
+        self.relative_duplicate_group_path = relative_duplicate_group_path
         self.settings = {"frequency": "20 GHz"}
 
     @property
     def simulationGroupPath(self) -> str:
+        if self.relative_duplicate_group_path and self.simulationGroup != "000001":
+            return f"./{self.simulationGroup}"
         return str(self.result_root / self.simulationGroup)
 
     def clone(self):
@@ -40,6 +44,7 @@ class FakeAnalysis:
             self.result_root,
             self.simulationGroup,
             self.simulationPath,
+            self.relative_duplicate_group_path,
         )
         duplicate.settings = dict(self.settings)
         return duplicate
@@ -108,7 +113,7 @@ class FakeAnalysisOutput:
     def getAvailableSimulationPaths(self):
         if self.omit_duplicate and self.analysis.simulationGroup != "000001":
             return []
-        root = Path(self.analysis.simulationGroupPath)
+        root = self.analysis.result_root / self.analysis.simulationGroup
         return [str(root / "000001"), str(root / "000002")]
 
 
@@ -181,7 +186,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(plan.registered_result_ids, ("000001", "000002"))
             self.assertGreater(plan.source_size_bytes, 0)
 
-    def test_clone_has_independent_group_and_remapped_simulation_path(self) -> None:
+    def test_clone_uses_group_without_deprecated_simulation_path_assignment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
@@ -194,9 +199,35 @@ class DuplicateAnalysisTests(unittest.TestCase):
 
             self.assertEqual(duplicate.name, "RF Setup Copy")
             self.assertEqual(duplicate.simulationGroup, "000002")
-            self.assertEqual(duplicate.simulationPath, str(root / "000002" / "000001"))
+            self.assertEqual(duplicate.simulationPath, source.simulationPath)
             duplicate.settings["frequency"] = "40 GHz"
             self.assertEqual(source.settings["frequency"], "20 GHz")
+
+    def test_relative_duplicate_group_path_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            source.relative_duplicate_group_path = True
+            project = FakeProject([source])
+
+            result = MODULE.duplicate_analysis_with_results(
+                FakeEmpro(), project, source, "RF Setup Copy"
+            )
+
+            self.assertEqual(result.duplicate.simulationGroupPath, "./000002")
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+
+    def test_relative_result_paths_are_resolved_inside_duplicate_group(self) -> None:
+        group = Path("C:/results/rfpro/000004")
+
+        self.assertEqual(
+            MODULE.resolve_result_path(Path("./000004/000026"), group),
+            group / "000026",
+        )
+        self.assertEqual(
+            MODULE.resolve_result_path(Path("./000026"), group),
+            group / "000026",
+        )
 
     def test_duplicate_copies_hidden_cache_data_and_registers_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

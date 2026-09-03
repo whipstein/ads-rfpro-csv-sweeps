@@ -30,7 +30,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.15.0**.
+The current release is **0.15.1**.
 
 ## Execution model
 
@@ -437,6 +437,13 @@ ID from `project.simulations.getNextSimulationGroup()`, copies the complete
 clone with `project.analyses.append()`. This produces an independent analysis
 and result tree; changing or deleting the duplicate does not reuse the source
 directory by reference.
+
+RFPro may expose the new `simulationGroupPath` as the project-relative value
+`./<group-id>` rather than as an absolute path. The verifier accepts that exact
+equivalent form and resolves relative result paths against the copied group
+before checking containment. The script does not assign the deprecated
+`Analysis.simulationPath` property; the distinct `simulationGroup` is the
+authoritative association.
 
 The directory copy includes hidden reuse metadata, mesh files, circuit-result
 files, logs, and any other saved artifacts in the source group. The operation
