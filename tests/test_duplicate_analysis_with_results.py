@@ -76,9 +76,15 @@ class FakeAnalyses:
 
 
 class FakeSimulationList(list):
-    def __init__(self, next_group: str = "000002", values=()) -> None:
+    def __init__(
+        self,
+        next_group: str = "000002",
+        values=(),
+        fail_refresh_count: int = 0,
+    ) -> None:
         super().__init__(values)
         self.next_group = next_group
+        self.fail_refresh_count = fail_refresh_count
         self.refresh_calls = 0
 
     def getNextSimulationGroup(self) -> str:
@@ -86,6 +92,21 @@ class FakeSimulationList(list):
 
     def refresh(self) -> None:
         self.refresh_calls += 1
+        if self.fail_refresh_count:
+            self.fail_refresh_count -= 1
+            raise RuntimeError(
+                "SimulationsTable has corrupt state: number of simulations mismatch!"
+            )
+
+
+class AssociationRefreshSimulationList(FakeSimulationList):
+    def __init__(self, analysis, values=()) -> None:
+        super().__init__(values=values)
+        self.analysis = analysis
+
+    def refresh(self) -> None:
+        super().refresh()
+        self.analysis.results_registered = True
 
 
 class FakeSimulation:
@@ -113,7 +134,9 @@ class FakeProject:
         async_delay_events: int = 0,
     ) -> None:
         self.analyses = FakeAnalyses(analyses)
-        self.simulations = simulations or FakeSimulationList()
+        self.simulations = (
+            simulations if simulations is not None else FakeSimulationList()
+        )
         self.empty_registration = empty_registration
         self.empty_return_with_records = empty_return_with_records
         self.queue_on_create = queue_on_create
@@ -373,7 +396,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             # Source mapping, duplicate/group assignment, then registrations.
             self.assertEqual(project.save_calls, 3)
-            self.assertEqual(project.simulations.refresh_calls, 0)
+            self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
             create_call = project.create_calls[0]
             self.assertEqual(create_call[0:2], (False, False))
@@ -424,6 +447,59 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
 
+    def test_wait_retries_transient_simulation_table_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            simulations = FakeSimulationList(fail_refresh_count=1)
+            project = FakeProject(
+                [source],
+                simulations=simulations,
+                async_delay_events=2,
+            )
+            empro = FakeEmpro(project=project)
+
+            with mock.patch.object(MODULE, "REGISTRATION_POLL_INTERVAL_SECONDS", 0):
+                result = MODULE.duplicate_analysis_with_results(
+                    empro, project, source, "RF Setup Copy"
+                )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertGreaterEqual(project.simulations.refresh_calls, 2)
+            self.assertEqual(len(project.simulations), 2)
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+
+    def test_preserved_duplicate_can_resume_without_another_creation_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = "000002"
+            MODULE.copy_group_atomically(root / "000001", root / "000002")
+            simulations = AssociationRefreshSimulationList(
+                duplicate,
+                values=[
+                    FakeSimulation(str(root / "000002" / "000001")),
+                    FakeSimulation(str(root / "000002" / "000002")),
+                ],
+            )
+            project = FakeProject([source, duplicate], simulations=simulations)
+            empro = FakeEmpro()
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertIs(result.duplicate, duplicate)
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(len(project.create_calls), 0)
+            self.assertGreaterEqual(project.simulations.refresh_calls, 1)
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+
     def test_registered_result_mismatch_preserves_association_for_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -445,7 +521,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
             self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.simulations), 2)
-            self.assertEqual(project.simulations.refresh_calls, 0)
+            self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
             self.assertEqual(project.cache_calls, 1)

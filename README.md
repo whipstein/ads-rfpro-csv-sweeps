@@ -469,8 +469,12 @@ In RFPro's newer backend this registration call can return an empty Python list
 while inactive records are still being created asynchronously. Empty therefore
 does not mean failure. The script processes RFPro events and waits up to
 `DEFAULT_REGISTRATION_TIMEOUT_SECONDS` (300 seconds by default) for every
-expected path to appear in `project.simulations`. A **Created** status is the
-expected inactive state; it is not a running or queued solve.
+expected path to appear in `project.simulations`. Each poll calls the public
+`project.simulations.refresh()` method because RFPro's GUI can show newly
+created records while the Python simulation-list wrapper is still stale.
+Temporary `SimulationsTable` count-mismatch errors during publication are
+retried. A **Created** status is the expected inactive state; it is not a
+running or queued solve.
 
 Once all records appear, the script saves them, refreshes with
 `empro.output.resultBrowser().refresh()`, and uses `AnalysisOutput` to verify
@@ -485,6 +489,12 @@ inspection and explicitly says not to run duplication again for that copy.
 Only failures occurring before registration is requested are rolled back. If a
 previous version left inactive orphan records after deleting their analysis,
 remove those **Created** entries from RFPro's Simulation window before retrying.
+
+If a timed-out attempt preserved both the duplicate analysis and its copied
+group, do not create another duplicate. Run the operation again with the
+original source selected and enter the exact existing duplicate name in the
+name dialog. The operation recognizes that name as **resume existing**, refreshes
+and verifies its Created records, and does not call simulation creation again.
 
 For an explicit direct launch:
 

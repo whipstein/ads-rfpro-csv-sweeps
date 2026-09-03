@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.8 - 2026-09-03
+
+- Refresh the public `project.simulations` wrapper on every asynchronous wait
+  cycle. Live RFPro testing showed Created records and copied directories in
+  the GUI while the unrefreshed Python list continued to report no paths.
+- Treat temporary `SimulationsTable` record-count mismatch errors as an
+  intermediate publication state and retry after processing RFPro GUI events.
+- Allow a preserved timed-out duplicate to be resumed by entering its exact
+  existing name. Resume mode refreshes and verifies existing records without
+  issuing another `createSimulationsFromAnalysis()` request.
+- Add regression coverage for stale-until-refresh simulation lists, transient
+  table mismatches, and refresh-only resumption of a preserved duplicate.
+
 ## 0.15.7 - 2026-09-03
 
 - Treat an empty return from nonqueued

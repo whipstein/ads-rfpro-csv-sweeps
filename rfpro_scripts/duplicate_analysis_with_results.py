@@ -58,6 +58,15 @@ class DuplicateResult:
     verified_result_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SourceResultInventory:
+    result_ids: tuple[str, ...]
+    result_paths: tuple[Path, ...]
+    group: str
+    group_path: Path
+    size_bytes: int
+
+
 def _expected_qt_platform_plugin() -> str:
     if sys.platform.startswith("linux"):
         return "libqxcb.so"
@@ -387,13 +396,12 @@ def _valid_group_id(group: Any) -> str:
     return text
 
 
-def prepare_duplicate_plan(
+def source_result_inventory(
     empro_module: Any,
-    project: Any,
     source: Any,
-    duplicate_name: str,
-) -> DuplicatePlan:
-    duplicate_name = validate_duplicate_name(duplicate_name, analysis_names(project))
+) -> SourceResultInventory:
+    """Read and validate the source analysis's complete public result mapping."""
+
     output = empro_module.output.AnalysisOutput(source)
     result_ids = tuple(str(value) for value in (output.getAvailableSimulationIds() or []))
     raw_result_paths = tuple(
@@ -432,38 +440,119 @@ def prepare_duplicate_plan(
             "RFPro reports result paths outside the source simulation group; "
             f"a complete copy cannot be guaranteed:\n  {details}"
         )
+    return SourceResultInventory(
+        result_ids=result_ids,
+        result_paths=result_paths,
+        group=source_group,
+        group_path=source_group_path,
+        size_bytes=directory_size(source_group_path),
+    )
+
+
+def prepare_duplicate_plan(
+    empro_module: Any,
+    project: Any,
+    source: Any,
+    duplicate_name: str,
+) -> DuplicatePlan:
+    duplicate_name = validate_duplicate_name(duplicate_name, analysis_names(project))
+    inventory = source_result_inventory(empro_module, source)
 
     duplicate_group = _valid_group_id(project.simulations.getNextSimulationGroup())
-    if duplicate_group == source_group:
+    if duplicate_group == inventory.group:
         raise RuntimeError(
             "RFPro returned the source analysis's existing simulation-group ID "
-            f"{source_group!r}; the duplicate was not created."
+            f"{inventory.group!r}; the duplicate was not created."
         )
-    duplicate_group_path = source_group_path.parent / duplicate_group
+    duplicate_group_path = inventory.group_path.parent / duplicate_group
     if duplicate_group_path.exists():
         raise FileExistsError(
             "RFPro's next simulation-group destination already exists. Nothing "
             f"was overwritten: {duplicate_group_path}"
         )
-    size = directory_size(source_group_path)
-    free = shutil.disk_usage(source_group_path.parent).free
-    if size > free:
+    free = shutil.disk_usage(inventory.group_path.parent).free
+    if inventory.size_bytes > free:
         raise OSError(
-            f"The result copy needs {_format_bytes(size)}, but only "
-            f"{_format_bytes(free)} is free beside {source_group_path}."
+            f"The result copy needs {_format_bytes(inventory.size_bytes)}, but only "
+            f"{_format_bytes(free)} is free beside {inventory.group_path}."
         )
 
     return DuplicatePlan(
         source_name=str(source.name),
         duplicate_name=duplicate_name,
-        source_group=source_group,
+        source_group=inventory.group,
         duplicate_group=duplicate_group,
-        source_group_path=source_group_path,
+        source_group_path=inventory.group_path,
         duplicate_group_path=duplicate_group_path,
-        registered_result_ids=result_ids,
-        registered_result_paths=result_paths,
-        source_size_bytes=size,
+        registered_result_ids=inventory.result_ids,
+        registered_result_paths=inventory.result_paths,
+        source_size_bytes=inventory.size_bytes,
     )
+
+
+def prepare_resume_plan(
+    empro_module: Any,
+    project: Any,
+    source: Any,
+    duplicate_name: str,
+) -> tuple[Any, DuplicatePlan]:
+    """Validate an existing preserved duplicate for refresh-only resumption."""
+
+    name = str(duplicate_name).strip()
+    names = analysis_names(project)
+    if name == str(source.name):
+        raise ValueError("The source analysis cannot resume itself as a duplicate.")
+    if name not in names:
+        raise ValueError(f"Existing duplicate analysis {name!r} was not found.")
+    duplicate = project.analyses[project.analyses.index(name)]
+    inventory = source_result_inventory(empro_module, source)
+    duplicate_group = _valid_group_id(getattr(duplicate, "simulationGroup", ""))
+    if duplicate_group == inventory.group:
+        raise RuntimeError(
+            "The existing analysis shares the source simulation group and is "
+            "not an independent preserved duplicate."
+        )
+
+    group_text = str(getattr(duplicate, "simulationGroupPath", "") or "").strip()
+    if not group_text:
+        raise RuntimeError(
+            f"Existing analysis {name!r} has no simulationGroupPath to resume."
+        )
+    reported_group_path = Path(group_text)
+    if reported_group_path.is_absolute():
+        duplicate_group_path = reported_group_path
+    elif os.path.normpath(group_text) == duplicate_group:
+        duplicate_group_path = inventory.group_path.parent / duplicate_group
+    else:
+        raise RuntimeError(
+            f"Existing analysis {name!r} reports an unsupported relative result "
+            f"group path: {group_text!r}."
+        )
+    if not duplicate_group_path.is_dir():
+        raise FileNotFoundError(
+            "The preserved duplicate result-group directory does not exist: "
+            f"{duplicate_group_path}"
+        )
+
+    plan = DuplicatePlan(
+        source_name=str(source.name),
+        duplicate_name=name,
+        source_group=inventory.group,
+        duplicate_group=duplicate_group,
+        source_group_path=inventory.group_path,
+        duplicate_group_path=duplicate_group_path,
+        registered_result_ids=inventory.result_ids,
+        registered_result_paths=inventory.result_paths,
+        source_size_bytes=directory_size(duplicate_group_path),
+    )
+    missing = [path for path in remapped_result_paths(plan) if not path.is_dir()]
+    if missing:
+        details = "\n  ".join(str(path) for path in missing)
+        raise RuntimeError(
+            "The preserved duplicate is missing copied result directories:\n  "
+            + details
+        )
+    return duplicate, plan
 
 
 def _format_bytes(size: int) -> str:
@@ -636,6 +725,15 @@ def process_rfpro_events(empro_module: Any) -> None:
         callback()
 
 
+def refresh_simulation_table(project: Any) -> None:
+    """Reload RFPro's Python simulation-list wrapper from its native table."""
+
+    callback = getattr(project.simulations, "refresh", None)
+    if not callable(callback):
+        raise RuntimeError("RFPro's SimulationList exposes no refresh() method.")
+    callback()
+
+
 def refresh_result_browser(empro_module: Any) -> None:
     """Reload saved output data after the result associations are created."""
 
@@ -733,10 +831,24 @@ def wait_for_duplicate_registration(
 
     while True:
         process_rfpro_events(empro_module)
+        simulation_refresh_error = ""
+        try:
+            refresh_simulation_table(project)
+        except Exception as error:
+            # The native table can be transiently inconsistent while its
+            # asynchronous creator publishes multiple records. Keep pumping
+            # events and retry instead of treating that intermediate mismatch
+            # as corruption or deleting the owning analysis.
+            simulation_refresh_error = str(error)
         try:
             records, record_paths = copied_result_records(project, plan)
         except Exception as error:
             last_detail = f"simulation-table inspection failed: {error}"
+            if simulation_refresh_error:
+                last_detail += (
+                    "; latest SimulationList.refresh() error: "
+                    + simulation_refresh_error
+                )
         else:
             active = active_simulation_descriptions(records)
             if active:
@@ -771,6 +883,11 @@ def wait_for_duplicate_registration(
                     f"expected={[str(path) for path in expected_paths]!r}; "
                     f"observed={[str(path) for path in record_paths]!r}"
                 )
+                if simulation_refresh_error:
+                    last_detail += (
+                        "; latest SimulationList.refresh() error: "
+                        + simulation_refresh_error
+                    )
 
         if time.monotonic() >= deadline:
             raise RuntimeError(
@@ -949,6 +1066,38 @@ def execute_confirmed_duplicate_plan(
     return execute_duplicate_plan(empro_module, project, source, plan)
 
 
+def resume_existing_duplicate_plan(
+    empro_module: Any,
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+) -> DuplicateResult:
+    """Refresh and verify a preserved duplicate without creating more records."""
+
+    active = running_simulation_descriptions(project)
+    if active:
+        details = "\n  ".join(active)
+        raise RuntimeError(
+            "Only inactive Created records can be resumed. Wait for or cancel "
+            f"active simulations first:\n  {details}"
+        )
+    project.saveActiveProject()
+    print(
+        f"Refreshing preserved duplicate {plan.duplicate_name!r}; waiting up to "
+        f"{DEFAULT_REGISTRATION_TIMEOUT_SECONDS:g} seconds for its existing "
+        "Created records and output association."
+    )
+    _records, verified_ids = wait_for_duplicate_registration(
+        empro_module,
+        project,
+        duplicate,
+        plan,
+        (),
+        timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
+    )
+    return DuplicateResult(duplicate, plan, verified_ids)
+
+
 def build_confirmation(plan: DuplicatePlan) -> str:
     return "\n".join(
         (
@@ -965,34 +1114,62 @@ def build_confirmation(plan: DuplicatePlan) -> str:
     )
 
 
+def build_resume_confirmation(plan: DuplicatePlan) -> str:
+    return "\n".join(
+        (
+            f"Source analysis: {plan.source_name}",
+            f"Existing duplicate: {plan.duplicate_name}",
+            f"Preserved result group: {plan.duplicate_group_path}",
+            f"Expected solved points: {len(plan.registered_result_ids)}",
+            "",
+            "RFPro's simulation table and output association will be refreshed.",
+            "No new simulation records will be requested or queued.",
+        )
+    )
+
+
 def _choose_duplicate_name(
     project: Any, source: Any, requested: str
 ) -> str | None:
     names = analysis_names(project)
     if requested:
-        return validate_duplicate_name(requested, names)
+        cleaned = str(requested).strip()
+        if not cleaned:
+            raise ValueError("The duplicate analysis name cannot be empty.")
+        return cleaned
     from PySide6.QtWidgets import QInputDialog
 
     suggested = default_duplicate_name(str(source.name), names)
     selected, accepted = QInputDialog.getText(
         None,
         "Duplicate RFPro analysis and results",
-        "New analysis name:",
+        "New analysis name, or existing incomplete copy to resume:",
         text=suggested,
     )
     if not accepted:
         return None
-    return validate_duplicate_name(str(selected), names)
+    cleaned = str(selected).strip()
+    if not cleaned:
+        raise ValueError("The duplicate analysis name cannot be empty.")
+    return cleaned
 
 
-def _confirm(plan: DuplicatePlan) -> bool:
+def _confirm(plan: DuplicatePlan, resume_existing: bool = False) -> bool:
     from PySide6.QtWidgets import QMessageBox
 
     return (
         QMessageBox.question(
             None,
-            "Duplicate RFPro analysis and solved data?",
-            build_confirmation(plan),
+            (
+                "Resume RFPro copied-results association?"
+                if resume_existing
+                else "Duplicate RFPro analysis and solved data?"
+            ),
+            (
+                build_resume_confirmation(plan)
+                if resume_existing
+                else build_confirmation(plan)
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1034,19 +1211,34 @@ def main(argv: Sequence[str] | None = None) -> None:
             "Wait for every RFPro simulation to finish before duplicating an "
             f"analysis and its results:\n  {details}"
         )
-    plan = prepare_duplicate_plan(empro, project, source, duplicate_name)
-    preview = build_confirmation(plan)
+    resume_existing = duplicate_name in analysis_names(project)
+    if resume_existing:
+        duplicate, plan = prepare_resume_plan(
+            empro, project, source, duplicate_name
+        )
+        preview = build_resume_confirmation(plan)
+    else:
+        plan = prepare_duplicate_plan(empro, project, source, duplicate_name)
+        preview = build_confirmation(plan)
     print(preview)
-    if not arguments.yes and not _confirm(plan):
+    if not arguments.yes and not _confirm(plan, resume_existing):
         print("Analysis duplication cancelled; no files or analyses were changed.")
         return
 
-    result = execute_confirmed_duplicate_plan(
-        empro,
-        project,
-        source,
-        plan,
-    )
+    if resume_existing:
+        result = resume_existing_duplicate_plan(
+            empro,
+            project,
+            duplicate,
+            plan,
+        )
+    else:
+        result = execute_confirmed_duplicate_plan(
+            empro,
+            project,
+            source,
+            plan,
+        )
     summary = (
         f"Created analysis {result.plan.duplicate_name!r} with independent "
         f"simulation group {result.plan.duplicate_group!r} and verified "
