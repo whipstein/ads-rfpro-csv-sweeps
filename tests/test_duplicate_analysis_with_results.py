@@ -126,9 +126,11 @@ class FakeSimulation:
         path: str,
         status: str = "Created",
         group: str = "",
+        parameters=None,
     ) -> None:
         self.path = path
         self.group_id = group
+        self.parameters = parameters
         self.isRunning = status in {"Queued", "Running"}
         self.status = status
         self.queue_calls = 0
@@ -138,6 +140,9 @@ class FakeSimulation:
 
     def group(self) -> str:
         return self.group_id
+
+    def getParameterValues(self):
+        return self.parameters
 
     def setQueued(self, _queued=True) -> None:
         self.queue_calls += 1
@@ -200,6 +205,14 @@ class FakeProject:
         status = "Queued" if add_to_queue else "Created"
         existing_paths = arguments[2]
         analysis = arguments[3]
+        if not existing_paths:
+            existing_paths = [
+                str(analysis.result_root / analysis.simulationGroup / simulation_id)
+                for simulation_id in ("000001", "000002")
+            ]
+            for path in existing_paths:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                (Path(path) / "created.placeholder").write_text("", encoding="utf-8")
         created = [FakeSimulation(path, status) for path in existing_paths]
         if self.async_delay_events:
             self.pending_registration = (created, analysis)
@@ -412,6 +425,10 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertTrue(
                 (copied / "000002" / "emds_dsn" / "design" / ".reusable").is_file()
             )
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir() if path.is_dir()),
+                ["000001", "000002"],
+            )
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             # Source mapping, duplicate/group assignment, then registrations.
@@ -422,7 +439,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(create_call[0:2], (False, False))
             self.assertEqual(
                 create_call[2],
-                [str(copied / "000001"), str(copied / "000002")],
+                [],
             )
             self.assertIs(create_call[3], result.duplicate)
             self.assertEqual(create_call[4:], ({}, {}))
@@ -463,6 +480,12 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
+            self.assertTrue(
+                (root / "000002" / "000001" / "created.placeholder").is_file()
+            )
+            self.assertTrue(
+                (root / "000002" / "000001" / ".reuse.hash").is_file()
+            )
             self.assertEqual(len(project.simulations), 2)
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
 
@@ -573,6 +596,79 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(duplicate.simulationGroup, "000002")
             self.assertEqual(len(project.create_calls), 0)
 
+    def test_split_group_resume_adopts_records_and_transplants_solved_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = "000002"
+            duplicate.results_registered = False
+            MODULE.copy_group_atomically(root / "000001", root / "000002")
+            for simulation_id in ("000001", "000002"):
+                target = root / "000003" / simulation_id
+                target.mkdir(parents=True)
+                (target / "created.placeholder").write_text("", encoding="utf-8")
+            simulations = AssociationRefreshSimulationList(
+                duplicate,
+                values=[
+                    FakeSimulation(
+                        str(root / "000001" / "000001"),
+                        group="000001",
+                        parameters={"width": "1 um"},
+                    ),
+                    FakeSimulation(
+                        str(root / "000001" / "000002"),
+                        group="000001",
+                        parameters={"width": "2 um"},
+                    ),
+                    FakeSimulation(
+                        str(root / "000003" / "000001"),
+                        group="000003",
+                        parameters={"width": "2 um"},
+                    ),
+                    FakeSimulation(
+                        str(root / "000003" / "000002"),
+                        group="000003",
+                        parameters={"width": "1 um"},
+                    ),
+                ],
+            )
+            project = FakeProject([source, duplicate], simulations=simulations)
+            empro = FakeEmpro()
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+
+            self.assertEqual(plan.duplicate_group, "000003")
+            self.assertEqual(plan.redundant_copied_group_path, root / "000002")
+            self.assertTrue(plan.transplant_source_results)
+
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(duplicate.simulationGroup, "000003")
+            self.assertTrue(
+                (root / "000003" / "000001" / ".reuse.hash").is_file()
+            )
+            self.assertEqual(
+                (root / "000003" / "000001" / ".reuse.hash").read_text(
+                    encoding="utf-8"
+                ),
+                "hash-000002",
+            )
+            self.assertTrue(
+                (root / "000003" / "000001" / "created.placeholder").is_file()
+            )
+            self.assertTrue((root / "000002" / "000001" / ".reuse.hash").is_file())
+            self.assertEqual(len(project.create_calls), 0)
+            self.assertFalse(
+                list((root / "000003").glob(".*.rfpro-created-*"))
+            )
+
     def test_ambiguous_empty_group_requires_explicit_resume_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -608,7 +704,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             empro = FakeEmpro(omit_duplicate=True)
 
             with mock.patch.object(MODULE, "DEFAULT_REGISTRATION_TIMEOUT_SECONDS", 0):
-                with self.assertRaisesRegex(RuntimeError, "did not expose the same"):
+                with self.assertRaisesRegex(RuntimeError, "expected number"):
                     MODULE.duplicate_analysis_with_results(
                         empro,
                         project,
@@ -618,6 +714,12 @@ class DuplicateAnalysisTests(unittest.TestCase):
 
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
+            self.assertTrue(
+                (root / "000002" / "000001" / "created.placeholder").is_file()
+            )
+            self.assertFalse(
+                (root / "000002" / "000001" / ".reuse.hash").exists()
+            )
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
             self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.simulations), 2)
@@ -661,7 +763,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
                     )
 
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
-            self.assertTrue((root / "000002").is_dir())
+            self.assertFalse((root / "000002").is_dir())
             self.assertEqual(project.save_calls, 2)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(project.create_calls[0][0], False)
@@ -675,7 +777,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             source = make_source(root)
             project = FakeProject([source], queue_on_create=True)
 
-            with self.assertRaisesRegex(RuntimeError, "no rollback was attempted"):
+            with self.assertRaisesRegex(RuntimeError, "records were preserved"):
                 MODULE.duplicate_analysis_with_results(
                     FakeEmpro(), project, source, "RF Setup Copy"
                 )

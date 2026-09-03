@@ -429,16 +429,26 @@ scripting.run(
 )
 ```
 
-The operation asks for a new analysis name and shows the source group, new
-group, registered-result count, and copy size before making changes. It uses
-the documented deep-copy `Analysis.clone()` API for the setup, obtains a new
-ID from `project.simulations.getNextSimulationGroup()`, copies the complete
-`simulationGroupPath` directory to that new sibling group, and registers the
-clone with `project.analyses.append()`. After saving that association, it asks
-RFPro to create nonqueued simulation records for the copied paths and then
-asks the documented output result browser to reload saved data. This produces
-an independent analysis and result tree; changing or deleting the duplicate
-does not reuse the source directory by reference.
+The operation asks for a new analysis name and shows the source group, proposed
+target group, registered-result count, and copy size before making changes. It
+uses the documented deep-copy `Analysis.clone()` API and the index returned by
+`project.analyses.append()` to work with RFPro's registered analysis object.
+It obtains a new ID from `project.simulations.getNextSimulationGroup()`, saves
+that association, and asks RFPro to create the cloned sweep's inactive target
+records with
+`project.createSimulationsFromAnalysis(False, False, [], analysis, ...)`.
+
+RFPro therefore owns creation of the final group and point paths. Only after
+every record has a **Created** status does the script copy each solved source
+point into its corresponding registered target path. It matches unique public
+parameter dictionaries when RFPro exposes them; otherwise the unchanged cloned
+sweep is mapped in simulation-ID order. Each target directory is copied to a
+private sibling staging path, the solved source data is overlaid there, and the
+merged directory is atomically swapped into place. This preserves target-only
+RFPro identity metadata. The original Created directory is retained as a backup
+until `AnalysisOutput` verifies the complete duplicate, then removed. A
+verification failure restores all Created-directory backups. The source is
+never modified.
 
 RFPro may expose the new `simulationGroupPath` as the project-relative value
 `./<group-id>` rather than as an absolute path. The verifier accepts that exact
@@ -447,48 +457,38 @@ before checking containment. The script does not assign the deprecated
 `Analysis.simulationPath` property; the distinct `simulationGroup` is the
 authoritative association.
 
-The directory copy includes hidden reuse metadata, mesh files, circuit-result
-files, logs, and any other saved artifacts in the source group. The operation
-does not queue or start a simulation. It refuses to proceed while any RFPro
-simulation is running or queued, when the source group is missing, when a
-registered result path falls outside the source group, when no solved result is
-registered, or when the proposed destination already exists. Enough free space
-for the complete uncompressed copy is required.
-
-Files are first copied to a private sibling staging directory and published
-under the new group name only after the copy completes. The script appends and
-saves the clone with its new `simulationGroup`, then uses RFPro's shipped
-`project.createSimulationsFromAnalysis(False, False, existingPaths, ...)`
-registration path. The first argument is deliberately `False`: Keysight's
-shipped workflows use that form to create simulation records and then call
-`setQueued(True)` separately only when they intend to run them. This script
-never makes that separate queue call. It rejects the result if any returned
-record is queued or running, or if its path differs from the copied path.
+The point copies include hidden reuse metadata, meshes, circuit results, logs,
+and every other saved artifact. The operation does not queue or start a
+simulation. The first creation argument is deliberately `False`; Keysight's
+shipped workflows call `setQueued(True)` separately when they intend to run a
+record, and this script never makes that call. It refuses to proceed while any
+simulation is active, when the source mapping is incomplete, when a source path
+falls outside its group, or when the proposed RFPro target already exists.
+Enough free space for the complete copy is required.
 
 In RFPro's newer backend this registration call can return an empty Python list
 while inactive records are still being created asynchronously. Empty therefore
 does not mean failure. The script processes RFPro events and waits up to
 `DEFAULT_REGISTRATION_TIMEOUT_SECONDS` (300 seconds by default) for every
-expected path to appear in `project.simulations`. Each poll calls the public
-`project.simulations.refresh()` method because RFPro's GUI can show newly
+expected Created record to appear in `project.simulations`. Each poll calls the
+public `project.simulations.refresh()` method because RFPro's GUI can show newly
 created records while the Python simulation-list wrapper is still stale.
 Temporary `SimulationsTable` count-mismatch errors during publication are
 retried. A **Created** status is the expected inactive state; it is not a
 running or queued solve.
 
-Once all records appear, the script saves them, refreshes with
-`empro.output.resultBrowser().refresh()`, and uses `AnalysisOutput` to verify
-that the duplicate exposes the same solved-result IDs and that every duplicate
-path exists under the copied group. Transient output-refresh delays are retried
-during the same wait.
+Once all target records appear and their solved data has been copied, the
+script saves them, refreshes with `empro.output.resultBrowser().refresh()`, and
+uses `AnalysisOutput` to verify that the duplicate exposes the expected result
+count and exactly the paths owned by its Created records. Transient
+output-refresh delays are retried.
 
-After a registration request has been sent, the script never automatically
-deletes the duplicate analysis, its records, or copied data, because RFPro may
-still be completing the request. A timeout therefore preserves everything for
-inspection and explicitly says not to run duplication again for that copy.
-Only failures occurring before registration is requested are rolled back. If a
-previous version left inactive orphan records after deleting their analysis,
-remove those **Created** entries from RFPro's Simulation window before retrying.
+After a target-creation request has been sent, the script never automatically
+deletes the duplicate analysis or its records because RFPro may still be
+completing the request. If solved data was already swapped into the targets and
+verification fails, their original Created directories are restored. A timeout
+therefore leaves an inactive, resumable duplicate instead of deleting its
+owner. Only failures before target creation are fully rolled back.
 
 If a timed-out attempt preserved both the duplicate analysis and its copied
 group, do not create another duplicate. Run the operation again with the
@@ -496,21 +496,19 @@ original source selected and enter the exact existing duplicate name in the
 name dialog. The operation recognizes that name as **resume existing**, refreshes
 and verifies its Created records, and does not call simulation creation again.
 
-An interrupted RFPro registration can leave that preserved analysis with an
-empty `simulationGroup` even though its Created records and copied result
-directory exist. Resume mode now recovers the group from the analysis path,
-the public `Simulation.group()`/`simulationPath()` records, or the only
-unassigned sibling directory containing every expected source-result path. It
-restores and saves the group assignment before refreshing output. If multiple
-abandoned copied groups match, the GUI asks which directory belongs to the
-duplicate instead of guessing. `DEFAULT_RESUME_GROUP_ID` or `--resume-group`
-can be used to supply that group ID explicitly.
+Older copy-first releases can leave two new directories: one contains the
+copied solved data, while a second RFPro-owned group contains the inactive
+Created records. Resume mode recognizes this split, adopts the record-owning
+group, and atomically copies the original solved points into those registered
+paths. The redundant earlier full-group copy is reported and left untouched.
+An empty `simulationGroup` is recovered from public `Simulation.group()` and
+`Simulation.simulationPath()` data. If several abandoned record groups match,
+the GUI asks which one belongs to the duplicate instead of guessing.
+`DEFAULT_RESUME_GROUP_ID` or `--resume-group` supplies an explicit group ID.
 
-For newly created duplicates, the script uses the index returned by the
-documented `AnalysisList.append()` method to reacquire RFPro's registered
-analysis object. This avoids continuing with a detached pre-append Python
-wrapper and reasserts the group if RFPro clears it while asynchronously
-publishing the Created records.
+New duplicates no longer pre-create or copy into the proposed group before
+RFPro registers it, so the copied data and RFPro records cannot be split across
+two newly allocated groups.
 
 For an explicit direct launch:
 

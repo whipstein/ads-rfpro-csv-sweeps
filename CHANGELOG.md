@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.16.0 - 2026-09-03
+
+- Reverse new duplication order so RFPro creates the inactive target group and
+  point paths before any solved data is copied. The old copy-first order could
+  produce one data directory and a second RFPro-owned registration directory.
+- Create target sweep records with an empty existing-path list and never call
+  `setQueued(True)`, then preserve target-only RFPro identity metadata, overlay
+  the matching solved source point, and atomically publish the merged directory.
+- Match source and target points by unique public parameter dictionaries when
+  available, with deterministic simulation-ID ordering for unchanged cloned
+  sweeps when RFPro does not expose those dictionaries.
+- Retain each original Created directory as a temporary backup until
+  `AnalysisOutput` verifies the complete target path set; restore all backups
+  if copying or verification fails.
+- Recover older split-group attempts by adopting the group that owns the
+  Created records and transplanting solved data into those registered paths.
+  The redundant earlier full-group copy is reported and left untouched.
+- Add coverage for RFPro-owned target creation, nonqueued data transplant,
+  parameter-based point matching, rollback safety, and split-group recovery.
+
 ## 0.15.9 - 2026-09-03
 
 - Recover a preserved duplicate whose analysis-tree object has an empty
