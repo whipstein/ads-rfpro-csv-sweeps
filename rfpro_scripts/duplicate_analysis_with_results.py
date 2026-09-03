@@ -25,6 +25,7 @@ from typing import Any, Callable, Sequence
 # Edit these defaults when RFPro's Run Script command cannot pass arguments.
 DEFAULT_ANALYSIS_NAME = ""
 DEFAULT_DUPLICATE_NAME = ""
+DEFAULT_RESUME_GROUP_ID = ""
 DEFAULT_REGISTRATION_TIMEOUT_SECONDS = 300.0
 REGISTRATION_POLL_INTERVAL_SECONDS = 0.1
 
@@ -65,6 +66,12 @@ class SourceResultInventory:
     group: str
     group_path: Path
     size_bytes: int
+
+
+class AmbiguousResumeGroupsError(RuntimeError):
+    def __init__(self, message: str, candidates: Sequence[Path]) -> None:
+        super().__init__(message)
+        self.candidates = tuple(candidates)
 
 
 def _expected_qt_platform_plugin() -> str:
@@ -396,6 +403,204 @@ def _valid_group_id(group: Any) -> str:
     return text
 
 
+def _optional_group_id(group: Any) -> str | None:
+    """Return a safe group ID, or None when RFPro exposes no usable value."""
+
+    text = str(group or "").strip()
+    if not text or text in {".", ".."} or Path(text).name != text:
+        return None
+    return text
+
+
+def _source_relative_result_paths(
+    inventory: SourceResultInventory,
+) -> tuple[Path, ...]:
+    return tuple(
+        Path(os.path.relpath(path, inventory.group_path))
+        for path in inventory.result_paths
+    )
+
+
+def _complete_resume_group_candidate(
+    path: Path,
+    inventory: SourceResultInventory,
+) -> bool:
+    """Require a sibling group containing every copied source-result path."""
+
+    if normalized_path(path.parent) != normalized_path(inventory.group_path.parent):
+        return False
+    if normalized_path(path) == normalized_path(inventory.group_path):
+        return False
+    if not path.is_dir():
+        return False
+    return all(
+        (path / relative_path).is_dir()
+        for relative_path in _source_relative_result_paths(inventory)
+    )
+
+
+def _analysis_owned_group_ids(project: Any, excluded_name: str) -> set[str]:
+    owned: set[str] = set()
+    for name in analysis_names(project):
+        if name == excluded_name:
+            continue
+        analysis = project.analyses[project.analyses.index(name)]
+        group = _optional_group_id(getattr(analysis, "simulationGroup", ""))
+        if group is not None:
+            owned.add(group)
+    return owned
+
+
+def _record_group_candidates(
+    project: Any,
+    inventory: SourceResultInventory,
+) -> set[Path]:
+    """Infer result-group roots from public Simulation.group/path values."""
+
+    root = inventory.group_path.parent
+    relatives = _source_relative_result_paths(inventory)
+    candidates: set[Path] = set()
+    for simulation in project.simulations:
+        group = _optional_group_id(
+            _call_or_value(getattr(simulation, "group", None), "")
+        )
+        if group is not None:
+            candidates.add(root / group)
+
+        path_text = str(
+            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+        ).strip()
+        if not path_text:
+            continue
+        reported = Path(path_text)
+        if reported.is_absolute():
+            for relative in relatives:
+                candidate = reported
+                for _part in relative.parts:
+                    candidate = candidate.parent
+                if normalized_path(candidate / relative) == normalized_path(reported):
+                    candidates.add(candidate)
+        else:
+            parts = Path(os.path.normpath(path_text)).parts
+            for relative in relatives:
+                count = len(relative.parts)
+                if len(parts) != count + 1 or tuple(parts[-count:]) != relative.parts:
+                    continue
+                candidates.add(root / parts[0])
+    return {
+        path
+        for path in candidates
+        if _optional_group_id(path.name) is not None
+        and _complete_resume_group_candidate(path, inventory)
+    }
+
+
+def recover_resume_group(
+    project: Any,
+    duplicate: Any,
+    inventory: SourceResultInventory,
+    requested_group: str = "",
+) -> tuple[str, Path]:
+    """Resolve an incomplete duplicate's copied group without guessing."""
+
+    root = inventory.group_path.parent
+    duplicate_name = str(duplicate.name)
+    requested = str(requested_group or "").strip()
+    current = _optional_group_id(getattr(duplicate, "simulationGroup", ""))
+    if requested:
+        requested = _valid_group_id(requested)
+        if current is not None and current != requested:
+            raise RuntimeError(
+                f"Existing analysis {duplicate_name!r} is already associated with "
+                f"group {current!r}, not requested resume group {requested!r}."
+            )
+        candidate = root / requested
+        if not _complete_resume_group_candidate(candidate, inventory):
+            raise RuntimeError(
+                f"Requested resume group {requested!r} does not contain every "
+                f"copied source-result directory: {candidate}"
+            )
+        return requested, candidate
+
+    group_path_text = str(
+        getattr(duplicate, "simulationGroupPath", "") or ""
+    ).strip()
+    metadata_path: Path | None = None
+    if group_path_text:
+        reported = Path(group_path_text)
+        if reported.is_absolute():
+            candidate = reported
+        else:
+            normalized = Path(os.path.normpath(group_path_text))
+            candidate = root / normalized if len(normalized.parts) == 1 else Path()
+        if (
+            candidate != Path()
+            and _optional_group_id(candidate.name) is not None
+            and _complete_resume_group_candidate(candidate, inventory)
+        ):
+            metadata_path = candidate
+
+    if current is not None:
+        candidate = root / current
+        if metadata_path is not None and normalized_path(metadata_path) != normalized_path(
+            candidate
+        ):
+            raise RuntimeError(
+                f"Existing analysis {duplicate_name!r} reports conflicting result "
+                f"metadata: simulationGroup={current!r}, "
+                f"simulationGroupPath={group_path_text!r}."
+            )
+        if not _complete_resume_group_candidate(candidate, inventory):
+            raise RuntimeError(
+                f"Existing analysis {duplicate_name!r} points to incomplete or "
+                f"missing copied result group {candidate}."
+            )
+        return current, candidate
+    if metadata_path is not None:
+        return metadata_path.name, metadata_path
+
+    owned = _analysis_owned_group_ids(project, duplicate_name)
+    record_candidates = {
+        path
+        for path in _record_group_candidates(project, inventory)
+        if path.name not in owned
+    }
+    if len(record_candidates) == 1:
+        candidate = next(iter(record_candidates))
+        return candidate.name, candidate
+    if len(record_candidates) > 1:
+        candidates = tuple(sorted(record_candidates, key=lambda path: str(path)))
+        raise AmbiguousResumeGroupsError(
+            f"Existing analysis {duplicate_name!r} has an empty simulationGroup, "
+            "and multiple Created-record groups match its copied results: "
+            f"{[str(path) for path in candidates]!r}.",
+            candidates,
+        )
+
+    filesystem_candidates = {
+        path
+        for path in root.iterdir()
+        if path.name.isdigit()
+        and path.name not in owned
+        and _complete_resume_group_candidate(path, inventory)
+    }
+    if len(filesystem_candidates) == 1:
+        candidate = next(iter(filesystem_candidates))
+        return candidate.name, candidate
+    candidates = tuple(sorted(filesystem_candidates, key=lambda path: str(path)))
+    if candidates:
+        raise AmbiguousResumeGroupsError(
+            f"Existing analysis {duplicate_name!r} has an empty simulationGroup, "
+            "and multiple unassigned copied groups match: "
+            f"{[str(path) for path in candidates]!r}.",
+            candidates,
+        )
+    raise RuntimeError(
+        f"Existing analysis {duplicate_name!r} has an empty simulationGroup, and "
+        "no unassigned sibling group contains every expected result directory."
+    )
+
+
 def source_result_inventory(
     empro_module: Any,
     source: Any,
@@ -418,14 +623,24 @@ def source_result_inventory(
             f"{len(result_ids)} simulation IDs and {len(raw_result_paths)} paths. "
             "Run the analysis reuse diagnostic before duplicating it."
         )
-    source_group = _valid_group_id(getattr(source, "simulationGroup", ""))
-    source_group_text = str(getattr(source, "simulationGroupPath", "") or "").strip()
-    if not source_group_text:
+    source_group_text = str(getattr(source, "simulationGroup", "") or "").strip()
+    source_group = _optional_group_id(source_group_text)
+    if source_group is None:
+        raise RuntimeError(
+            f"Source analysis {source.name!r} has an empty or invalid "
+            f"simulationGroup ({source_group_text!r}). When resuming a preserved "
+            "copy, select the original solved analysis as the source, then enter "
+            "the incomplete duplicate's exact name in the next dialog."
+        )
+    source_group_path_text = str(
+        getattr(source, "simulationGroupPath", "") or ""
+    ).strip()
+    if not source_group_path_text:
         raise RuntimeError(
             f"Analysis {source.name!r} has no simulationGroupPath. Run and save "
             "the analysis before duplicating its solved data."
         )
-    source_group_path = Path(source_group_text)
+    source_group_path = Path(source_group_path_text)
     if not source_group_path.is_dir():
         raise FileNotFoundError(
             f"The source simulation-group directory does not exist: {source_group_path}"
@@ -495,6 +710,7 @@ def prepare_resume_plan(
     project: Any,
     source: Any,
     duplicate_name: str,
+    resume_group: str = "",
 ) -> tuple[Any, DuplicatePlan]:
     """Validate an existing preserved duplicate for refresh-only resumption."""
 
@@ -506,32 +722,16 @@ def prepare_resume_plan(
         raise ValueError(f"Existing duplicate analysis {name!r} was not found.")
     duplicate = project.analyses[project.analyses.index(name)]
     inventory = source_result_inventory(empro_module, source)
-    duplicate_group = _valid_group_id(getattr(duplicate, "simulationGroup", ""))
+    duplicate_group, duplicate_group_path = recover_resume_group(
+        project,
+        duplicate,
+        inventory,
+        resume_group,
+    )
     if duplicate_group == inventory.group:
         raise RuntimeError(
             "The existing analysis shares the source simulation group and is "
             "not an independent preserved duplicate."
-        )
-
-    group_text = str(getattr(duplicate, "simulationGroupPath", "") or "").strip()
-    if not group_text:
-        raise RuntimeError(
-            f"Existing analysis {name!r} has no simulationGroupPath to resume."
-        )
-    reported_group_path = Path(group_text)
-    if reported_group_path.is_absolute():
-        duplicate_group_path = reported_group_path
-    elif os.path.normpath(group_text) == duplicate_group:
-        duplicate_group_path = inventory.group_path.parent / duplicate_group
-    else:
-        raise RuntimeError(
-            f"Existing analysis {name!r} reports an unsupported relative result "
-            f"group path: {group_text!r}."
-        )
-    if not duplicate_group_path.is_dir():
-        raise FileNotFoundError(
-            "The preserved duplicate result-group directory does not exist: "
-            f"{duplicate_group_path}"
         )
 
     plan = DuplicatePlan(
@@ -734,6 +934,33 @@ def refresh_simulation_table(project: Any) -> None:
     callback()
 
 
+def ensure_duplicate_group_binding(
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+) -> bool:
+    """Restore a missing group assignment on RFPro's registered analysis object."""
+
+    current_text = str(getattr(duplicate, "simulationGroup", "") or "").strip()
+    current = _optional_group_id(current_text)
+    if current == plan.duplicate_group:
+        return False
+    if current_text:
+        raise RuntimeError(
+            f"Duplicate analysis {plan.duplicate_name!r} changed to unexpected "
+            f"simulation group {current_text!r}; expected {plan.duplicate_group!r}."
+        )
+    with project:
+        duplicate.simulationGroup = plan.duplicate_group
+    restored = _optional_group_id(getattr(duplicate, "simulationGroup", ""))
+    if restored != plan.duplicate_group:
+        raise RuntimeError(
+            f"RFPro did not retain the recovered simulation-group assignment "
+            f"{plan.duplicate_group!r} on analysis {plan.duplicate_name!r}."
+        )
+    return True
+
+
 def refresh_result_browser(empro_module: Any) -> None:
     """Reload saved output data after the result associations are created."""
 
@@ -863,9 +1090,16 @@ def wait_for_duplicate_registration(
             )
             if observed_normalized == expected_normalized:
                 verify_nonqueued_registration(records, plan)
-                if not records_saved:
+                binding_restored = ensure_duplicate_group_binding(
+                    project,
+                    duplicate,
+                    plan,
+                )
+                if not records_saved or binding_restored:
                     # Persist the asynchronously created records before asking
                     # the output layer to associate them with the duplicate.
+                    # RFPro can clear a clone's group while publishing those
+                    # records, so reassert it on the registered analysis first.
                     project.saveActiveProject()
                     records_saved = True
                 try:
@@ -918,8 +1152,14 @@ def execute_duplicate_plan(
         end_creation_lifecycle = begin_simulation_creation_lifecycle(project)
         try:
             with project:
-                project.analyses.append(duplicate)
+                appended_index = project.analyses.append(duplicate)
             appended = True
+            # AnalysisList.append() publicly returns the index of the object
+            # registered in RFPro. Continue with that authoritative object;
+            # the pre-append clone can be detached from the analysis tree.
+            duplicate = project.analyses[appended_index]
+            with project:
+                duplicate.simulationGroup = plan.duplicate_group
             project.saveActiveProject()
             registration_attempted = True
             registered = register_duplicate_results(project, duplicate, plan)
@@ -1082,6 +1322,10 @@ def resume_existing_duplicate_plan(
             f"active simulations first:\n  {details}"
         )
     project.saveActiveProject()
+    if ensure_duplicate_group_binding(project, duplicate, plan):
+        # Persist the recovered association before refreshing the native
+        # simulation table and output browser.
+        project.saveActiveProject()
     print(
         f"Refreshing preserved duplicate {plan.duplicate_name!r}; waiting up to "
         f"{DEFAULT_REGISTRATION_TIMEOUT_SECONDS:g} seconds for its existing "
@@ -1119,6 +1363,7 @@ def build_resume_confirmation(plan: DuplicatePlan) -> str:
         (
             f"Source analysis: {plan.source_name}",
             f"Existing duplicate: {plan.duplicate_name}",
+            f"Recovered simulation group: {plan.duplicate_group}",
             f"Preserved result group: {plan.duplicate_group_path}",
             f"Expected solved points: {len(plan.registered_result_ids)}",
             "",
@@ -1177,12 +1422,30 @@ def _confirm(plan: DuplicatePlan, resume_existing: bool = False) -> bool:
     )
 
 
+def _choose_resume_group(candidates: Sequence[Path]) -> str | None:
+    from PySide6.QtWidgets import QInputDialog
+
+    labels = [str(path) for path in candidates]
+    selected, accepted = QInputDialog.getItem(
+        None,
+        "Recover RFPro duplicate result group",
+        "Multiple copied groups match. Select the group created for this duplicate:",
+        labels,
+        0,
+        False,
+    )
+    if not accepted:
+        return None
+    return Path(str(selected)).name
+
+
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Duplicate an RFPro analysis and its saved result group."
     )
     parser.add_argument("--analysis", default=DEFAULT_ANALYSIS_NAME)
     parser.add_argument("--new-name", default=DEFAULT_DUPLICATE_NAME)
+    parser.add_argument("--resume-group", default=DEFAULT_RESUME_GROUP_ID)
     parser.add_argument("--yes", action="store_true", help="copy without confirmation")
     arguments, unknown = parser.parse_known_args(argv)
     if unknown:
@@ -1213,9 +1476,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     resume_existing = duplicate_name in analysis_names(project)
     if resume_existing:
-        duplicate, plan = prepare_resume_plan(
-            empro, project, source, duplicate_name
-        )
+        try:
+            duplicate, plan = prepare_resume_plan(
+                empro,
+                project,
+                source,
+                duplicate_name,
+                arguments.resume_group,
+            )
+        except AmbiguousResumeGroupsError as error:
+            selected_group = _choose_resume_group(error.candidates)
+            if selected_group is None:
+                print("Duplicate recovery cancelled; nothing was changed.")
+                return
+            duplicate, plan = prepare_resume_plan(
+                empro,
+                project,
+                source,
+                duplicate_name,
+                selected_group,
+            )
         preview = build_resume_confirmation(plan)
     else:
         plan = prepare_duplicate_plan(empro, project, source, duplicate_name)
@@ -1240,7 +1520,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             plan,
         )
     summary = (
-        f"Created analysis {result.plan.duplicate_name!r} with independent "
+        f"{'Recovered' if resume_existing else 'Created'} analysis "
+        f"{result.plan.duplicate_name!r} with independent "
         f"simulation group {result.plan.duplicate_group!r} and verified "
         f"{len(result.verified_result_ids)} solved result(s). No simulation was started."
     )

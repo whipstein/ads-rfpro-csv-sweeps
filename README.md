@@ -496,6 +496,22 @@ original source selected and enter the exact existing duplicate name in the
 name dialog. The operation recognizes that name as **resume existing**, refreshes
 and verifies its Created records, and does not call simulation creation again.
 
+An interrupted RFPro registration can leave that preserved analysis with an
+empty `simulationGroup` even though its Created records and copied result
+directory exist. Resume mode now recovers the group from the analysis path,
+the public `Simulation.group()`/`simulationPath()` records, or the only
+unassigned sibling directory containing every expected source-result path. It
+restores and saves the group assignment before refreshing output. If multiple
+abandoned copied groups match, the GUI asks which directory belongs to the
+duplicate instead of guessing. `DEFAULT_RESUME_GROUP_ID` or `--resume-group`
+can be used to supply that group ID explicitly.
+
+For newly created duplicates, the script uses the index returned by the
+documented `AnalysisList.append()` method to reacquire RFPro's registered
+analysis object. This avoids continuing with a detached pre-append Python
+wrapper and reasserts the group if RFPro clears it while asynchronously
+publishing the Created records.
+
 For an explicit direct launch:
 
 ```python
@@ -514,6 +530,7 @@ Useful options:
 ```text
 --analysis NAME
 --new-name NAME
+--resume-group GROUP_ID
 --yes
 ```
 

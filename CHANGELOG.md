@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.9 - 2026-09-03
+
+- Recover a preserved duplicate whose analysis-tree object has an empty
+  `simulationGroup`, using its valid `simulationGroupPath`, public
+  `Simulation.group()`/`simulationPath()` records, or a unique unassigned
+  sibling group containing every expected copied result.
+- Restore and save the recovered `simulationGroup` before refreshing output;
+  this remains a nonqueued recovery and does not create another simulation.
+- Prompt for the intended copied group when multiple abandoned groups match,
+  with `DEFAULT_RESUME_GROUP_ID` and `--resume-group` available as explicit
+  overrides.
+- Continue new duplications with the authoritative analysis object returned by
+  the documented `AnalysisList.append()` index, then reassert the group if
+  RFPro clears it while asynchronously publishing Created records.
+- Add regression coverage for empty-group recovery, ambiguous copied groups,
+  explicit group selection, and detached pre-append analysis wrappers.
+
 ## 0.15.8 - 2026-09-03
 
 - Refresh the public `project.simulations` wrapper on every asynchronous wait

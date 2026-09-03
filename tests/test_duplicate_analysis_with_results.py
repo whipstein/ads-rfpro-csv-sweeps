@@ -75,6 +75,17 @@ class FakeAnalyses:
         del self.values[index]
 
 
+class CopyingFakeAnalyses(FakeAnalyses):
+    """Model a binding that registers a different wrapper than it receives."""
+
+    def append(self, value) -> int:
+        registered = value.clone()
+        registered.name = value.name
+        registered.simulationGroup = value.simulationGroup
+        self.values.append(registered)
+        return len(self.values) - 1
+
+
 class FakeSimulationList(list):
     def __init__(
         self,
@@ -110,14 +121,23 @@ class AssociationRefreshSimulationList(FakeSimulationList):
 
 
 class FakeSimulation:
-    def __init__(self, path: str, status: str = "Created") -> None:
+    def __init__(
+        self,
+        path: str,
+        status: str = "Created",
+        group: str = "",
+    ) -> None:
         self.path = path
+        self.group_id = group
         self.isRunning = status in {"Queued", "Running"}
         self.status = status
         self.queue_calls = 0
 
     def simulationPath(self) -> str:
         return self.path
+
+    def group(self) -> str:
+        return self.group_id
 
     def setQueued(self, _queued=True) -> None:
         self.queue_calls += 1
@@ -413,6 +433,23 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.invalidate_calls, 1)
             self.assertFalse(project.modified_state_cached)
 
+    def test_append_reacquires_rfpro_registered_analysis_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source])
+            project.analyses = CopyingFakeAnalyses([source])
+            project.saved_analysis_count = 1
+
+            result = MODULE.duplicate_analysis_with_results(
+                FakeEmpro(), project, source, "RF Setup Copy"
+            )
+
+            registered = project.analyses[1]
+            self.assertIs(result.duplicate, registered)
+            self.assertIs(project.create_calls[0][3], registered)
+            self.assertEqual(registered.simulationGroup, "000002")
+
     def test_empty_return_succeeds_when_created_records_appear_in_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -499,6 +536,69 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(len(project.create_calls), 0)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+
+    def test_empty_group_resume_recovers_created_record_group_and_rebinds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = ""
+            MODULE.copy_group_atomically(root / "000001", root / "000002")
+            simulations = AssociationRefreshSimulationList(
+                duplicate,
+                values=[
+                    FakeSimulation(
+                        str(root / "000002" / "000001"), group="000002"
+                    ),
+                    FakeSimulation(
+                        str(root / "000002" / "000002"), group="000002"
+                    ),
+                ],
+            )
+            project = FakeProject([source, duplicate], simulations=simulations)
+            empro = FakeEmpro()
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+            self.assertEqual(plan.duplicate_group, "000002")
+            self.assertEqual(duplicate.simulationGroup, "")
+
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(duplicate.simulationGroup, "000002")
+            self.assertEqual(len(project.create_calls), 0)
+
+    def test_ambiguous_empty_group_requires_explicit_resume_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = ""
+            MODULE.copy_group_atomically(root / "000001", root / "000002")
+            MODULE.copy_group_atomically(root / "000001", root / "000003")
+            project = FakeProject([source, duplicate])
+            empro = FakeEmpro()
+
+            with self.assertRaisesRegex(RuntimeError, "multiple unassigned copied"):
+                MODULE.prepare_resume_plan(
+                    empro, project, source, "RF Setup Copy"
+                )
+
+            _resumed, plan = MODULE.prepare_resume_plan(
+                empro,
+                project,
+                source,
+                "RF Setup Copy",
+                "000003",
+            )
+            self.assertEqual(plan.duplicate_group, "000003")
+            self.assertEqual(plan.duplicate_group_path, root / "000003")
 
     def test_registered_result_mismatch_preserves_association_for_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -634,6 +734,21 @@ class DuplicateAnalysisTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no registered solved results"):
                 MODULE.prepare_duplicate_plan(
                     EmptyEmpro(), project, source, "RF Setup Copy"
+                )
+
+    def test_empty_source_group_reports_wrong_resume_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            source.simulationGroup = ""
+            project = FakeProject([source])
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "select the original solved analysis as the source",
+            ):
+                MODULE.prepare_duplicate_plan(
+                    FakeEmpro(), project, source, "RF Setup Copy"
                 )
 
     def test_confirmation_is_required_by_default(self) -> None:
