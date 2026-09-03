@@ -435,10 +435,10 @@ the documented deep-copy `Analysis.clone()` API for the setup, obtains a new
 ID from `project.simulations.getNextSimulationGroup()`, copies the complete
 `simulationGroupPath` directory to that new sibling group, and registers the
 clone with `project.analyses.append()`. After saving that association, it asks
-the documented RFPro output result browser to reload saved data. This produces
-an independent analysis and result tree when RFPro recognizes the copied
-group; changing or deleting the duplicate does not reuse the source directory
-by reference.
+RFPro to create nonqueued simulation records for the copied paths and then
+asks the documented output result browser to reload saved data. This produces
+an independent analysis and result tree; changing or deleting the duplicate
+does not reuse the source directory by reference.
 
 RFPro may expose the new `simulationGroupPath` as the project-relative value
 `./<group-id>` rather than as an absolute path. The verifier accepts that exact
@@ -449,29 +449,32 @@ authoritative association.
 
 The directory copy includes hidden reuse metadata, mesh files, circuit-result
 files, logs, and any other saved artifacts in the source group. The operation
-does not create, start, queue, or remove simulation records. It refuses to
-proceed while any RFPro simulation is running or queued, when the source group
-is missing, when a registered result path falls outside the source group, when
-no solved result is registered, or when the proposed destination already
-exists. Enough free space for the complete uncompressed copy is required.
+does not queue or start a simulation. It refuses to proceed while any RFPro
+simulation is running or queued, when the source group is missing, when a
+registered result path falls outside the source group, when no solved result is
+registered, or when the proposed destination already exists. Enough free space
+for the complete uncompressed copy is required.
 
 Files are first copied to a private sibling staging directory and published
 under the new group name only after the copy completes. The script appends and
-saves the clone with its new `simulationGroup`, then calls the documented
-`empro.output.resultBrowser().refresh()` output-data reload. It deliberately
-does not call `project.createSimulationsFromAnalysis()`, `setQueued()`, or any
-simulation-list mutation: the former can launch asynchronous backend work in
-RFPro even when its Python return is empty.
+saves the clone with its new `simulationGroup`, then uses RFPro's shipped
+`project.createSimulationsFromAnalysis(False, False, existingPaths, ...)`
+registration path. The first argument is deliberately `False`: Keysight's
+shipped workflows use that form to create simulation records and then call
+`setQueued(True)` separately only when they intend to run them. This script
+never makes that separate queue call. It rejects the result if any returned
+record is queued or running, or if its path differs from the copied path.
 
-The script then uses `empro.output.AnalysisOutput` to verify that the refreshed
-duplicate exposes the same solved-result IDs and that every duplicate path
-exists under the copied group. If RFPro cannot discover the copied group using
-the read-only output refresh, the operation fails safely instead of creating a
-simulation. A failed refresh or verification rolls back the cloned analysis,
-saves its removal, removes the copied result directory, and refreshes the
-output browser again while leaving the source untouched. If the analysis
-rollback itself cannot be saved, the copied directory is preserved to avoid a
-saved analysis pointing at deleted data.
+After refreshing with `empro.output.resultBrowser().refresh()`, the script uses
+`empro.output.AnalysisOutput` to verify that the duplicate exposes the same
+solved-result IDs and that every duplicate path exists under the copied group.
+A failed nonqueued registration, refresh, or verification removes only the new
+inactive simulation records, rolls back the cloned analysis, saves its
+removal, and removes the copied result directory while leaving the source
+untouched. If RFPro unexpectedly reports an active record despite the false
+queue flag, the script performs no destructive rollback: it preserves the
+duplicate analysis and copied directory and tells the user to cancel the job
+first, preventing another orphaned simulation.
 
 For an explicit direct launch:
 

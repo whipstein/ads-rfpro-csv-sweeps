@@ -2,9 +2,9 @@
 
 Run this script inside RFPro. It deep-clones the selected Analysis, allocates a
 new simulation-group ID, copies the source group directory without modifying
-it, saves the cloned Analysis, refreshes RFPro's output result browser, and
-verifies its public AnalysisOutput paths. It never creates, starts, queues, or
-removes a simulation record.
+it, creates nonqueued simulation-table associations for the copied paths,
+refreshes RFPro's output result browser, and verifies its public AnalysisOutput
+paths. It never queues or starts a simulation.
 """
 
 from __future__ import annotations
@@ -281,24 +281,47 @@ def _call_or_value(value: Any, default: Any = None) -> Any:
         return default
 
 
-def running_simulation_descriptions(project: Any) -> list[str]:
-    """Return public simulation entries that are running or waiting to run."""
+def active_simulation_descriptions(simulations: Sequence[Any]) -> list[str]:
+    """Describe simulation records that are running or waiting to run."""
 
     active: list[str] = []
-    active_status_words = ("queue", "pending", "submit", "start", "running", "solving")
-    for index, simulation in enumerate(project.simulations):
+    active_status_prefixes = (
+        "queue",
+        "pending",
+        "submit",
+        "start",
+        "running",
+        "solving",
+        "preprocess",
+        "meshing",
+        "postprocess",
+        "interrupt",
+        "killing",
+    )
+    for index, simulation in enumerate(simulations):
         is_running = bool(_call_or_value(getattr(simulation, "isRunning", None), False))
         has_running_status = bool(
             _call_or_value(getattr(simulation, "hasRunningStatus", None), False)
         )
         status = str(_call_or_value(getattr(simulation, "status", None), "") or "")
-        status_is_active = any(word in status.casefold() for word in active_status_words)
+        status_key = (
+            status.casefold().replace(" ", "").replace("_", "").rsplit(".", 1)[-1]
+        )
+        status_is_active = any(
+            status_key.startswith(prefix) for prefix in active_status_prefixes
+        )
         if not (is_running or has_running_status or status_is_active):
             continue
         name = str(getattr(simulation, "name", "") or f"simulation {index + 1}")
         path = str(_call_or_value(getattr(simulation, "simulationPath", None), "") or "")
         active.append(f"{name} (status={status or 'active'}, path={path or 'unknown'})")
     return active
+
+
+def running_simulation_descriptions(project: Any) -> list[str]:
+    """Return public simulation entries that are running or waiting to run."""
+
+    return active_simulation_descriptions(list(project.simulations))
 
 
 def normalized_path(path: Path) -> str:
@@ -476,8 +499,144 @@ def clone_analysis_for_plan(source: Any, plan: DuplicatePlan) -> Any:
     return duplicate
 
 
+def remapped_result_paths(plan: DuplicatePlan) -> tuple[Path, ...]:
+    """Map every source result path to the same location in the copied group."""
+
+    return tuple(
+        plan.duplicate_group_path
+        / Path(os.path.relpath(path, plan.source_group_path))
+        for path in plan.registered_result_paths
+    )
+
+
+def begin_simulation_creation_lifecycle(project: Any) -> Callable[[], Any]:
+    """Enter the modified-state guard used by RFPro's shipped runAnalysis."""
+
+    cache = getattr(project, "_cacheProjectModifiedBeforeRunAnalysis", None)
+    invalidate = getattr(project, "_invalidateProjectModifiedBeforeRunAnalysis", None)
+    if not callable(cache) or not callable(invalidate):
+        raise RuntimeError(
+            "This RFPro runtime does not expose the project modified-state "
+            "lifecycle required for nonqueued result registration."
+        )
+    cache()
+    return invalidate
+
+
+def register_duplicate_results(
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+) -> tuple[Any, ...]:
+    """Create result associations without adding any simulation to the queue.
+
+    RFPro's shipped workflows use the first ``False`` argument when records
+    must be created before a later, explicit ``setQueued(True)`` call.  This
+    operation intentionally performs only that nonqueued creation step.
+    """
+
+    expected_paths = remapped_result_paths(plan)
+    missing = [path for path in expected_paths if not path.is_dir()]
+    if missing:
+        details = "\n  ".join(str(path) for path in missing)
+        raise RuntimeError(
+            "Copied result paths are missing before RFPro registration:\n  "
+            + details
+        )
+    try:
+        simulations = project.createSimulationsFromAnalysis(
+            False,
+            False,
+            [str(path) for path in expected_paths],
+            duplicate,
+            {},
+            {},
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "RFPro could not create nonqueued result associations for the "
+            f"duplicate analysis: {error}"
+        ) from error
+
+    registered = tuple(simulations or ())
+    if not registered:
+        raise RuntimeError(
+            "RFPro returned no simulation records while creating the "
+            "nonqueued copied-result associations."
+        )
+    return registered
+
+
+def verify_nonqueued_registration(
+    registered: Sequence[Any],
+    plan: DuplicatePlan,
+) -> None:
+    """Require the returned records to be inactive and point at the copy."""
+
+    expected_paths = remapped_result_paths(plan)
+    active = active_simulation_descriptions(registered)
+    if active:
+        details = "\n  ".join(active)
+        raise RuntimeError(
+            "RFPro unexpectedly queued or started a copied-result record even "
+            f"though addToQueue was False:\n  {details}"
+        )
+
+    registered_paths: list[Path] = []
+    for simulation in registered:
+        path_text = str(
+            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+        ).strip()
+        if not path_text:
+            raise RuntimeError(
+                "RFPro returned a nonqueued simulation record without a "
+                "simulation path."
+            )
+        registered_paths.append(
+            resolve_result_path(Path(path_text), plan.duplicate_group_path)
+        )
+
+    expected_normalized = sorted(normalized_path(path) for path in expected_paths)
+    registered_normalized = sorted(normalized_path(path) for path in registered_paths)
+    if registered_normalized != expected_normalized:
+        raise RuntimeError(
+            "RFPro associated different paths than the copied results. "
+            f"Expected={[str(path) for path in expected_paths]!r}; "
+            f"registered={[str(path) for path in registered_paths]!r}."
+        )
+
+
+def remove_duplicate_simulation_registrations(project: Any, plan: DuplicatePlan) -> int:
+    """Remove only inactive records whose paths are inside the copied group."""
+
+    indexes: list[int] = []
+    records: list[Any] = []
+    for index, simulation in enumerate(project.simulations):
+        text = str(
+            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+        ).strip()
+        if not text:
+            continue
+        path = resolve_result_path(Path(text), plan.duplicate_group_path)
+        if path_is_within(path, plan.duplicate_group_path):
+            indexes.append(index)
+            records.append(simulation)
+    active = active_simulation_descriptions(records)
+    if active:
+        details = "\n  ".join(active)
+        raise RuntimeError(
+            "refusing to remove active copied-result records:\n  " + details
+        )
+    if not indexes:
+        return 0
+    with project:
+        for index in reversed(indexes):
+            del project.simulations[index]
+    return len(indexes)
+
+
 def refresh_result_browser(empro_module: Any) -> None:
-    """Reload saved output data without creating or changing simulations."""
+    """Reload saved output data after the result associations are created."""
 
     try:
         browser = empro_module.output.resultBrowser()
@@ -552,39 +711,73 @@ def execute_duplicate_plan(
     source: Any,
     plan: DuplicatePlan,
 ) -> DuplicateResult:
-    """Copy and expose a previously validated duplicate plan."""
+    """Copy and register a previously validated duplicate plan without queueing."""
 
     duplicate = clone_analysis_for_plan(source, plan)
     copy_group_atomically(plan.source_group_path, plan.duplicate_group_path)
 
     appended = False
+    registration_attempted = False
+    registered: tuple[Any, ...] = ()
     try:
-        with project:
-            project.analyses.append(duplicate)
-        appended = True
-        # Persist the analysis/group association before the output layer
-        # rescans the copied result tree. ResultBrowser.refresh() is read-only;
-        # unlike createSimulationsFromAnalysis(), it cannot launch backend work.
-        project.saveActiveProject()
+        # RFPro's public runAnalysis() uses this guard around simulation-record
+        # creation. The duplicate is saved before creation so the backend sees
+        # a persistent analysis/group association.
+        end_creation_lifecycle = begin_simulation_creation_lifecycle(project)
+        try:
+            with project:
+                project.analyses.append(duplicate)
+            appended = True
+            project.saveActiveProject()
+            registration_attempted = True
+            registered = register_duplicate_results(project, duplicate, plan)
+            verify_nonqueued_registration(registered, plan)
+        finally:
+            end_creation_lifecycle()
         refresh_result_browser(empro_module)
         verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
+        project.saveActiveProject()
     except Exception as error:
+        # The operation began with no active simulations. If RFPro nevertheless
+        # started one, preserve its analysis and files so it cannot become an
+        # orphaned backend job like a queued registration attempt would.
+        new_active = active_simulation_descriptions(registered)
+        for description in running_simulation_descriptions(project):
+            if description not in new_active:
+                new_active.append(description)
+        if new_active:
+            details = "\n  ".join(new_active)
+            raise RuntimeError(
+                f"Analysis duplication failed: {error}. RFPro now reports an "
+                "active simulation, so no rollback was attempted. Cancel it "
+                "before removing the preserved duplicate analysis or copied "
+                f"result group {plan.duplicate_group_path}:\n  {details}"
+            ) from error
+
         rollback_errors: list[str] = []
+        simulation_rollback_succeeded = not registration_attempted
+        if registration_attempted:
+            try:
+                remove_duplicate_simulation_registrations(project, plan)
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    f"simulation-record rollback failed: {rollback_error}"
+                )
+            else:
+                simulation_rollback_succeeded = True
+
         analysis_rollback_succeeded = not appended
-        if appended:
+        if appended and simulation_rollback_succeeded:
             try:
                 with project:
                     del project.analyses[project.analyses.index(plan.duplicate_name)]
-            except Exception as rollback_error:
-                rollback_errors.append(f"analysis rollback failed: {rollback_error}")
-            else:
                 try:
-                    # The duplicate was saved before the output-browser refresh.
-                    # Persist its removal as well.
                     project.saveActiveProject()
                     analysis_rollback_succeeded = True
                 except Exception as rollback_error:
                     rollback_errors.append(f"rollback save failed: {rollback_error}")
+            except Exception as rollback_error:
+                rollback_errors.append(f"analysis rollback failed: {rollback_error}")
         if analysis_rollback_succeeded:
             try:
                 shutil.rmtree(plan.duplicate_group_path)
@@ -608,8 +801,8 @@ def execute_duplicate_plan(
             ) from error
         raise RuntimeError(
             f"Analysis duplication failed: {error}. The source analysis was not "
-            "modified, and the duplicate analysis and copied result directory "
-            "were rolled back."
+            "modified, and the nonqueued simulation records, duplicate analysis, "
+            "and copied result directory were rolled back."
         ) from error
 
     return DuplicateResult(duplicate, plan, verified_ids)

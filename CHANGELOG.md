@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.15.6 - 2026-09-03
+
+- Correct copied-result registration to call RFPro's shipped
+  `createSimulationsFromAnalysis(False, False, existingPaths, ...)` form. The
+  first argument is the add-to-queue behavior; shipped workflows using `False`
+  make a later explicit `setQueued(True)` call when they intend to solve.
+- Restore simulation-table association because live RFPro testing confirmed
+  that `resultBrowser().refresh()` alone cannot associate copied result folders
+  with a cloned analysis.
+- Verify that every returned record is inactive and resolves to the expected
+  copied path. The duplication workflow never calls `setQueued()`.
+- If RFPro unexpectedly starts or queues work, preserve the saved duplicate and
+  copied data instead of rolling them back underneath the active process.
+- Add regression coverage for the false queue flag, inactive result
+  registration, normal rollback, and unexpected-active preservation.
+
 ## 0.15.5 - 2026-09-03
 
 - Remove `Project.createSimulationsFromAnalysis()` from analysis duplication

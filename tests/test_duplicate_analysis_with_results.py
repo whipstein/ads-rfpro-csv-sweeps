@@ -24,12 +24,14 @@ class FakeAnalysis:
         group: str,
         simulation_path: str,
         relative_duplicate_group_path: bool = False,
+        results_registered: bool = True,
     ) -> None:
         self.name = name
         self.result_root = result_root
         self.simulationGroup = group
         self.simulationPath = simulation_path
         self.relative_duplicate_group_path = relative_duplicate_group_path
+        self.results_registered = results_registered
         self.settings = {"frequency": "20 GHz"}
 
     @property
@@ -45,6 +47,7 @@ class FakeAnalysis:
             self.simulationGroup,
             self.simulationPath,
             self.relative_duplicate_group_path,
+            False,
         )
         duplicate.settings = dict(self.settings)
         return duplicate
@@ -85,10 +88,10 @@ class FakeSimulationList(list):
 
 
 class FakeSimulation:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, status: str = "Completed") -> None:
         self.path = path
-        self.isRunning = False
-        self.status = "Completed"
+        self.isRunning = status in {"Queued", "Running"}
+        self.status = status
         self.queue_calls = 0
 
     def simulationPath(self) -> str:
@@ -99,11 +102,23 @@ class FakeSimulation:
 
 
 class FakeProject:
-    def __init__(self, analyses, simulations=None) -> None:
+    def __init__(
+        self,
+        analyses,
+        simulations=None,
+        empty_registration: bool = False,
+        queue_on_create: bool = False,
+    ) -> None:
         self.analyses = FakeAnalyses(analyses)
         self.simulations = simulations or FakeSimulationList()
-        self.create_calls = 0
+        self.empty_registration = empty_registration
+        self.queue_on_create = queue_on_create
+        self.create_calls = []
         self.save_calls = 0
+        self.saved_analysis_count = len(self.analyses.values)
+        self.modified_state_cached = False
+        self.cache_calls = 0
+        self.invalidate_calls = 0
 
     def __enter__(self):
         return self
@@ -113,10 +128,32 @@ class FakeProject:
 
     def saveActiveProject(self) -> None:
         self.save_calls += 1
+        self.saved_analysis_count = len(self.analyses.values)
 
-    def createSimulationsFromAnalysis(self, *_arguments):
-        self.create_calls += 1
-        raise AssertionError("duplication must never create simulations")
+    def _cacheProjectModifiedBeforeRunAnalysis(self) -> None:
+        self.cache_calls += 1
+        self.modified_state_cached = True
+
+    def _invalidateProjectModifiedBeforeRunAnalysis(self) -> None:
+        self.invalidate_calls += 1
+        self.modified_state_cached = False
+
+    def createSimulationsFromAnalysis(self, *arguments):
+        if not self.modified_state_cached:
+            raise RuntimeError("simulation-creation lifecycle was not entered")
+        if len(self.analyses.values) != self.saved_analysis_count:
+            raise RuntimeError("Cannot create simulation sweep: unsaved changes")
+        self.create_calls.append(arguments)
+        if self.empty_registration:
+            return []
+        add_to_queue = bool(arguments[0]) or self.queue_on_create
+        status = "Queued" if add_to_queue else "Completed"
+        existing_paths = arguments[2]
+        analysis = arguments[3]
+        created = [FakeSimulation(path, status) for path in existing_paths]
+        self.simulations.extend(created)
+        analysis.results_registered = True
+        return created
 
 
 class FakeAnalysisOutput:
@@ -125,9 +162,10 @@ class FakeAnalysisOutput:
         self.output_module = output_module
 
     def _is_available(self) -> bool:
-        if self.analysis.simulationGroup == "000001":
-            return True
-        return self.output_module.refreshed and not self.output_module.omit_duplicate
+        return self.analysis.results_registered and not (
+            self.output_module.omit_duplicate
+            and self.analysis.simulationGroup != "000001"
+        )
 
     def getAvailableSimulationIds(self):
         if not self._is_available():
@@ -280,7 +318,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             group / "000026",
         )
 
-    def test_duplicate_copies_hidden_cache_data_and_refreshes_output(self) -> None:
+    def test_duplicate_registers_copied_results_without_queueing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
@@ -298,11 +336,24 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            # Source mapping, then the duplicate/group assignment.
-            self.assertEqual(project.save_calls, 2)
+            # Source mapping, duplicate/group assignment, then registrations.
+            self.assertEqual(project.save_calls, 3)
             self.assertEqual(project.simulations.refresh_calls, 0)
-            self.assertEqual(project.create_calls, 0)
+            self.assertEqual(len(project.create_calls), 1)
+            create_call = project.create_calls[0]
+            self.assertEqual(create_call[0:2], (False, False))
+            self.assertEqual(
+                create_call[2],
+                [str(copied / "000001"), str(copied / "000002")],
+            )
+            self.assertIs(create_call[3], result.duplicate)
+            self.assertEqual(create_call[4:], ({}, {}))
+            self.assertTrue(all(sim.queue_calls == 0 for sim in project.simulations))
+            self.assertTrue(all(sim.status == "Completed" for sim in project.simulations))
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
+            self.assertEqual(project.cache_calls, 1)
+            self.assertEqual(project.invalidate_calls, 1)
+            self.assertFalse(project.modified_state_cached)
 
     def test_registered_result_mismatch_rolls_back_and_saves_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -325,8 +376,10 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.simulations), 0)
             self.assertEqual(project.simulations.refresh_calls, 0)
-            self.assertEqual(project.create_calls, 0)
+            self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(empro.output.result_browser.refresh_calls, 2)
+            self.assertEqual(project.cache_calls, 1)
+            self.assertEqual(project.invalidate_calls, 1)
 
     def test_result_browser_refresh_failure_rolls_back_and_saves_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -343,8 +396,49 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup"])
             self.assertFalse((root / "000002").exists())
             self.assertEqual(project.save_calls, 3)
-            self.assertEqual(project.create_calls, 0)
+            self.assertEqual(len(project.create_calls), 1)
+            self.assertEqual(len(project.simulations), 0)
             self.assertEqual(empro.output.result_browser.refresh_calls, 2)
+
+    def test_empty_nonqueued_registration_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source], empty_registration=True)
+            empro = FakeEmpro()
+
+            with self.assertRaisesRegex(RuntimeError, "returned no simulation records"):
+                MODULE.duplicate_analysis_with_results(
+                    empro, project, source, "RF Setup Copy"
+                )
+
+            self.assertEqual(project.analyses.names(), ["RF Setup"])
+            self.assertFalse((root / "000002").exists())
+            self.assertEqual(project.save_calls, 3)
+            self.assertEqual(len(project.create_calls), 1)
+            self.assertEqual(project.create_calls[0][0], False)
+            self.assertEqual(project.cache_calls, 1)
+            self.assertEqual(project.invalidate_calls, 1)
+
+    def test_unexpected_queued_registration_is_preserved_for_safe_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source], queue_on_create=True)
+
+            with self.assertRaisesRegex(RuntimeError, "no rollback was attempted"):
+                MODULE.duplicate_analysis_with_results(
+                    FakeEmpro(), project, source, "RF Setup Copy"
+                )
+
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+            self.assertTrue((root / "000002").is_dir())
+            self.assertEqual(project.save_calls, 2)
+            self.assertEqual(len(project.simulations), 2)
+            self.assertTrue(all(sim.status == "Queued" for sim in project.simulations))
+            self.assertEqual(project.create_calls[0][0], False)
+            self.assertEqual(project.cache_calls, 1)
+            self.assertEqual(project.invalidate_calls, 1)
 
     def test_running_or_queued_simulation_prevents_save_and_copy(self) -> None:
         class RunningSimulation:
