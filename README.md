@@ -434,9 +434,11 @@ group, registered-result count, and copy size before making changes. It uses
 the documented deep-copy `Analysis.clone()` API for the setup, obtains a new
 ID from `project.simulations.getNextSimulationGroup()`, copies the complete
 `simulationGroupPath` directory to that new sibling group, and registers the
-clone with `project.analyses.append()`. This produces an independent analysis
-and result tree; changing or deleting the duplicate does not reuse the source
-directory by reference.
+clone with `project.analyses.append()`. After saving that association, it asks
+the documented RFPro output result browser to reload saved data. This produces
+an independent analysis and result tree when RFPro recognizes the copied
+group; changing or deleting the duplicate does not reuse the source directory
+by reference.
 
 RFPro may expose the new `simulationGroupPath` as the project-relative value
 `./<group-id>` rather than as an absolute path. The verifier accepts that exact
@@ -447,33 +449,29 @@ authoritative association.
 
 The directory copy includes hidden reuse metadata, mesh files, circuit-result
 files, logs, and any other saved artifacts in the source group. The operation
-does not start or queue a simulation. It refuses to proceed while any RFPro
-simulation is running or queued, when the source group is missing, when a
-registered result path falls outside the source group, when no solved result is
-registered, or when the proposed destination already exists. Enough free space
-for the complete uncompressed copy is required.
+does not create, start, queue, or remove simulation records. It refuses to
+proceed while any RFPro simulation is running or queued, when the source group
+is missing, when a registered result path falls outside the source group, when
+no solved result is registered, or when the proposed destination already
+exists. Enough free space for the complete uncompressed copy is required.
 
 Files are first copied to a private sibling staging directory and published
-under the new group name only after the copy completes. Before saving the
-modified project, the script passes every remapped copied result path to
-RFPro's shipped
-`project.createSimulationsFromAnalysis(True, False, existingPaths, ...)`
-lifecycle. Immediately before that call, it saves the clone and new
-`simulationGroup` assignment because RFPro rejects simulation creation while
-those changes are unsaved. It also brackets registration with the same
-project-modified-state cache/invalidate lifecycle used by RFPro's public
-`runAnalysis()` implementation. This prevents the registration backend from
-treating changes made internally by the duplicate operation as pre-existing
-unsaved user edits. The registration creates simulation-table records that a
-plain `project.simulations.refresh()` cannot discover. It does not call RFPro's
-separate `setQueued(True)` launch step, so no simulation is started.
+under the new group name only after the copy completes. The script appends and
+saves the clone with its new `simulationGroup`, then calls the documented
+`empro.output.resultBrowser().refresh()` output-data reload. It deliberately
+does not call `project.createSimulationsFromAnalysis()`, `setQueued()`, or any
+simulation-list mutation: the former can launch asynchronous backend work in
+RFPro even when its Python return is empty.
 
-The script then uses `empro.output.AnalysisOutput` to verify that the duplicate
-exposes the same registered result IDs and that every duplicate path exists
-under the copied group, then saves the registered result mapping. A failed
-registration or verification rolls back the new simulation-table records and
-analysis, saves their removal, and removes the copied result directory while
-leaving the source untouched.
+The script then uses `empro.output.AnalysisOutput` to verify that the refreshed
+duplicate exposes the same solved-result IDs and that every duplicate path
+exists under the copied group. If RFPro cannot discover the copied group using
+the read-only output refresh, the operation fails safely instead of creating a
+simulation. A failed refresh or verification rolls back the cloned analysis,
+saves its removal, removes the copied result directory, and refreshes the
+output browser again while leaving the source untouched. If the analysis
+rollback itself cannot be saved, the copied directory is preserved to avoid a
+saved analysis pointing at deleted data.
 
 For an explicit direct launch:
 

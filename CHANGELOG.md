@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.15.5 - 2026-09-03
+
+- Remove `Project.createSimulationsFromAnalysis()` from analysis duplication
+  after live RFPro behavior showed that it can launch asynchronous backend work
+  even when the Python call returns no simulation records.
+- Save the cloned analysis and copied result group, then reload saved output
+  with the documented `empro.output.resultBrowser().refresh()` API and verify
+  the duplicate through `AnalysisOutput`.
+- Guarantee that duplication does not create, queue, refresh, or remove
+  simulation-table records; a copied group that RFPro cannot discover through
+  the read-only output layer is rolled back instead of simulated.
+- Add regression coverage that makes any simulation-creation call fail and
+  verifies safe rollback after an output-browser refresh or result mismatch.
+
 ## 0.15.4 - 2026-09-03
 
 - Bracket copied-result registration with RFPro's own

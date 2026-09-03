@@ -2,9 +2,9 @@
 
 Run this script inside RFPro. It deep-clones the selected Analysis, allocates a
 new simulation-group ID, copies the source group directory without modifying
-it, registers the cloned Analysis and copied result paths in RFPro's simulation
-table, verifies its public AnalysisOutput paths, and saves the project. It
-never starts or queues a simulation.
+it, saves the cloned Analysis, refreshes RFPro's output result browser, and
+verifies its public AnalysisOutput paths. It never creates, starts, queues, or
+removes a simulation record.
 """
 
 from __future__ import annotations
@@ -476,95 +476,17 @@ def clone_analysis_for_plan(source: Any, plan: DuplicatePlan) -> Any:
     return duplicate
 
 
-def remapped_result_paths(plan: DuplicatePlan) -> tuple[Path, ...]:
-    """Map each registered source result to the same location in the copy."""
+def refresh_result_browser(empro_module: Any) -> None:
+    """Reload saved output data without creating or changing simulations."""
 
-    return tuple(
-        plan.duplicate_group_path
-        / Path(os.path.relpath(path, plan.source_group_path))
-        for path in plan.registered_result_paths
-    )
-
-
-def register_duplicate_results(
-    project: Any,
-    duplicate: Any,
-    plan: DuplicatePlan,
-) -> tuple[Any, ...]:
-    """Register copied results through RFPro's own analysis-creation path.
-
-    RFPro's shipped analysis runner passes reusable result directories as the
-    ``existingPaths`` argument to this method.  Merely refreshing
-    ``project.simulations`` does not discover copied directories.  This call
-    creates the simulation-table records but does not queue them; RFPro's run
-    implementation performs a separate ``setQueued(True)`` step when a solve
-    is actually requested.
-    """
-
-    existing_paths = [str(path) for path in remapped_result_paths(plan)]
-    missing = [path for path in existing_paths if not Path(path).is_dir()]
-    if missing:
-        details = "\n  ".join(missing)
-        raise RuntimeError(
-            "Copied result paths are missing before RFPro registration:\n  "
-            + details
-        )
     try:
-        simulations = project.createSimulationsFromAnalysis(
-            True,
-            False,
-            existing_paths,
-            duplicate,
-            {},
-            {},
-        )
+        browser = empro_module.output.resultBrowser()
+        browser.refresh()
     except Exception as error:
         raise RuntimeError(
-            "RFPro could not register the copied result paths with the "
-            f"duplicate analysis: {error}"
+            "RFPro could not refresh its output result browser after copying "
+            f"the result group: {error}"
         ) from error
-    registered = tuple(simulations or ())
-    if not registered:
-        raise RuntimeError(
-            "RFPro returned no simulation records while registering the "
-            "copied result paths."
-        )
-    return registered
-
-
-def remove_duplicate_simulation_registrations(project: Any, plan: DuplicatePlan) -> int:
-    """Remove only simulation-table entries that resolve inside the new group."""
-
-    indexes: list[int] = []
-    for index, simulation in enumerate(project.simulations):
-        text = str(
-            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
-        ).strip()
-        if not text:
-            continue
-        path = resolve_result_path(Path(text), plan.duplicate_group_path)
-        if path_is_within(path, plan.duplicate_group_path):
-            indexes.append(index)
-    if not indexes:
-        return 0
-    with project:
-        for index in reversed(indexes):
-            del project.simulations[index]
-    return len(indexes)
-
-
-def begin_simulation_creation_lifecycle(project: Any) -> Callable[[], Any]:
-    """Enter the modified-state guard used by RFPro's shipped runAnalysis."""
-
-    cache = getattr(project, "_cacheProjectModifiedBeforeRunAnalysis", None)
-    invalidate = getattr(project, "_invalidateProjectModifiedBeforeRunAnalysis", None)
-    if not callable(cache) or not callable(invalidate):
-        raise RuntimeError(
-            "This RFPro runtime does not expose the project modified-state "
-            "lifecycle required for simulation registration."
-        )
-    cache()
-    return invalidate
 
 
 def verify_duplicate_output(
@@ -596,13 +518,13 @@ def verify_duplicate_output(
     )
     if sorted(result_ids) != sorted(plan.registered_result_ids):
         raise RuntimeError(
-            "RFPro did not register the same solved-result IDs for the duplicate. "
+            "RFPro did not expose the same solved-result IDs for the duplicate. "
             f"Source={list(plan.registered_result_ids)!r}; "
             f"duplicate={list(result_ids)!r}."
         )
     if len(raw_result_paths) != len(plan.registered_result_paths):
         raise RuntimeError(
-            "RFPro registered a different number of result paths for the "
+            "RFPro exposed a different number of result paths for the "
             f"duplicate: source={len(plan.registered_result_paths)}, "
             f"duplicate={len(raw_result_paths)}."
         )
@@ -630,70 +552,64 @@ def execute_duplicate_plan(
     source: Any,
     plan: DuplicatePlan,
 ) -> DuplicateResult:
-    """Copy and register a previously validated duplicate plan."""
+    """Copy and expose a previously validated duplicate plan."""
 
     duplicate = clone_analysis_for_plan(source, plan)
     copy_group_atomically(plan.source_group_path, plan.duplicate_group_path)
 
     appended = False
-    registration_attempted = False
     try:
-        # runAnalysis brackets all simulation creation with this modified-state
-        # cache. Without it, createSimulationsFromAnalysis mistakes the edits
-        # made by this operation itself for pre-existing unsaved user changes.
-        end_creation_lifecycle = begin_simulation_creation_lifecycle(project)
-        try:
-            with project:
-                project.analyses.append(duplicate)
-            appended = True
-            # The group assignment must also be persisted before the backend
-            # process creates the simulation-table records.
-            project.saveActiveProject()
-            registration_attempted = True
-            register_duplicate_results(project, duplicate, plan)
-        finally:
-            end_creation_lifecycle()
-        verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
+        with project:
+            project.analyses.append(duplicate)
+        appended = True
+        # Persist the analysis/group association before the output layer
+        # rescans the copied result tree. ResultBrowser.refresh() is read-only;
+        # unlike createSimulationsFromAnalysis(), it cannot launch backend work.
         project.saveActiveProject()
+        refresh_result_browser(empro_module)
+        verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
     except Exception as error:
         rollback_errors: list[str] = []
-        if registration_attempted:
-            try:
-                remove_duplicate_simulation_registrations(project, plan)
-            except Exception as rollback_error:
-                rollback_errors.append(
-                    f"simulation registration rollback failed: {rollback_error}"
-                )
+        analysis_rollback_succeeded = not appended
         if appended:
             try:
                 with project:
                     del project.analyses[project.analyses.index(plan.duplicate_name)]
-                project.simulations.refresh()
             except Exception as rollback_error:
                 rollback_errors.append(f"analysis rollback failed: {rollback_error}")
-            try:
-                # The duplicate may already have been saved to satisfy RFPro's
-                # registration precondition. Persist its removal as well.
-                project.saveActiveProject()
-            except Exception as rollback_error:
-                rollback_errors.append(f"rollback save failed: {rollback_error}")
-        if not rollback_errors:
+            else:
+                try:
+                    # The duplicate was saved before the output-browser refresh.
+                    # Persist its removal as well.
+                    project.saveActiveProject()
+                    analysis_rollback_succeeded = True
+                except Exception as rollback_error:
+                    rollback_errors.append(f"rollback save failed: {rollback_error}")
+        if analysis_rollback_succeeded:
             try:
                 shutil.rmtree(plan.duplicate_group_path)
             except Exception as rollback_error:
                 rollback_errors.append(
                     f"result-directory rollback failed: {rollback_error}"
                 )
+            else:
+                try:
+                    # Drop the removed group from the output browser's memory.
+                    refresh_result_browser(empro_module)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"output-browser rollback refresh failed: {rollback_error}"
+                    )
         if rollback_errors:
             raise RuntimeError(
                 f"Analysis duplication failed: {error}. "
                 + "; ".join(rollback_errors)
-                + f". Preserve and inspect {plan.duplicate_group_path}."
+                + f". Inspect the project and {plan.duplicate_group_path}."
             ) from error
         raise RuntimeError(
             f"Analysis duplication failed: {error}. The source analysis was not "
-            "modified, and the duplicate analysis, simulation registrations, "
-            "and copied result directory were rolled back."
+            "modified, and the duplicate analysis and copied result directory "
+            "were rolled back."
         ) from error
 
     return DuplicateResult(duplicate, plan, verified_ids)
