@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.16.2 - 2026-09-03
+
+- After copying solved data into RFPro-created target paths, invoke the public
+  native analysis path again with reuse enabled while the global queue is held.
+  RFPro does not retroactively associate copied files with records it already
+  classified as `Created`; this second native decision publishes reusable
+  copied results without permitting a solver to start.
+- Recover preserved duplicates whose complete inactive record group exists but
+  whose `AnalysisOutput` is empty by copying into those exact paths and running
+  the new post-copy native reuse phase.
+- Print ten-second progress diagnostics during reuse association and retain the
+  existing target-directory backup/restore protection if verification fails.
+- Add regression coverage for inactive `Created` records that become solved
+  only after the post-copy native reuse decision.
+
 ## 0.16.1 - 2026-09-03
 
 - Replace the unsupported direct `Project.createSimulationsFromAnalysis()`

@@ -221,7 +221,7 @@ class FakeProject:
             self.pending_registration = (created, analysis)
             return []
         self.simulations.extend(created)
-        analysis.results_registered = True
+        analysis.results_registered = False
         if self.empty_return_with_records:
             return []
         return created
@@ -235,7 +235,7 @@ class FakeProject:
             return
         created, analysis = self.pending_registration
         self.simulations.extend(created)
-        analysis.results_registered = True
+        analysis.results_registered = False
         self.pending_registration = None
 
 
@@ -330,6 +330,23 @@ class FakeAnalysisToolkit:
         try:
             if saveProject:
                 self.project.saveActiveProject()
+            group_root = analysis.result_root / analysis.simulationGroup
+            existing = [
+                simulation
+                for simulation in self.project.simulations
+                if Path(simulation.simulationPath()).parent == group_root
+            ]
+            if existing and all(
+                (Path(simulation.simulationPath()) / ".reuse.hash").is_file()
+                for simulation in existing
+            ):
+                analysis.results_registered = True
+                return existing
+            if existing:
+                for simulation in existing:
+                    simulation.setQueued(True)
+                analysis.results_registered = False
+                return existing
             return self.project.createSimulationsFromAnalysis(
                 True,
                 False,
@@ -481,7 +498,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             # Source save, duplicate/group save, native-run save, final association.
-            self.assertEqual(project.save_calls, 4)
+            self.assertEqual(project.save_calls, 5)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
             create_call = project.create_calls[0]
@@ -492,7 +509,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
             self.assertIs(create_call[3], result.duplicate)
             self.assertEqual(create_call[4:], ({}, {}))
-            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 2)
             self.assertEqual(
                 empro.toolkit.analysis.run_calls[0][1:],
                 (False, True, True),
@@ -501,8 +518,8 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertFalse(project.simulations.isQueueHeld)
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
-            self.assertEqual(project.cache_calls, 1)
-            self.assertEqual(project.invalidate_calls, 1)
+            self.assertEqual(project.cache_calls, 2)
+            self.assertEqual(project.invalidate_calls, 2)
             self.assertFalse(project.modified_state_cached)
 
     def test_append_reacquires_rfpro_registered_analysis_wrapper(self) -> None:
@@ -638,12 +655,12 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
 
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 2)
             self.assertTrue((root / "000002" / "000001" / ".reuse.hash").is_file())
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertFalse(project.simulations.isQueueHeld)
 
-    def test_late_held_records_are_unqueued_and_recovered_without_second_run(self) -> None:
+    def test_late_held_records_are_recovered_without_recreating_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
@@ -679,10 +696,50 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
 
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            self.assertEqual(len(empro.toolkit.analysis.run_calls), 0)
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertTrue(project.simulations.isQueueHeld)
             self.assertTrue((target_paths[0] / ".reuse.hash").is_file())
+
+    def test_created_records_are_rechecked_by_native_reuse_after_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = "000002"
+            duplicate.results_registered = False
+            target_paths = []
+            for simulation_id in ("000001", "000002"):
+                target = root / "000002" / simulation_id
+                target.mkdir(parents=True)
+                (target / "created.placeholder").write_text("", encoding="utf-8")
+                target_paths.append(target)
+            simulations = FakeSimulationList(
+                values=[
+                    FakeSimulation(str(path), status="Created", group="000002")
+                    for path in target_paths
+                ]
+            )
+            project = FakeProject([source, duplicate], simulations=simulations)
+            project.saved_analysis_count = 2
+            empro = FakeEmpro(project=project)
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+            self.assertTrue(plan.needs_native_registration)
+            self.assertTrue(plan.transplant_source_results)
+
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
+            self.assertTrue(duplicate.results_registered)
+            self.assertTrue((target_paths[0] / ".reuse.hash").is_file())
+            self.assertFalse(project.simulations.isQueueHeld)
 
     def test_empty_group_resume_recovers_created_record_group_and_rebinds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -704,7 +761,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
                 ],
             )
             project = FakeProject([source, duplicate], simulations=simulations)
-            empro = FakeEmpro()
+            empro = FakeEmpro(project=project)
 
             resumed, plan = MODULE.prepare_resume_plan(
                 empro, project, source, "RF Setup Copy"
@@ -759,7 +816,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
                 ],
             )
             project = FakeProject([source, duplicate], simulations=simulations)
-            empro = FakeEmpro()
+            empro = FakeEmpro(project=project)
 
             resumed, plan = MODULE.prepare_resume_plan(
                 empro, project, source, "RF Setup Copy"
@@ -845,13 +902,13 @@ class DuplicateAnalysisTests(unittest.TestCase):
                 (root / "000002" / "000001" / ".reuse.hash").exists()
             )
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
-            self.assertEqual(project.save_calls, 4)
+            self.assertEqual(project.save_calls, 5)
             self.assertEqual(len(project.simulations), 2)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
-            self.assertEqual(project.cache_calls, 1)
-            self.assertEqual(project.invalidate_calls, 1)
+            self.assertEqual(project.cache_calls, 2)
+            self.assertEqual(project.invalidate_calls, 2)
 
     def test_transient_result_browser_refresh_failure_is_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -868,7 +925,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
-            self.assertEqual(project.save_calls, 4)
+            self.assertEqual(project.save_calls, 5)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(len(project.simulations), 2)
             self.assertEqual(empro.output.result_browser.refresh_calls, 2)
@@ -910,14 +967,14 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            self.assertEqual(project.save_calls, 4)
+            self.assertEqual(project.save_calls, 5)
             self.assertEqual(len(project.simulations), 2)
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertTrue(all(sim.queue_calls == 1 for sim in project.simulations))
             self.assertEqual(project.create_calls[0][0], True)
             self.assertFalse(project.simulations.isQueueHeld)
-            self.assertEqual(project.cache_calls, 1)
-            self.assertEqual(project.invalidate_calls, 1)
+            self.assertEqual(project.cache_calls, 2)
+            self.assertEqual(project.invalidate_calls, 2)
 
     def test_running_or_queued_simulation_prevents_save_and_copy(self) -> None:
         class RunningSimulation:

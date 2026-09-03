@@ -456,9 +456,15 @@ RFPro exposes them; otherwise the unchanged cloned sweep is mapped in
 simulation-ID order. Each target directory is copied to a private sibling
 staging path, the solved source data is overlaid there, and the merged directory
 is atomically swapped into place. This preserves target-only RFPro identity
-metadata. The original target directory is retained as a backup until
-`AnalysisOutput` verifies the complete duplicate, then removed. A verification
-failure restores all target-directory backups. The source is never modified.
+metadata. Copying files into an already-created record is not, by itself, enough
+to update RFPro's result association. With the copied files now present at the
+exact paths RFPro registered, the script therefore calls the same public native
+`runAnalysis(..., reuseExistingIfPossible=True)` path a second time while the
+global queue remains held. RFPro can then make its own reuse decision and
+publish the copied points as solved results without allowing a solver to start.
+The original target directory is retained as a backup until `AnalysisOutput`
+verifies the complete duplicate, then removed. A verification failure restores
+all target-directory backups. The source is never modified.
 
 RFPro may expose the new `simulationGroupPath` as the project-relative value
 `./<group-id>` rather than as an absolute path. The verifier accepts that exact
@@ -488,10 +494,13 @@ a timeout reports the observed group binding, records, statuses, and filesystem
 groups instead of merely saying that nothing happened.
 
 Once all target records appear and their solved data has been copied, the
-script saves them, refreshes with `empro.output.resultBrowser().refresh()`, and
-uses `AnalysisOutput` to verify that the duplicate exposes the expected result
-count and exactly the paths owned by its Created records. Transient
-output-refresh delays are retried.
+second native reuse pass re-evaluates those exact registered paths with the
+queue held. The script removes any still-queued target records, saves the
+association, refreshes with `empro.output.resultBrowser().refresh()`, and uses
+`AnalysisOutput` to verify that the duplicate exposes the expected result count
+and exactly the paths owned by its records. Transient output-refresh delays are
+retried. Both the initial target-record creation and the post-copy reuse phase
+print a status snapshot every ten seconds.
 
 After native registration has been requested, the script never automatically
 deletes the duplicate analysis or its records because RFPro may still be
@@ -505,7 +514,10 @@ duplicate. Run the operation again with the original source selected and enter
 the exact existing duplicate name in the name dialog. The operation recognizes
 that name as **resume existing**. If no complete record set exists, it retries
 that same saved analysis through RFPro's native path while the global queue is
-held; it does not create a second duplicate analysis.
+held; it does not create a second duplicate analysis. If all expected inactive
+`Created` records already exist but `AnalysisOutput` is empty, resume mode
+copies into those same paths and performs the post-copy native reuse pass. It
+does not wait for file copying alone to change RFPro's association.
 
 Older copy-first releases can leave two new directories: one contains the
 copied solved data, while a second RFPro-owned group contains the inactive

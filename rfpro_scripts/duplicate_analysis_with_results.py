@@ -4,7 +4,9 @@ Run this script inside RFPro. It deep-clones the selected Analysis, holds the
 global simulation queue while RFPro's public native analysis path creates its
 target records, removes those records from the held queue, atomically copies
 each solved source point into the corresponding registered target path, and
-verifies the public AnalysisOutput paths. No solver job is allowed to start.
+then invokes the native reuse decision again so RFPro associates those copied
+results before verifying the public AnalysisOutput paths. No solver job is
+allowed to start.
 """
 
 from __future__ import annotations
@@ -915,6 +917,12 @@ def prepare_resume_plan(
     if registered_group_path is not None:
         _records, target_paths = registered_groups[registered_group_path]
         current = _optional_group_id(getattr(duplicate, "simulationGroup", ""))
+        output_matches = _analysis_output_matches_paths(
+            empro_module,
+            duplicate,
+            registered_group_path,
+            target_paths,
+        )
         redundant_path = None
         if current is not None and current != registered_group_path.name:
             possible = inventory.group_path.parent / current
@@ -933,14 +941,10 @@ def prepare_resume_plan(
             target_result_paths=target_paths,
             transplant_source_results=(
                 current != registered_group_path.name
-                or not _analysis_output_matches_paths(
-                    empro_module,
-                    duplicate,
-                    registered_group_path,
-                    target_paths,
-                )
+                or not output_matches
             ),
             redundant_copied_group_path=redundant_path,
+            needs_native_registration=not output_matches,
         )
         return duplicate, plan
 
@@ -1764,12 +1768,11 @@ def execute_duplicate_plan(
             "Solved source data was copied into RFPro's native registered "
             "target paths; verifying the duplicate output association."
         )
-        registered, verified_ids = wait_for_duplicate_registration(
+        registered, verified_ids = register_copied_results_through_native_reuse(
             empro_module,
             project,
             duplicate,
             plan,
-            registered,
             timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
         )
         cleanup_errors = discard_result_transplant_backups(replacements)
@@ -2274,6 +2277,138 @@ def resume_native_target_registration(
     return plan, records
 
 
+def register_copied_results_through_native_reuse(
+    empro_module: Any,
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+    timeout_seconds: float = DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
+) -> tuple[tuple[Any, ...], tuple[str, ...]]:
+    """Make RFPro evaluate already-copied target data through native reuse.
+
+    Merely placing solved files into a Created record's directory does not
+    update RFPro's native result association. The public analysis runner must
+    see those files during its ``reuse`` decision. The global queue remains
+    held for that entire decision and any rejected points are unqueued before
+    the prior hold state is restored.
+    """
+
+    prior_queue_hold = simulation_queue_is_held(project)
+    set_simulation_queue_held(project, True)
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout_seconds))
+    next_progress = started
+    records: tuple[Any, ...] = ()
+    paths: tuple[Path, ...] = ()
+    last_detail = "RFPro has not exposed the copied results yet."
+    try:
+        project.saveActiveProject()
+        request_native_target_registration(empro_module, project, duplicate)
+        print(
+            "Copied data is in RFPro's registered target paths. Re-running the "
+            "native analysis decision with reuse enabled and the global queue "
+            "held so RFPro can register those paths as solved."
+        )
+        while True:
+            process_rfpro_events(empro_module)
+            refresh_error = ""
+            try:
+                refresh_simulation_table(project)
+            except Exception as error:
+                refresh_error = str(error)
+            try:
+                records, paths = copied_result_records(project, plan)
+            except Exception as error:
+                last_detail = f"simulation-table inspection failed: {error}"
+            else:
+                executing = executing_simulation_descriptions(records)
+                if executing:
+                    raise RuntimeError(
+                        "A duplicate point progressed beyond RFPro's held queue:\n  "
+                        + "\n  ".join(executing)
+                    )
+                expected_count = len(expected_target_result_paths(plan))
+                if (
+                    len(records) == expected_count
+                    and len({normalized_path(path) for path in paths})
+                    == expected_count
+                ):
+                    if active_simulation_descriptions(records):
+                        records = remove_target_records_from_held_queue(
+                            empro_module,
+                            project,
+                            records,
+                            paths,
+                        )
+                    binding_restored = ensure_duplicate_group_binding(
+                        project,
+                        duplicate,
+                        plan,
+                    )
+                    if binding_restored:
+                        project.saveActiveProject()
+                    try:
+                        refresh_result_browser(empro_module)
+                        result_ids = verify_duplicate_output(
+                            empro_module,
+                            duplicate,
+                            plan,
+                        )
+                    except Exception as error:
+                        last_detail = str(error)
+                    else:
+                        set_simulation_queue_held(project, prior_queue_hold)
+                        return records, result_ids
+                else:
+                    last_detail = (
+                        f"expected {expected_count} target records; observed "
+                        f"paths={[str(path) for path in paths]!r}"
+                    )
+            if refresh_error:
+                last_detail += "; latest SimulationList.refresh() error: " + refresh_error
+            now = time.monotonic()
+            if now >= next_progress:
+                elapsed = int(now - started)
+                print(
+                    f"RFPro native reuse-association wait: {elapsed}s elapsed; "
+                    + last_detail
+                )
+                next_progress = now + 10.0
+            if now >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for RFPro's native reuse decision to "
+                    "associate the copied solved results. " + last_detail
+                )
+            time.sleep(REGISTRATION_POLL_INTERVAL_SECONDS)
+    except Exception as error:
+        queue_detail = ""
+        try:
+            if records and paths:
+                records = remove_target_records_from_held_queue(
+                    empro_module,
+                    project,
+                    records,
+                    paths,
+                )
+                set_simulation_queue_held(project, prior_queue_hold)
+                queue_detail = " RFPro's prior queue-hold state was restored."
+            else:
+                set_simulation_queue_held(project, True)
+                queue_detail = (
+                    " RFPro's global queue remains HELD because no complete "
+                    "target record set was available to unqueue."
+                )
+        except Exception as queue_error:
+            queue_detail = (
+                " RFPro's global queue remains HELD because cleanup failed: "
+                + str(queue_error)
+            )
+        raise RuntimeError(
+            f"RFPro could not associate the copied results through native reuse: "
+            f"{error}.{queue_detail}"
+        ) from error
+
+
 def resume_existing_duplicate_plan(
     empro_module: Any,
     project: Any,
@@ -2367,14 +2502,23 @@ def resume_existing_duplicate_plan(
         "Created records and output association."
     )
     try:
-        _records, verified_ids = wait_for_duplicate_registration(
-            empro_module,
-            project,
-            duplicate,
-            plan,
-            registered,
-            timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
-        )
+        if replacements:
+            _records, verified_ids = register_copied_results_through_native_reuse(
+                empro_module,
+                project,
+                duplicate,
+                plan,
+                timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
+            )
+        else:
+            _records, verified_ids = wait_for_duplicate_registration(
+                empro_module,
+                project,
+                duplicate,
+                plan,
+                registered,
+                timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
+            )
     except Exception as error:
         rollback_errors = rollback_result_transplants(replacements)
         detail = (
@@ -2406,13 +2550,19 @@ def build_confirmation(plan: DuplicatePlan) -> str:
             "native analysis registration, and remove the new target records",
             "from the held queue before restoring the previous queue state.",
             "Each target point will then be atomically replaced with its matching",
-            "solved source point. Records may briefly display as Queued, but no",
-            "solver job can start. Source analysis/results are not modified.",
+            "solved source point. RFPro's native reuse decision will run again",
+            "with the queue held to associate the copied results. Records may",
+            "briefly display as Queued, but no solver job can start. Source",
+            "analysis/results are not modified.",
         )
     )
 
 
 def build_resume_confirmation(plan: DuplicatePlan) -> str:
+    has_complete_targets = (
+        len(plan.target_result_paths) == len(plan.registered_result_paths)
+        and bool(plan.target_result_paths)
+    )
     lines = [
         f"Source analysis: {plan.source_name}",
         f"Existing duplicate: {plan.duplicate_name}",
@@ -2421,31 +2571,37 @@ def build_resume_confirmation(plan: DuplicatePlan) -> str:
         f"Expected solved points: {len(plan.registered_result_ids)}",
     ]
     if plan.transplant_source_results:
-        if plan.needs_native_registration:
+        if not has_complete_targets:
             lines.extend(
                 (
                     "",
                     "Once RFPro creates the target records, each point directory",
                     "will be backed up and atomically merged with its solved source",
-                    "point. Backups are removed only after RFPro verifies every result.",
+                    "point.",
                 )
             )
         else:
             lines.extend(
                 (
                     "",
-                    "RFPro registered inactive Created records in a different group",
-                    "than the earlier copied data. Each Created point directory will be",
+                    "RFPro already has a complete inactive target record set. Each",
+                    "target point directory will be",
                     "backed up and atomically replaced with its solved source point.",
-                    "Backups are removed only after RFPro verifies every result.",
                 )
             )
+        lines.extend(
+            (
+                "RFPro's native reuse decision then runs with the global queue",
+                "held to associate those copied files as solved results. Backups",
+                "are removed only after RFPro verifies every result.",
+            )
+        )
         if plan.redundant_copied_group_path is not None:
             lines.append(
                 "The redundant earlier copy is left unchanged: "
                 + str(plan.redundant_copied_group_path)
             )
-    if plan.needs_native_registration:
+    if plan.needs_native_registration and not has_complete_targets:
         lines.extend(
             (
                 "",
@@ -2460,11 +2616,7 @@ def build_resume_confirmation(plan: DuplicatePlan) -> str:
         (
             "",
             "RFPro's simulation table and output association will be refreshed.",
-            (
-                "No additional record request is needed."
-                if not plan.needs_native_registration
-                else "The existing duplicate analysis is reused; no second copy is made."
-            ),
+            "The existing duplicate analysis is reused; no second copy is made.",
         )
     )
     return "\n".join(lines)
