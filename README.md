@@ -30,7 +30,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.15.2**.
+The current release is **0.15.3**.
 
 ## Execution model
 
@@ -458,15 +458,18 @@ under the new group name only after the copy completes. Before saving the
 modified project, the script passes every remapped copied result path to
 RFPro's shipped
 `project.createSimulationsFromAnalysis(True, False, existingPaths, ...)`
-lifecycle. That creates the simulation-table records that a plain
-`project.simulations.refresh()` cannot discover. It does not call RFPro's
-separate `setQueued(True)` launch step, so no simulation is started.
+lifecycle. Immediately before that call, it saves the clone and new
+`simulationGroup` assignment because RFPro rejects simulation creation while
+those changes are unsaved. That creates the simulation-table records that a
+plain `project.simulations.refresh()` cannot discover. It does not call
+RFPro's separate `setQueued(True)` launch step, so no simulation is started.
 
 The script then uses `empro.output.AnalysisOutput` to verify that the duplicate
 exposes the same registered result IDs and that every duplicate path exists
-under the copied group. A failed pre-save verification rolls back the new
-simulation-table records, analysis, and result directory while leaving the
-source untouched.
+under the copied group, then saves the registered result mapping. A failed
+registration or verification rolls back the new simulation-table records and
+analysis, saves their removal, and removes the copied result directory while
+leaving the source untouched.
 
 For an explicit direct launch:
 

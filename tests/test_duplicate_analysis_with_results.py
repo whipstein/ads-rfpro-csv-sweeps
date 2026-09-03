@@ -108,6 +108,7 @@ class FakeProject:
         self.empty_registration = empty_registration
         self.create_calls = []
         self.save_calls = 0
+        self.saved_analysis_count = len(self.analyses.values)
 
     def __enter__(self):
         return self
@@ -117,8 +118,11 @@ class FakeProject:
 
     def saveActiveProject(self) -> None:
         self.save_calls += 1
+        self.saved_analysis_count = len(self.analyses.values)
 
     def createSimulationsFromAnalysis(self, *arguments):
+        if len(self.analyses.values) != self.saved_analysis_count:
+            raise RuntimeError("Cannot create simulation sweep: there are unsaved changes")
         self.create_calls.append(arguments)
         if self.empty_registration:
             return []
@@ -280,7 +284,8 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            self.assertEqual(project.save_calls, 2)
+            # Source mapping, duplicate/group assignment, then registrations.
+            self.assertEqual(project.save_calls, 3)
             self.assertEqual(project.simulations.refresh_calls, 0)
             self.assertEqual(len(project.create_calls), 1)
             create_call = project.create_calls[0]
@@ -293,7 +298,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(create_call[4:], ({}, {}))
             self.assertTrue(all(sim.queue_calls == 0 for sim in project.simulations))
 
-    def test_registered_result_mismatch_rolls_back_before_save(self) -> None:
+    def test_registered_result_mismatch_rolls_back_and_saves_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
@@ -310,11 +315,11 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup"])
             self.assertFalse((root / "000002").exists())
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
-            self.assertEqual(project.save_calls, 1)
+            self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.simulations), 0)
             self.assertEqual(project.simulations.refresh_calls, 1)
 
-    def test_empty_rfpro_registration_rolls_back_before_save(self) -> None:
+    def test_empty_rfpro_registration_rolls_back_and_saves_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
@@ -327,7 +332,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
 
             self.assertEqual(project.analyses.names(), ["RF Setup"])
             self.assertFalse((root / "000002").exists())
-            self.assertEqual(project.save_calls, 1)
+            self.assertEqual(project.save_calls, 3)
 
     def test_running_or_queued_simulation_prevents_save_and_copy(self) -> None:
         class RunningSimulation:

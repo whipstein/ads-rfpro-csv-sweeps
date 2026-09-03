@@ -623,48 +623,57 @@ def execute_duplicate_plan(
 
     appended = False
     registration_attempted = False
-    save_attempted = False
     try:
         with project:
             project.analyses.append(duplicate)
         appended = True
+        # RFPro refuses createSimulationsFromAnalysis while the new Analysis
+        # or its simulationGroup assignment is still an unsaved project edit.
+        # This is the same ordering used by RFPro's shipped analysis runner.
+        project.saveActiveProject()
         registration_attempted = True
         register_duplicate_results(project, duplicate, plan)
         verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
-        save_attempted = True
         project.saveActiveProject()
     except Exception as error:
-        if not save_attempted:
-            rollback_errors: list[str] = []
-            if registration_attempted:
-                try:
-                    remove_duplicate_simulation_registrations(project, plan)
-                except Exception as rollback_error:
-                    rollback_errors.append(
-                        f"simulation registration rollback failed: {rollback_error}"
-                    )
-            if appended:
-                try:
-                    with project:
-                        del project.analyses[project.analyses.index(plan.duplicate_name)]
-                    project.simulations.refresh()
-                except Exception as rollback_error:
-                    rollback_errors.append(f"analysis rollback failed: {rollback_error}")
-            if not rollback_errors:
-                try:
-                    shutil.rmtree(plan.duplicate_group_path)
-                except Exception as rollback_error:
-                    rollback_errors.append(f"result-directory rollback failed: {rollback_error}")
-            if rollback_errors:
-                raise RuntimeError(
-                    f"Analysis duplication failed: {error}. "
-                    + "; ".join(rollback_errors)
-                    + f". Preserve and inspect {plan.duplicate_group_path}."
-                ) from error
+        rollback_errors: list[str] = []
+        if registration_attempted:
+            try:
+                remove_duplicate_simulation_registrations(project, plan)
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    f"simulation registration rollback failed: {rollback_error}"
+                )
+        if appended:
+            try:
+                with project:
+                    del project.analyses[project.analyses.index(plan.duplicate_name)]
+                project.simulations.refresh()
+            except Exception as rollback_error:
+                rollback_errors.append(f"analysis rollback failed: {rollback_error}")
+            try:
+                # The duplicate may already have been saved to satisfy RFPro's
+                # registration precondition. Persist its removal as well.
+                project.saveActiveProject()
+            except Exception as rollback_error:
+                rollback_errors.append(f"rollback save failed: {rollback_error}")
+        if not rollback_errors:
+            try:
+                shutil.rmtree(plan.duplicate_group_path)
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    f"result-directory rollback failed: {rollback_error}"
+                )
+        if rollback_errors:
+            raise RuntimeError(
+                f"Analysis duplication failed: {error}. "
+                + "; ".join(rollback_errors)
+                + f". Preserve and inspect {plan.duplicate_group_path}."
+            ) from error
         raise RuntimeError(
             f"Analysis duplication failed: {error}. The source analysis was not "
-            "modified. Because a project save was attempted, the copied result "
-            f"directory was preserved at {plan.duplicate_group_path}."
+            "modified, and the duplicate analysis, simulation registrations, "
+            "and copied result directory were rolled back."
         ) from error
 
     return DuplicateResult(duplicate, plan, verified_ids)

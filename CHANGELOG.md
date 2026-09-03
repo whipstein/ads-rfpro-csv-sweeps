@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.3 - 2026-09-02
+
+- Save the cloned analysis and its new `simulationGroup` assignment before
+  calling `createSimulationsFromAnalysis`, matching RFPro's shipped ordering
+  and satisfying its no-unsaved-changes precondition.
+- Save again after copied-result registration so the completed simulation
+  table is persistent.
+- If registration or verification fails after the required intermediate save,
+  remove the new simulation records and analysis, save that rollback, and then
+  remove the copied result directory.
+- Make the duplicate-operation test double reject simulation creation with
+  unsaved analysis changes, reproducing RFPro's reported failure.
+
 ## 0.15.2 - 2026-09-02
 
 - Register every copied existing-result path through RFPro's shipped
