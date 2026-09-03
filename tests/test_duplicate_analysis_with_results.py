@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +89,7 @@ class FakeSimulationList(list):
 
 
 class FakeSimulation:
-    def __init__(self, path: str, status: str = "Completed") -> None:
+    def __init__(self, path: str, status: str = "Created") -> None:
         self.path = path
         self.isRunning = status in {"Queued", "Running"}
         self.status = status
@@ -107,12 +108,18 @@ class FakeProject:
         analyses,
         simulations=None,
         empty_registration: bool = False,
+        empty_return_with_records: bool = False,
         queue_on_create: bool = False,
+        async_delay_events: int = 0,
     ) -> None:
         self.analyses = FakeAnalyses(analyses)
         self.simulations = simulations or FakeSimulationList()
         self.empty_registration = empty_registration
+        self.empty_return_with_records = empty_return_with_records
         self.queue_on_create = queue_on_create
+        self.async_delay_events = async_delay_events
+        self.pending_registration = None
+        self.process_event_calls = 0
         self.create_calls = []
         self.save_calls = 0
         self.saved_analysis_count = len(self.analyses.values)
@@ -147,13 +154,30 @@ class FakeProject:
         if self.empty_registration:
             return []
         add_to_queue = bool(arguments[0]) or self.queue_on_create
-        status = "Queued" if add_to_queue else "Completed"
+        status = "Queued" if add_to_queue else "Created"
         existing_paths = arguments[2]
         analysis = arguments[3]
         created = [FakeSimulation(path, status) for path in existing_paths]
+        if self.async_delay_events:
+            self.pending_registration = (created, analysis)
+            return []
         self.simulations.extend(created)
         analysis.results_registered = True
+        if self.empty_return_with_records:
+            return []
         return created
+
+    def process_events(self) -> None:
+        self.process_event_calls += 1
+        if self.pending_registration is None:
+            return
+        self.async_delay_events -= 1
+        if self.async_delay_events > 0:
+            return
+        created, analysis = self.pending_registration
+        self.simulations.extend(created)
+        analysis.results_registered = True
+        self.pending_registration = None
 
 
 class FakeAnalysisOutput:
@@ -210,13 +234,24 @@ class FakeOutputModule:
         return self.result_browser
 
 
+class FakeGui:
+    def __init__(self, project=None) -> None:
+        self.project = project
+
+    def processEvents(self) -> None:
+        if self.project is not None:
+            self.project.process_events()
+
+
 class FakeEmpro:
     def __init__(
         self,
         omit_duplicate: bool = False,
         fail_refresh_count: int = 0,
+        project=None,
     ) -> None:
         self.output = FakeOutputModule(omit_duplicate, fail_refresh_count)
+        self.gui = FakeGui(project)
 
 
 class EmptyOutputModule:
@@ -349,74 +384,112 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertIs(create_call[3], result.duplicate)
             self.assertEqual(create_call[4:], ({}, {}))
             self.assertTrue(all(sim.queue_calls == 0 for sim in project.simulations))
-            self.assertTrue(all(sim.status == "Completed" for sim in project.simulations))
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
             self.assertFalse(project.modified_state_cached)
 
-    def test_registered_result_mismatch_rolls_back_and_saves_removal(self) -> None:
+    def test_empty_return_succeeds_when_created_records_appear_in_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source], empty_return_with_records=True)
+
+            result = MODULE.duplicate_analysis_with_results(
+                FakeEmpro(), project, source, "RF Setup Copy"
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+            self.assertTrue((root / "000002").is_dir())
+            self.assertEqual(len(project.simulations), 2)
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+
+    def test_empty_return_waits_for_asynchronous_created_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source], async_delay_events=3)
+            empro = FakeEmpro(project=project)
+
+            with mock.patch.object(MODULE, "REGISTRATION_POLL_INTERVAL_SECONDS", 0):
+                result = MODULE.duplicate_analysis_with_results(
+                    empro, project, source, "RF Setup Copy"
+                )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertGreaterEqual(project.process_event_calls, 3)
+            self.assertEqual(len(project.simulations), 2)
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+
+    def test_registered_result_mismatch_preserves_association_for_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source])
             empro = FakeEmpro(omit_duplicate=True)
 
-            with self.assertRaisesRegex(RuntimeError, "did not expose the same"):
-                MODULE.duplicate_analysis_with_results(
-                    empro,
-                    project,
-                    source,
-                    "RF Setup Copy",
-                )
+            with mock.patch.object(MODULE, "DEFAULT_REGISTRATION_TIMEOUT_SECONDS", 0):
+                with self.assertRaisesRegex(RuntimeError, "did not expose the same"):
+                    MODULE.duplicate_analysis_with_results(
+                        empro,
+                        project,
+                        source,
+                        "RF Setup Copy",
+                    )
 
-            self.assertEqual(project.analyses.names(), ["RF Setup"])
-            self.assertFalse((root / "000002").exists())
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+            self.assertTrue((root / "000002").is_dir())
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
             self.assertEqual(project.save_calls, 3)
-            self.assertEqual(len(project.simulations), 0)
+            self.assertEqual(len(project.simulations), 2)
             self.assertEqual(project.simulations.refresh_calls, 0)
             self.assertEqual(len(project.create_calls), 1)
-            self.assertEqual(empro.output.result_browser.refresh_calls, 2)
+            self.assertEqual(empro.output.result_browser.refresh_calls, 1)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
 
-    def test_result_browser_refresh_failure_rolls_back_and_saves_removal(self) -> None:
+    def test_transient_result_browser_refresh_failure_is_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source])
             empro = FakeEmpro(fail_refresh_count=1)
 
-            with self.assertRaisesRegex(RuntimeError, "could not refresh"):
-                MODULE.duplicate_analysis_with_results(
+            with mock.patch.object(MODULE, "REGISTRATION_POLL_INTERVAL_SECONDS", 0):
+                result = MODULE.duplicate_analysis_with_results(
                     empro, project, source, "RF Setup Copy"
                 )
 
-            self.assertEqual(project.analyses.names(), ["RF Setup"])
-            self.assertFalse((root / "000002").exists())
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+            self.assertTrue((root / "000002").is_dir())
             self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.create_calls), 1)
-            self.assertEqual(len(project.simulations), 0)
+            self.assertEqual(len(project.simulations), 2)
             self.assertEqual(empro.output.result_browser.refresh_calls, 2)
 
-    def test_empty_nonqueued_registration_rolls_back(self) -> None:
+    def test_missing_async_records_preserve_analysis_and_copy_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source], empty_registration=True)
             empro = FakeEmpro()
 
-            with self.assertRaisesRegex(RuntimeError, "returned no simulation records"):
-                MODULE.duplicate_analysis_with_results(
-                    empro, project, source, "RF Setup Copy"
-                )
+            with mock.patch.object(MODULE, "DEFAULT_REGISTRATION_TIMEOUT_SECONDS", 0):
+                with self.assertRaisesRegex(RuntimeError, "may still be completing"):
+                    MODULE.duplicate_analysis_with_results(
+                        empro, project, source, "RF Setup Copy"
+                    )
 
-            self.assertEqual(project.analyses.names(), ["RF Setup"])
-            self.assertFalse((root / "000002").exists())
-            self.assertEqual(project.save_calls, 3)
+            self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+            self.assertTrue((root / "000002").is_dir())
+            self.assertEqual(project.save_calls, 2)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(project.create_calls[0][0], False)
+            self.assertEqual(len(project.simulations), 0)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
 

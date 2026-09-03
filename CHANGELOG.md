@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.7 - 2026-09-03
+
+- Treat an empty return from nonqueued
+  `createSimulationsFromAnalysis(False, ...)` as asynchronous/inconclusive
+  instead of failure; live RFPro testing showed that inactive **Created**
+  records appear after the Python call returns.
+- Keep the saved duplicate analysis alive, process RFPro GUI events, and wait
+  up to an editable 300-second timeout for every copied result path to appear
+  in the simulation table and `AnalysisOutput`.
+- Save and verify the asynchronously created records without calling
+  `setQueued()`; a **Created** status is accepted as inactive.
+- Never automatically roll back after registration has been requested. A
+  timeout or verification failure preserves the analysis, records, and copied
+  directory so a late backend update cannot create another orphan.
+- Add regression coverage for empty synchronous returns, delayed Created-record
+  delivery, transient result-browser refresh failure, and safe timeout state.
+
 ## 0.15.6 - 2026-09-03
 
 - Correct copied-result registration to call RFPro's shipped

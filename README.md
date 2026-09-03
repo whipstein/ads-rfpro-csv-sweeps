@@ -465,16 +465,26 @@ shipped workflows use that form to create simulation records and then call
 never makes that separate queue call. It rejects the result if any returned
 record is queued or running, or if its path differs from the copied path.
 
-After refreshing with `empro.output.resultBrowser().refresh()`, the script uses
-`empro.output.AnalysisOutput` to verify that the duplicate exposes the same
-solved-result IDs and that every duplicate path exists under the copied group.
-A failed nonqueued registration, refresh, or verification removes only the new
-inactive simulation records, rolls back the cloned analysis, saves its
-removal, and removes the copied result directory while leaving the source
-untouched. If RFPro unexpectedly reports an active record despite the false
-queue flag, the script performs no destructive rollback: it preserves the
-duplicate analysis and copied directory and tells the user to cancel the job
-first, preventing another orphaned simulation.
+In RFPro's newer backend this registration call can return an empty Python list
+while inactive records are still being created asynchronously. Empty therefore
+does not mean failure. The script processes RFPro events and waits up to
+`DEFAULT_REGISTRATION_TIMEOUT_SECONDS` (300 seconds by default) for every
+expected path to appear in `project.simulations`. A **Created** status is the
+expected inactive state; it is not a running or queued solve.
+
+Once all records appear, the script saves them, refreshes with
+`empro.output.resultBrowser().refresh()`, and uses `AnalysisOutput` to verify
+that the duplicate exposes the same solved-result IDs and that every duplicate
+path exists under the copied group. Transient output-refresh delays are retried
+during the same wait.
+
+After a registration request has been sent, the script never automatically
+deletes the duplicate analysis, its records, or copied data, because RFPro may
+still be completing the request. A timeout therefore preserves everything for
+inspection and explicitly says not to run duplication again for that copy.
+Only failures occurring before registration is requested are rolled back. If a
+previous version left inactive orphan records after deleting their analysis,
+remove those **Created** entries from RFPro's Simulation window before retrying.
 
 For an explicit direct launch:
 
