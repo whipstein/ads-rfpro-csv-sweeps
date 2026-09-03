@@ -553,6 +553,20 @@ def remove_duplicate_simulation_registrations(project: Any, plan: DuplicatePlan)
     return len(indexes)
 
 
+def begin_simulation_creation_lifecycle(project: Any) -> Callable[[], Any]:
+    """Enter the modified-state guard used by RFPro's shipped runAnalysis."""
+
+    cache = getattr(project, "_cacheProjectModifiedBeforeRunAnalysis", None)
+    invalidate = getattr(project, "_invalidateProjectModifiedBeforeRunAnalysis", None)
+    if not callable(cache) or not callable(invalidate):
+        raise RuntimeError(
+            "This RFPro runtime does not expose the project modified-state "
+            "lifecycle required for simulation registration."
+        )
+    cache()
+    return invalidate
+
+
 def verify_duplicate_output(
     empro_module: Any,
     duplicate: Any,
@@ -624,15 +638,21 @@ def execute_duplicate_plan(
     appended = False
     registration_attempted = False
     try:
-        with project:
-            project.analyses.append(duplicate)
-        appended = True
-        # RFPro refuses createSimulationsFromAnalysis while the new Analysis
-        # or its simulationGroup assignment is still an unsaved project edit.
-        # This is the same ordering used by RFPro's shipped analysis runner.
-        project.saveActiveProject()
-        registration_attempted = True
-        register_duplicate_results(project, duplicate, plan)
+        # runAnalysis brackets all simulation creation with this modified-state
+        # cache. Without it, createSimulationsFromAnalysis mistakes the edits
+        # made by this operation itself for pre-existing unsaved user changes.
+        end_creation_lifecycle = begin_simulation_creation_lifecycle(project)
+        try:
+            with project:
+                project.analyses.append(duplicate)
+            appended = True
+            # The group assignment must also be persisted before the backend
+            # process creates the simulation-table records.
+            project.saveActiveProject()
+            registration_attempted = True
+            register_duplicate_results(project, duplicate, plan)
+        finally:
+            end_creation_lifecycle()
         verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
         project.saveActiveProject()
     except Exception as error:

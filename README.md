@@ -30,7 +30,7 @@ directly in an open Keysight RFPro process:
   parameter sequences and reports conditions that evaluate to the same RFPro
   reference-unit values.
 
-The current release is **0.15.3**.
+The current release is **0.15.4**.
 
 ## Execution model
 
@@ -460,9 +460,13 @@ RFPro's shipped
 `project.createSimulationsFromAnalysis(True, False, existingPaths, ...)`
 lifecycle. Immediately before that call, it saves the clone and new
 `simulationGroup` assignment because RFPro rejects simulation creation while
-those changes are unsaved. That creates the simulation-table records that a
-plain `project.simulations.refresh()` cannot discover. It does not call
-RFPro's separate `setQueued(True)` launch step, so no simulation is started.
+those changes are unsaved. It also brackets registration with the same
+project-modified-state cache/invalidate lifecycle used by RFPro's public
+`runAnalysis()` implementation. This prevents the registration backend from
+treating changes made internally by the duplicate operation as pre-existing
+unsaved user edits. The registration creates simulation-table records that a
+plain `project.simulations.refresh()` cannot discover. It does not call RFPro's
+separate `setQueued(True)` launch step, so no simulation is started.
 
 The script then uses `empro.output.AnalysisOutput` to verify that the duplicate
 exposes the same registered result IDs and that every duplicate path exists

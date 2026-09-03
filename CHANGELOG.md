@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.4 - 2026-09-03
+
+- Bracket copied-result registration with RFPro's own
+  `_cacheProjectModifiedBeforeRunAnalysis()` and
+  `_invalidateProjectModifiedBeforeRunAnalysis()` lifecycle, exactly as the
+  shipped public `runAnalysis()` implementation does.
+- Prevent RFPro from mistaking the duplicate operation's internal analysis and
+  simulation-group edits for pre-existing unsaved user changes after the
+  project has already been saved.
+- Add regression coverage requiring both the saved analysis state and RFPro's
+  modified-state lifecycle before simulation records can be created, including
+  cleanup of the lifecycle guard on failure.
+
 ## 0.15.3 - 2026-09-02
 
 - Save the cloned analysis and its new `simulationGroup` assignment before
