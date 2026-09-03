@@ -1,10 +1,10 @@
 """Duplicate an RFPro analysis and its complete saved simulation-result group.
 
-Run this script inside RFPro. It deep-clones the selected Analysis, lets RFPro
-create the new simulation group and inactive target records, atomically copies
-each solved source point into the corresponding registered target path,
-refreshes the output result browser, and verifies its public AnalysisOutput
-paths. It never queues or starts a simulation.
+Run this script inside RFPro. It deep-clones the selected Analysis, holds the
+global simulation queue while RFPro's public native analysis path creates its
+target records, removes those records from the held queue, atomically copies
+each solved source point into the corresponding registered target path, and
+verifies the public AnalysisOutput paths. No solver job is allowed to start.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ class DuplicatePlan:
     target_result_paths: tuple[Path, ...] = ()
     transplant_source_results: bool = False
     redundant_copied_group_path: Path | None = None
+    needs_native_registration: bool = False
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,49 @@ def active_simulation_descriptions(simulations: Sequence[Any]) -> list[str]:
         path = str(_call_or_value(getattr(simulation, "simulationPath", None), "") or "")
         active.append(f"{name} (status={status or 'active'}, path={path or 'unknown'})")
     return active
+
+
+def _simulation_status_key(simulation: Any) -> str:
+    status = str(_call_or_value(getattr(simulation, "status", None), "") or "")
+    return status.casefold().replace(" ", "").replace("_", "").rsplit(".", 1)[-1]
+
+
+def executing_simulation_descriptions(simulations: Sequence[Any]) -> list[str]:
+    """Describe records that progressed beyond a safely held queue."""
+
+    executing: list[str] = []
+    executing_prefixes = (
+        "submit",
+        "start",
+        "running",
+        "solving",
+        "preprocess",
+        "meshing",
+        "postprocess",
+        "interrupt",
+        "killing",
+    )
+    for index, simulation in enumerate(simulations):
+        status = str(
+            _call_or_value(getattr(simulation, "status", None), "") or ""
+        )
+        status_key = _simulation_status_key(simulation)
+        if status_key and not any(
+            status_key.startswith(prefix) for prefix in executing_prefixes
+        ):
+            continue
+        if not status_key and not bool(
+            _call_or_value(getattr(simulation, "isRunning", None), False)
+        ):
+            continue
+        name = str(getattr(simulation, "name", "") or f"simulation {index + 1}")
+        path = str(
+            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+        )
+        executing.append(
+            f"{name} (status={status or 'active'}, path={path or 'unknown'})"
+        )
+    return executing
 
 
 def running_simulation_descriptions(project: Any) -> list[str]:
@@ -900,6 +944,48 @@ def prepare_resume_plan(
         )
         return duplicate, plan
 
+    # A v0.16.0 timeout can preserve the analysis/group assignment before the
+    # unsupported direct creation call publishes any records. Retry that exact
+    # analysis through RFPro's public native run path while the queue is held.
+    current = _optional_group_id(getattr(duplicate, "simulationGroup", ""))
+    native_group = requested or current
+    if native_group is not None:
+        if current is not None and current != native_group:
+            raise RuntimeError(
+                f"Existing analysis {name!r} is already associated with group "
+                f"{current!r}, not requested resume group {native_group!r}."
+            )
+        if native_group == inventory.group:
+            raise RuntimeError(
+                "The existing analysis shares the source simulation group and is "
+                "not an independent preserved duplicate."
+            )
+        native_group_path = inventory.group_path.parent / native_group
+        provisional = DuplicatePlan(
+            source_name=str(source.name),
+            duplicate_name=name,
+            source_group=inventory.group,
+            duplicate_group=native_group,
+            source_group_path=inventory.group_path,
+            duplicate_group_path=native_group_path,
+            registered_result_ids=inventory.result_ids,
+            registered_result_paths=inventory.result_paths,
+            source_size_bytes=inventory.size_bytes,
+            needs_native_registration=True,
+        )
+        existing_targets = remapped_result_paths(provisional)
+        complete_copy = native_group_path.is_dir() and all(
+            path.is_dir() for path in existing_targets
+        )
+        return duplicate, replace(
+            provisional,
+            target_result_paths=existing_targets if complete_copy else (),
+            # The directories may be either an older solved copy or empty
+            # native placeholders. Overlaying the source after registration is
+            # safe in both cases and avoids guessing from filenames.
+            transplant_source_results=True,
+        )
+
     duplicate_group, duplicate_group_path = recover_resume_group(
         project,
         duplicate,
@@ -922,6 +1008,7 @@ def prepare_resume_plan(
         registered_result_ids=inventory.result_ids,
         registered_result_paths=inventory.result_paths,
         source_size_bytes=directory_size(duplicate_group_path),
+        needs_native_registration=True,
     )
     missing = [path for path in remapped_result_paths(plan) if not path.is_dir()]
     if missing:
@@ -984,53 +1071,91 @@ def expected_target_result_paths(plan: DuplicatePlan) -> tuple[Path, ...]:
     return plan.target_result_paths or remapped_result_paths(plan)
 
 
-def begin_simulation_creation_lifecycle(project: Any) -> Callable[[], Any]:
-    """Enter the modified-state guard used by RFPro's shipped runAnalysis."""
+def simulation_queue_is_held(project: Any) -> bool:
+    """Read the documented SimulationList queue-hold property."""
 
-    cache = getattr(project, "_cacheProjectModifiedBeforeRunAnalysis", None)
-    invalidate = getattr(project, "_invalidateProjectModifiedBeforeRunAnalysis", None)
-    if not callable(cache) or not callable(invalidate):
+    simulations = project.simulations
+    if not hasattr(simulations, "isQueueHeld"):
         raise RuntimeError(
-            "This RFPro runtime does not expose the project modified-state "
-            "lifecycle required for nonqueued result registration."
+            "This RFPro runtime does not expose SimulationList.isQueueHeld; "
+            "the duplicate cannot safely use native analysis registration."
         )
-    cache()
-    return invalidate
+    return bool(_call_or_value(getattr(simulations, "isQueueHeld"), False))
 
 
-def register_duplicate_results(
-    project: Any,
-    duplicate: Any,
-    plan: DuplicatePlan,
-) -> tuple[Any, ...]:
-    """Ask RFPro to create empty target records without queueing a solve.
-
-    RFPro's shipped workflows use the first ``False`` argument when records
-    must be created before a later, explicit ``setQueued(True)`` call.  This
-    operation intentionally performs only that nonqueued creation step.
-    """
+def set_simulation_queue_held(project: Any, held: bool) -> None:
+    """Set and verify RFPro's documented global simulation-queue hold."""
 
     try:
-        simulations = project.createSimulationsFromAnalysis(
-            False,
-            False,
-            [],
+        project.simulations.isQueueHeld = bool(held)
+    except Exception as error:
+        raise RuntimeError(
+            f"RFPro could not set the simulation queue hold to {bool(held)}: {error}"
+        ) from error
+    if simulation_queue_is_held(project) != bool(held):
+        raise RuntimeError(
+            f"RFPro did not retain simulation queue hold={bool(held)}."
+        )
+
+
+def _native_analysis_runner(empro_module: Any) -> Callable[..., Any]:
+    toolkit = getattr(empro_module, "toolkit", None)
+    analysis_toolkit = getattr(toolkit, "analysis", None)
+    runner = getattr(analysis_toolkit, "runAnalysis", None)
+    if callable(runner):
+        return runner
+    try:
+        from empro.toolkit import analysis as imported_analysis_toolkit
+    except Exception as error:
+        raise RuntimeError(
+            "RFPro's public empro.toolkit.analysis.runAnalysis API is unavailable."
+        ) from error
+    runner = getattr(imported_analysis_toolkit, "runAnalysis", None)
+    if not callable(runner):
+        raise RuntimeError(
+            "RFPro's public empro.toolkit.analysis.runAnalysis API is unavailable."
+        )
+    return runner
+
+
+def request_native_target_registration(
+    empro_module: Any,
+    project: Any,
+    duplicate: Any,
+) -> Any:
+    """Use RFPro's native analysis path while its queue is already held.
+
+    RFPro 2026's current RF extraction flow registers a sweep through
+    ``Analysis._doAnalysis``.  The public ``runAnalysis`` wrapper is the
+    supported entry point into that flow.  Holding the documented global queue
+    before calling it permits RFPro to create its own records and directories
+    without allowing a solver process to start.
+    """
+
+    if not simulation_queue_is_held(project):
+        raise RuntimeError(
+            "Refusing native target registration because RFPro's simulation "
+            "queue is not held."
+        )
+    runner = _native_analysis_runner(empro_module)
+    try:
+        result = runner(
             duplicate,
-            {},
-            {},
+            waitForConfirmation=False,
+            saveProject=True,
+            reuseExistingIfPossible=True,
         )
     except Exception as error:
         raise RuntimeError(
-            "RFPro could not create nonqueued result associations for the "
-            f"duplicate analysis: {error}"
+            "RFPro's native analysis registration failed while the queue was "
+            f"held: {error}"
         ) from error
-
-    # RFPro must own creation of the target group and paths. Supplying already
-    # copied paths can make its backend allocate a second group, separating the
-    # analysis records from the solved data. An empty existing-path list creates
-    # inactive targets for the cloned sweep; solved data is copied into those
-    # registered paths only after creation completes.
-    return tuple(simulations or ())
+    if not simulation_queue_is_held(project):
+        raise RuntimeError(
+            "RFPro released the simulation queue during target registration. "
+            "Inspect the Simulation window immediately before continuing."
+        )
+    return result
 
 
 def verify_nonqueued_registration(
@@ -1044,8 +1169,8 @@ def verify_nonqueued_registration(
     if active:
         details = "\n  ".join(active)
         raise RuntimeError(
-            "RFPro unexpectedly queued or started a copied-result record even "
-            f"though addToQueue was False:\n  {details}"
+            "RFPro still reports an active copied-result record after held-queue "
+            f"cleanup:\n  {details}"
         )
 
     registered_paths: list[Path] = []
@@ -1142,26 +1267,96 @@ def ensure_duplicate_group_binding(
     return True
 
 
-def wait_for_created_target_records(
+def simulation_record_paths(project: Any, results_root: Path) -> set[str]:
+    paths: set[str] = set()
+    for simulation in project.simulations:
+        resolved = _simulation_record_group_and_path(simulation, results_root)
+        if resolved is not None:
+            paths.add(normalized_path(resolved[1]))
+    return paths
+
+
+def _new_record_groups(
+    project: Any,
+    results_root: Path,
+    paths_before: set[str],
+) -> dict[Path, tuple[tuple[Any, ...], tuple[Path, ...]]]:
+    grouped: dict[Path, list[tuple[Any, Path]]] = {}
+    for simulation in project.simulations:
+        resolved = _simulation_record_group_and_path(simulation, results_root)
+        if resolved is None:
+            continue
+        group_path, simulation_path = resolved
+        if normalized_path(simulation_path) in paths_before:
+            continue
+        grouped.setdefault(group_path, []).append((simulation, simulation_path))
+    return {
+        group_path: (
+            tuple(record for record, _path in entries),
+            tuple(path for _record, path in entries),
+        )
+        for group_path, entries in grouped.items()
+    }
+
+
+def _record_wait_diagnostics(
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+    paths_before: set[str],
+    refresh_error: str = "",
+) -> str:
+    results_root = plan.source_group_path.parent
+    groups = _new_record_groups(project, results_root, paths_before)
+    group_details = {
+        str(group): [
+            {
+                "path": str(path),
+                "status": str(
+                    _call_or_value(getattr(record, "status", None), "") or ""
+                ),
+            }
+            for record, path in zip(records, paths)
+        ]
+        for group, (records, paths) in groups.items()
+    }
+    directory_groups: list[str] = []
+    try:
+        directory_groups = sorted(
+            path.name
+            for path in results_root.iterdir()
+            if path.is_dir() and _optional_group_id(path.name) is not None
+        )
+    except OSError as error:
+        directory_groups = [f"<directory scan failed: {error}>"]
+    detail = (
+        f"duplicate.simulationGroup="
+        f"{str(getattr(duplicate, 'simulationGroup', '') or '')!r}; "
+        f"new record groups={group_details!r}; "
+        f"filesystem groups={directory_groups!r}"
+    )
+    if refresh_error:
+        detail += "; latest SimulationList.refresh() error: " + refresh_error
+    return detail
+
+
+def wait_for_native_target_records(
     empro_module: Any,
     project: Any,
+    duplicate: Any,
     plan: DuplicatePlan,
-    returned_records: Sequence[Any],
+    paths_before: set[str],
     timeout_seconds: float = DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
 ) -> tuple[tuple[Any, ...], tuple[Path, ...], Path]:
-    """Wait until RFPro publishes every inactive target path it created."""
+    """Wait for RFPro's held native run to publish one complete target group."""
 
     timeout = max(0.0, float(timeout_seconds))
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    next_progress = started
     expected_count = len(plan.registered_result_paths)
-    last_detail = "RFPro has not exposed any target records yet."
-    returned_active = active_simulation_descriptions(returned_records)
-    if returned_active:
-        details = "\n  ".join(returned_active)
-        raise RuntimeError(
-            "RFPro unexpectedly queued or started a new duplicate record even "
-            f"though addToQueue was False:\n  {details}"
-        )
+    results_root = plan.source_group_path.parent
+    last_detail = "RFPro has not exposed any new target records yet."
 
     while True:
         process_rfpro_events(empro_module)
@@ -1171,54 +1366,136 @@ def wait_for_created_target_records(
         except Exception as error:
             refresh_error = str(error)
         try:
-            records, paths = copied_result_records(project, plan)
+            groups = _new_record_groups(project, results_root, paths_before)
+            executing = [
+                description
+                for records, _paths in groups.values()
+                for description in executing_simulation_descriptions(records)
+            ]
+            if executing:
+                raise RuntimeError(
+                    "A duplicate simulation progressed beyond RFPro's held "
+                    "queue:\n  " + "\n  ".join(executing)
+                )
+
+            candidates: dict[
+                Path, tuple[tuple[Any, ...], tuple[Path, ...]]
+            ] = {}
+            for group_path, (records, paths) in groups.items():
+                if len(records) != expected_count:
+                    continue
+                if len({normalized_path(path) for path in paths}) != expected_count:
+                    continue
+                if not all(path.is_dir() for path in paths):
+                    continue
+                candidates[group_path] = records, paths
+
+            current_group = _optional_group_id(
+                getattr(duplicate, "simulationGroup", "")
+            )
+            current_path = results_root / current_group if current_group else None
+            if current_path in candidates:
+                records, paths = candidates[current_path]
+                return records, paths, current_path
+            if len(candidates) == 1:
+                group_path, (records, paths) = next(iter(candidates.items()))
+                return records, paths, group_path
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    "RFPro created more than one complete new simulation group "
+                    f"while registering the duplicate: "
+                    f"{[str(path) for path in candidates]!r}. The queue remains held."
+                )
+            last_detail = _record_wait_diagnostics(
+                project,
+                duplicate,
+                plan,
+                paths_before,
+                refresh_error,
+            )
+        except RuntimeError:
+            raise
         except Exception as error:
             last_detail = f"simulation-table inspection failed: {error}"
-        else:
-            active = active_simulation_descriptions(records)
-            if active:
-                details = "\n  ".join(active)
-                raise RuntimeError(
-                    "RFPro unexpectedly queued or started a new duplicate "
-                    f"record:\n  {details}"
-                )
-            unique_paths = {normalized_path(path) for path in paths}
-            if (
-                len(records) == expected_count
-                and len(paths) == expected_count
-                and len(unique_paths) == expected_count
-                and all(path.is_dir() for path in paths)
-            ):
-                return records, paths, plan.duplicate_group_path
-            if not records:
-                inventory = SourceResultInventory(
-                    result_ids=plan.registered_result_ids,
-                    result_paths=plan.registered_result_paths,
-                    group=plan.source_group,
-                    group_path=plan.source_group_path,
-                    size_bytes=plan.source_size_bytes,
-                )
-                alternate_groups = registered_resume_group_candidates(
-                    project,
-                    inventory,
-                    plan.duplicate_name,
-                )
-                if len(alternate_groups) == 1:
-                    group_path, (alternate_records, alternate_paths) = next(
-                        iter(alternate_groups.items())
-                    )
-                    return alternate_records, alternate_paths, group_path
-            last_detail = (
-                f"expected {expected_count} inactive target records in "
-                f"{plan.duplicate_group_path}; observed paths="
-                f"{[str(path) for path in paths]!r}"
+            if refresh_error:
+                last_detail += "; latest SimulationList.refresh() error: " + refresh_error
+
+        now = time.monotonic()
+        if now >= next_progress:
+            elapsed = int(now - started)
+            print(
+                f"RFPro native registration wait: {elapsed}s elapsed; "
+                + last_detail
             )
-        if refresh_error:
-            last_detail += "; latest SimulationList.refresh() error: " + refresh_error
+            next_progress = now + 10.0
+        if now >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for RFPro's native held-queue analysis path "
+                f"to publish {expected_count} target records. " + last_detail
+            )
+        time.sleep(REGISTRATION_POLL_INTERVAL_SECONDS)
+
+
+def remove_target_records_from_held_queue(
+    empro_module: Any,
+    project: Any,
+    records: Sequence[Any],
+    target_paths: Sequence[Path],
+    timeout_seconds: float = 30.0,
+) -> tuple[Any, ...]:
+    """Remove just-created target records from a queue that is still held."""
+
+    expected = {normalized_path(path) for path in target_paths}
+    for simulation in records:
+        if not active_simulation_descriptions((simulation,)):
+            continue
+        setter = getattr(simulation, "setQueued", None)
+        if not callable(setter):
+            raise RuntimeError(
+                "A held duplicate record is queued, but RFPro exposes no "
+                "Simulation.setQueued(False) method. The global queue remains held."
+            )
+        setter(False)
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last_active: list[str] = []
+    while True:
+        process_rfpro_events(empro_module)
+        try:
+            refresh_simulation_table(project)
+        except Exception:
+            pass
+        current: list[Any] = []
+        for simulation in project.simulations:
+            path_text = str(
+                _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+            ).strip()
+            if not path_text:
+                continue
+            reported = Path(path_text)
+            matches = normalized_path(reported) in expected if reported.is_absolute() else False
+            if not matches:
+                for target_path in target_paths:
+                    if normalized_path(
+                        resolve_result_path(reported, target_path.parent)
+                    ) == normalized_path(target_path):
+                        matches = True
+                        break
+            if matches:
+                current.append(simulation)
+        if len(current) == len(expected):
+            last_active = active_simulation_descriptions(current)
+            if not last_active:
+                return tuple(current)
+        else:
+            last_active = [
+                f"expected {len(expected)} target records; observed {len(current)}"
+            ]
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "Timed out waiting for RFPro to create the duplicate's inactive "
-                "target records. " + last_detail
+                "RFPro did not remove every duplicate record from its held queue. "
+                "The global queue remains held. Observed:\n  "
+                + "\n  ".join(last_active)
             )
         time.sleep(REGISTRATION_POLL_INTERVAL_SECONDS)
 
@@ -1323,8 +1600,8 @@ def wait_for_duplicate_registration(
     if returned_active:
         details = "\n  ".join(returned_active)
         raise RuntimeError(
-            "RFPro unexpectedly queued or started a returned copied-result "
-            f"record even though addToQueue was False:\n  {details}"
+            "RFPro returned a copied-result record that is still active after "
+            f"held-queue cleanup:\n  {details}"
         )
 
     while True:
@@ -1352,8 +1629,8 @@ def wait_for_duplicate_registration(
             if active:
                 details = "\n  ".join(active)
                 raise RuntimeError(
-                    "RFPro unexpectedly queued or started a copied-result "
-                    f"record even though addToQueue was False:\n  {details}"
+                    "RFPro still reports an active copied-result record after "
+                    f"held-queue cleanup:\n  {details}"
                 )
 
             observed_normalized = sorted(
@@ -1397,7 +1674,7 @@ def wait_for_duplicate_registration(
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "Timed out waiting for RFPro to finish its asynchronous "
-                "nonqueued result registration. " + last_detail
+                "result association. " + last_detail
             )
         time.sleep(REGISTRATION_POLL_INTERVAL_SECONDS)
 
@@ -1408,7 +1685,7 @@ def execute_duplicate_plan(
     source: Any,
     plan: DuplicatePlan,
 ) -> DuplicateResult:
-    """Create inactive RFPro targets, then copy solved data without queueing."""
+    """Let RFPro create held native targets, then copy solved data into them."""
 
     duplicate = clone_analysis_for_plan(source, plan)
 
@@ -1416,36 +1693,49 @@ def execute_duplicate_plan(
     registration_attempted = False
     registered: tuple[Any, ...] = ()
     replacements: tuple[tuple[Path, Path], ...] = ()
+    prior_queue_hold: bool | None = None
+    queue_release_safe = False
+    results_root = plan.source_group_path.parent
+    paths_before: set[str] = set()
     try:
-        # RFPro's public runAnalysis() uses this guard around simulation-record
-        # creation. The duplicate is saved before creation so the backend sees
-        # a persistent analysis/group association.
-        end_creation_lifecycle = begin_simulation_creation_lifecycle(project)
+        with project:
+            appended_index = project.analyses.append(duplicate)
+        appended = True
+        # AnalysisList.append() publicly returns the index of the object
+        # registered in RFPro. Continue with that authoritative object; the
+        # pre-append clone can be detached from the analysis tree.
+        duplicate = project.analyses[appended_index]
+        with project:
+            duplicate.simulationGroup = plan.duplicate_group
+        project.saveActiveProject()
+
         try:
-            with project:
-                appended_index = project.analyses.append(duplicate)
-            appended = True
-            # AnalysisList.append() publicly returns the index of the object
-            # registered in RFPro. Continue with that authoritative object;
-            # the pre-append clone can be detached from the analysis tree.
-            duplicate = project.analyses[appended_index]
-            with project:
-                duplicate.simulationGroup = plan.duplicate_group
-            project.saveActiveProject()
-            registration_attempted = True
-            registered = register_duplicate_results(project, duplicate, plan)
-        finally:
-            end_creation_lifecycle()
-        print(
-            "RFPro nonqueued target creation was requested; waiting up to "
-            f"{DEFAULT_REGISTRATION_TIMEOUT_SECONDS:g} seconds for its inactive "
-            "Created records."
-        )
-        registered, target_paths, target_group_path = wait_for_created_target_records(
+            refresh_simulation_table(project)
+        except Exception as refresh_error:
+            print(
+                "RFPro simulation-table refresh was temporarily unavailable "
+                f"before native registration: {refresh_error}"
+            )
+        paths_before = simulation_record_paths(project, results_root)
+        prior_queue_hold = simulation_queue_is_held(project)
+        set_simulation_queue_held(project, True)
+        registration_attempted = True
+        request_native_target_registration(
             empro_module,
             project,
+            duplicate,
+        )
+        print(
+            "RFPro's native analysis registration was requested with the global "
+            "simulation queue held; no solver job can start. Waiting up to "
+            f"{DEFAULT_REGISTRATION_TIMEOUT_SECONDS:g} seconds for its records."
+        )
+        registered, target_paths, target_group_path = wait_for_native_target_records(
+            empro_module,
+            project,
+            duplicate,
             plan,
-            registered,
+            paths_before,
             timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
         )
         plan = replace(
@@ -1461,9 +1751,17 @@ def execute_duplicate_plan(
             with project:
                 duplicate.simulationGroup = plan.duplicate_group
             project.saveActiveProject()
+        registered = remove_target_records_from_held_queue(
+            empro_module,
+            project,
+            registered,
+            target_paths,
+        )
+        queue_release_safe = True
+        set_simulation_queue_held(project, bool(prior_queue_hold))
         replacements = transplant_source_results(project, plan)
         print(
-            "Solved source data was copied into RFPro's registered inactive "
+            "Solved source data was copied into RFPro's native registered "
             "target paths; verifying the duplicate output association."
         )
         registered, verified_ids = wait_for_duplicate_registration(
@@ -1483,15 +1781,42 @@ def execute_duplicate_plan(
     except Exception as error:
         if registration_attempted:
             rollback_errors = rollback_result_transplants(replacements)
-            # RFPro can return before its backend finishes adding Created
-            # records. Once requested, never delete the owning analysis or
-            # result group automatically—even an empty return is inconclusive.
             observed_records: tuple[Any, ...] = ()
             observed_paths: tuple[Path, ...] = ()
             try:
-                observed_records, observed_paths = copied_result_records(project, plan)
+                groups = _new_record_groups(project, results_root, paths_before)
+                observed_records = tuple(
+                    record for records, _paths in groups.values() for record in records
+                )
+                observed_paths = tuple(
+                    path for _records, paths in groups.values() for path in paths
+                )
             except Exception:
                 pass
+            queue_detail = ""
+            try:
+                if observed_records:
+                    observed_records = remove_target_records_from_held_queue(
+                        empro_module,
+                        project,
+                        observed_records,
+                        observed_paths,
+                    )
+                    queue_release_safe = True
+                if queue_release_safe and prior_queue_hold is not None:
+                    set_simulation_queue_held(project, prior_queue_hold)
+                    queue_detail = "; RFPro's previous queue-hold state was restored"
+                else:
+                    set_simulation_queue_held(project, True)
+                    queue_detail = (
+                        "; RFPro's global queue was intentionally left HELD because "
+                        "target records could not be safely unqueued"
+                    )
+            except Exception as queue_error:
+                queue_detail = (
+                    "; RFPro's global queue was intentionally left HELD; queue "
+                    f"cleanup failed: {queue_error}"
+                )
             active = active_simulation_descriptions(registered)
             for description in active_simulation_descriptions(observed_records):
                 if description not in active:
@@ -1505,13 +1830,12 @@ def execute_duplicate_plan(
             )
             raise RuntimeError(
                 f"Analysis duplication could not be verified: {error}. RFPro's "
-                "registration request may still be completing asynchronously, "
-                "so its duplicate analysis and Created records were preserved"
+                "native registration request may still be completing, so its "
+                "duplicate analysis and records were preserved"
                 f"{rollback_detail}. Observed records are {state}; "
-                f"observed paths={paths!r}. Do not create another copy. After "
-                "the records settle, rerun this operation with the original "
-                "source analysis and the exact preserved duplicate name to "
-                "resume recovery."
+                f"observed paths={paths!r}{queue_detail}. Do not create another "
+                "copy. Rerun this operation with the original source analysis "
+                "and the exact preserved duplicate name to resume recovery."
             ) from error
 
         rollback_errors: list[str] = []
@@ -1842,31 +2166,199 @@ def discard_result_transplant_backups(
     return errors
 
 
+def resume_native_target_registration(
+    empro_module: Any,
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+) -> tuple[DuplicatePlan, tuple[Any, ...]]:
+    """Retry a preserved duplicate through RFPro's held native run path."""
+
+    results_root = plan.source_group_path.parent
+    try:
+        refresh_simulation_table(project)
+    except Exception as refresh_error:
+        print(
+            "RFPro simulation-table refresh was temporarily unavailable before "
+            f"the native retry: {refresh_error}"
+        )
+    paths_before = simulation_record_paths(project, results_root)
+    # Include any late/partial records already published for this preserved
+    # duplicate in the candidate set; exclude only unrelated pre-existing
+    # records from the native-run delta.
+    existing_records, existing_paths = copied_result_records(project, plan)
+    paths_before.difference_update(normalized_path(path) for path in existing_paths)
+    prior_queue_hold = simulation_queue_is_held(project)
+    set_simulation_queue_held(project, True)
+    records: tuple[Any, ...] = ()
+    target_paths: tuple[Path, ...] = ()
+    try:
+        request_native_target_registration(empro_module, project, duplicate)
+        print(
+            "Retrying the preserved duplicate through RFPro's native analysis "
+            "registration with the global queue held. No solver job can start."
+        )
+        records, target_paths, target_group_path = wait_for_native_target_records(
+            empro_module,
+            project,
+            duplicate,
+            plan,
+            paths_before,
+            timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
+        )
+        original_group_path = plan.duplicate_group_path
+        plan = replace(
+            plan,
+            duplicate_group=target_group_path.name,
+            duplicate_group_path=target_group_path,
+            target_result_paths=target_paths,
+            transplant_source_results=(
+                plan.transplant_source_results
+                or normalized_path(target_group_path)
+                != normalized_path(original_group_path)
+            ),
+            redundant_copied_group_path=(
+                original_group_path
+                if original_group_path.is_dir()
+                and normalized_path(target_group_path)
+                != normalized_path(original_group_path)
+                else plan.redundant_copied_group_path
+            ),
+            needs_native_registration=False,
+        )
+        if _optional_group_id(getattr(duplicate, "simulationGroup", "")) != (
+            plan.duplicate_group
+        ):
+            with project:
+                duplicate.simulationGroup = plan.duplicate_group
+            project.saveActiveProject()
+        records = remove_target_records_from_held_queue(
+            empro_module,
+            project,
+            records,
+            target_paths,
+        )
+    except Exception as error:
+        cleanup_error = ""
+        try:
+            groups = _new_record_groups(project, results_root, paths_before)
+            cleanup_records = tuple(
+                record for group_records, _paths in groups.values() for record in group_records
+            )
+            cleanup_paths = tuple(
+                path for _records, group_paths in groups.values() for path in group_paths
+            )
+            if cleanup_records:
+                remove_target_records_from_held_queue(
+                    empro_module,
+                    project,
+                    cleanup_records,
+                    cleanup_paths,
+                )
+                set_simulation_queue_held(project, prior_queue_hold)
+            else:
+                set_simulation_queue_held(project, True)
+                cleanup_error = (
+                    " RFPro's global queue remains HELD because no stable target "
+                    "record set was available to unqueue."
+                )
+        except Exception as queue_error:
+            cleanup_error = (
+                " RFPro's global queue remains HELD because cleanup failed: "
+                + str(queue_error)
+            )
+        raise RuntimeError(
+            f"Native registration retry failed: {error}.{cleanup_error}"
+        ) from error
+    set_simulation_queue_held(project, prior_queue_hold)
+    return plan, records
+
+
 def resume_existing_duplicate_plan(
     empro_module: Any,
     project: Any,
     duplicate: Any,
     plan: DuplicatePlan,
 ) -> DuplicateResult:
-    """Refresh and verify a preserved duplicate without creating more records."""
+    """Refresh a preserved duplicate or retry it through held native registration."""
 
-    active = running_simulation_descriptions(project)
-    if active:
-        details = "\n  ".join(active)
+    existing_target_records, existing_target_paths = copied_result_records(project, plan)
+    target_path_keys = {normalized_path(path) for path in existing_target_paths}
+    unrelated_records: list[Any] = []
+    for simulation in project.simulations:
+        resolved = _simulation_record_group_and_path(
+            simulation,
+            plan.source_group_path.parent,
+        )
+        if resolved is None or normalized_path(resolved[1]) not in target_path_keys:
+            unrelated_records.append(simulation)
+    unrelated_active = active_simulation_descriptions(unrelated_records)
+    if unrelated_active:
+        details = "\n  ".join(unrelated_active)
         raise RuntimeError(
-            "Only inactive Created records can be resumed. Wait for or cancel "
-            f"active simulations first:\n  {details}"
+            "Only the preserved duplicate's held records can be recovered. Wait "
+            f"for or cancel these unrelated active simulations first:\n  {details}"
+        )
+    target_executing = executing_simulation_descriptions(existing_target_records)
+    if target_executing:
+        raise RuntimeError(
+            "A preserved duplicate record is already executing rather than only "
+            "waiting in a held queue:\n  " + "\n  ".join(target_executing)
+        )
+    if active_simulation_descriptions(existing_target_records):
+        prior_queue_hold = simulation_queue_is_held(project)
+        set_simulation_queue_held(project, True)
+        try:
+            existing_target_records = remove_target_records_from_held_queue(
+                empro_module,
+                project,
+                existing_target_records,
+                existing_target_paths,
+            )
+        except Exception:
+            # The cleanup helper intentionally keeps the queue held on failure.
+            raise
+        else:
+            set_simulation_queue_held(project, prior_queue_hold)
+    expected_count = len(plan.registered_result_paths)
+    if (
+        len(existing_target_records) == expected_count
+        and len({normalized_path(path) for path in existing_target_paths})
+        == expected_count
+        and all(path.is_dir() for path in existing_target_paths)
+    ):
+        plan = replace(
+            plan,
+            target_result_paths=existing_target_paths,
+            needs_native_registration=False,
+            transplant_source_results=(
+                plan.transplant_source_results
+                or not _analysis_output_matches_paths(
+                    empro_module,
+                    duplicate,
+                    plan.duplicate_group_path,
+                    existing_target_paths,
+                )
+            ),
         )
     project.saveActiveProject()
     if ensure_duplicate_group_binding(project, duplicate, plan):
         # Persist the recovered association before refreshing the native
         # simulation table and output browser.
         project.saveActiveProject()
+    registered: tuple[Any, ...] = ()
+    if plan.needs_native_registration:
+        plan, registered = resume_native_target_registration(
+            empro_module,
+            project,
+            duplicate,
+            plan,
+        )
     replacements: tuple[tuple[Path, Path], ...] = ()
     if plan.transplant_source_results:
         print(
-            "RFPro created the duplicate records in a different result group. "
-            "Copying solved source data into those inactive registered paths."
+            "Copying solved source data into RFPro's inactive registered target "
+            "paths."
         )
         replacements = transplant_source_results(project, plan)
     print(
@@ -1880,7 +2372,7 @@ def resume_existing_duplicate_plan(
             project,
             duplicate,
             plan,
-            (),
+            registered,
             timeout_seconds=DEFAULT_REGISTRATION_TIMEOUT_SECONDS,
         )
     except Exception as error:
@@ -1910,10 +2402,12 @@ def build_confirmation(plan: DuplicatePlan) -> str:
             f"Registered solved points: {len(plan.registered_result_ids)}",
             f"Data to copy: {_format_bytes(plan.source_size_bytes)}",
             "",
-            "RFPro will first create inactive target records and directories.",
+            "The script will hold RFPro's global simulation queue, invoke its",
+            "native analysis registration, and remove the new target records",
+            "from the held queue before restoring the previous queue state.",
             "Each target point will then be atomically replaced with its matching",
-            "solved source point. No simulation will be queued or started, and",
-            "the source analysis and result files will not be modified.",
+            "solved source point. Records may briefly display as Queued, but no",
+            "solver job can start. Source analysis/results are not modified.",
         )
     )
 
@@ -1927,25 +2421,50 @@ def build_resume_confirmation(plan: DuplicatePlan) -> str:
         f"Expected solved points: {len(plan.registered_result_ids)}",
     ]
     if plan.transplant_source_results:
-        lines.extend(
-            (
-                "",
-                "RFPro registered inactive Created records in a different group",
-                "than the earlier copied data. Each Created point directory will be",
-                "backed up and atomically replaced with its solved source point.",
-                "Backups are removed only after RFPro verifies every result.",
+        if plan.needs_native_registration:
+            lines.extend(
+                (
+                    "",
+                    "Once RFPro creates the target records, each point directory",
+                    "will be backed up and atomically merged with its solved source",
+                    "point. Backups are removed only after RFPro verifies every result.",
+                )
             )
-        )
+        else:
+            lines.extend(
+                (
+                    "",
+                    "RFPro registered inactive Created records in a different group",
+                    "than the earlier copied data. Each Created point directory will be",
+                    "backed up and atomically replaced with its solved source point.",
+                    "Backups are removed only after RFPro verifies every result.",
+                )
+            )
         if plan.redundant_copied_group_path is not None:
             lines.append(
                 "The redundant earlier copy is left unchanged: "
                 + str(plan.redundant_copied_group_path)
             )
+    if plan.needs_native_registration:
+        lines.extend(
+            (
+                "",
+                "RFPro has no complete registered record set for this preserved",
+                "duplicate. Its public native analysis path will be retried while",
+                "the global simulation queue is held. New records are removed from",
+                "that held queue before its previous state is restored; no solver",
+                "job is allowed to start.",
+            )
+        )
     lines.extend(
         (
             "",
             "RFPro's simulation table and output association will be refreshed.",
-            "No new simulation records will be requested or queued.",
+            (
+                "No additional record request is needed."
+                if not plan.needs_native_registration
+                else "The existing duplicate analysis is reused; no second copy is made."
+            ),
         )
     )
     return "\n".join(lines)

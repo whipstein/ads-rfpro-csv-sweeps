@@ -97,6 +97,7 @@ class FakeSimulationList(list):
         self.next_group = next_group
         self.fail_refresh_count = fail_refresh_count
         self.refresh_calls = 0
+        self.isQueueHeld = False
 
     def getNextSimulationGroup(self) -> str:
         return self.next_group
@@ -144,8 +145,10 @@ class FakeSimulation:
     def getParameterValues(self):
         return self.parameters
 
-    def setQueued(self, _queued=True) -> None:
+    def setQueued(self, queued=True) -> None:
         self.queue_calls += 1
+        self.status = "Queued" if queued else "Created"
+        self.isRunning = bool(queued)
 
 
 class FakeProject:
@@ -299,6 +302,51 @@ class FakeGui:
             self.project.process_events()
 
 
+class FakeAnalysisToolkit:
+    def __init__(self, project) -> None:
+        self.project = project
+        self.run_calls = []
+
+    def runAnalysis(
+        self,
+        analysis,
+        waitForConfirmation=True,
+        saveProject=False,
+        reuseExistingIfPossible=True,
+    ):
+        if self.project is None:
+            raise RuntimeError("No fake project was supplied")
+        if not self.project.simulations.isQueueHeld:
+            raise RuntimeError("native analysis was requested without holding the queue")
+        self.run_calls.append(
+            (
+                analysis,
+                waitForConfirmation,
+                saveProject,
+                reuseExistingIfPossible,
+            )
+        )
+        self.project._cacheProjectModifiedBeforeRunAnalysis()
+        try:
+            if saveProject:
+                self.project.saveActiveProject()
+            return self.project.createSimulationsFromAnalysis(
+                True,
+                False,
+                [],
+                analysis,
+                {},
+                {},
+            )
+        finally:
+            self.project._invalidateProjectModifiedBeforeRunAnalysis()
+
+
+class FakeToolkit:
+    def __init__(self, project) -> None:
+        self.analysis = FakeAnalysisToolkit(project)
+
+
 class FakeEmpro:
     def __init__(
         self,
@@ -308,6 +356,7 @@ class FakeEmpro:
     ) -> None:
         self.output = FakeOutputModule(omit_duplicate, fail_refresh_count)
         self.gui = FakeGui(project)
+        self.toolkit = FakeToolkit(project)
 
 
 class EmptyOutputModule:
@@ -391,7 +440,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             project = FakeProject([source])
 
             result = MODULE.duplicate_analysis_with_results(
-                FakeEmpro(), project, source, "RF Setup Copy"
+                FakeEmpro(project=project), project, source, "RF Setup Copy"
             )
 
             self.assertEqual(result.duplicate.simulationGroupPath, "./000002")
@@ -414,7 +463,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source])
-            empro = FakeEmpro()
+            empro = FakeEmpro(project=project)
 
             result = MODULE.duplicate_analysis_with_results(
                 empro, project, source, "RF Setup Copy"
@@ -431,20 +480,26 @@ class DuplicateAnalysisTests(unittest.TestCase):
             )
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
-            # Source mapping, duplicate/group assignment, then registrations.
-            self.assertEqual(project.save_calls, 3)
+            # Source save, duplicate/group save, native-run save, final association.
+            self.assertEqual(project.save_calls, 4)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
             create_call = project.create_calls[0]
-            self.assertEqual(create_call[0:2], (False, False))
+            self.assertEqual(create_call[0:2], (True, False))
             self.assertEqual(
                 create_call[2],
                 [],
             )
             self.assertIs(create_call[3], result.duplicate)
             self.assertEqual(create_call[4:], ({}, {}))
-            self.assertTrue(all(sim.queue_calls == 0 for sim in project.simulations))
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
+            self.assertEqual(
+                empro.toolkit.analysis.run_calls[0][1:],
+                (False, True, True),
+            )
+            self.assertTrue(all(sim.queue_calls == 1 for sim in project.simulations))
             self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+            self.assertFalse(project.simulations.isQueueHeld)
             self.assertEqual(empro.output.result_browser.refresh_calls, 1)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
@@ -459,7 +514,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             project.saved_analysis_count = 1
 
             result = MODULE.duplicate_analysis_with_results(
-                FakeEmpro(), project, source, "RF Setup Copy"
+                FakeEmpro(project=project), project, source, "RF Setup Copy"
             )
 
             registered = project.analyses[1]
@@ -474,7 +529,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             project = FakeProject([source], empty_return_with_records=True)
 
             result = MODULE.duplicate_analysis_with_results(
-                FakeEmpro(), project, source, "RF Setup Copy"
+                FakeEmpro(project=project), project, source, "RF Setup Copy"
             )
 
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
@@ -559,6 +614,75 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(len(project.create_calls), 0)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
+
+    def test_timed_out_duplicate_without_records_retries_native_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = "000002"
+            duplicate.results_registered = False
+            project = FakeProject([source, duplicate])
+            project.saved_analysis_count = 2
+            empro = FakeEmpro(project=project)
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+            self.assertTrue(plan.needs_native_registration)
+            self.assertTrue(plan.transplant_source_results)
+
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 1)
+            self.assertTrue((root / "000002" / "000001" / ".reuse.hash").is_file())
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+            self.assertFalse(project.simulations.isQueueHeld)
+
+    def test_late_held_records_are_unqueued_and_recovered_without_second_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            duplicate = source.clone()
+            duplicate.name = "RF Setup Copy"
+            duplicate.simulationGroup = "000002"
+            duplicate.results_registered = False
+            target_paths = []
+            for simulation_id in ("000001", "000002"):
+                target = root / "000002" / simulation_id
+                target.mkdir(parents=True)
+                (target / "created.placeholder").write_text("", encoding="utf-8")
+                target_paths.append(target)
+            simulations = AssociationRefreshSimulationList(
+                duplicate,
+                values=[
+                    FakeSimulation(str(path), status="Queued", group="000002")
+                    for path in target_paths
+                ],
+            )
+            simulations.isQueueHeld = True
+            project = FakeProject([source, duplicate], simulations=simulations)
+            project.saved_analysis_count = 2
+            empro = FakeEmpro(project=project)
+
+            resumed, plan = MODULE.prepare_resume_plan(
+                empro, project, source, "RF Setup Copy"
+            )
+            self.assertTrue(plan.needs_native_registration)
+
+            result = MODULE.resume_existing_duplicate_plan(
+                empro, project, resumed, plan
+            )
+
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(len(empro.toolkit.analysis.run_calls), 0)
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+            self.assertTrue(project.simulations.isQueueHeld)
+            self.assertTrue((target_paths[0] / ".reuse.hash").is_file())
 
     def test_empty_group_resume_recovers_created_record_group_and_rebinds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -701,7 +825,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source])
-            empro = FakeEmpro(omit_duplicate=True)
+            empro = FakeEmpro(omit_duplicate=True, project=project)
 
             with mock.patch.object(MODULE, "DEFAULT_REGISTRATION_TIMEOUT_SECONDS", 0):
                 with self.assertRaisesRegex(RuntimeError, "expected number"):
@@ -721,7 +845,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
                 (root / "000002" / "000001" / ".reuse.hash").exists()
             )
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
-            self.assertEqual(project.save_calls, 3)
+            self.assertEqual(project.save_calls, 4)
             self.assertEqual(len(project.simulations), 2)
             self.assertGreaterEqual(project.simulations.refresh_calls, 1)
             self.assertEqual(len(project.create_calls), 1)
@@ -734,7 +858,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source])
-            empro = FakeEmpro(fail_refresh_count=1)
+            empro = FakeEmpro(fail_refresh_count=1, project=project)
 
             with mock.patch.object(MODULE, "REGISTRATION_POLL_INTERVAL_SECONDS", 0):
                 result = MODULE.duplicate_analysis_with_results(
@@ -744,7 +868,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
-            self.assertEqual(project.save_calls, 3)
+            self.assertEqual(project.save_calls, 4)
             self.assertEqual(len(project.create_calls), 1)
             self.assertEqual(len(project.simulations), 2)
             self.assertEqual(empro.output.result_browser.refresh_calls, 2)
@@ -754,7 +878,7 @@ class DuplicateAnalysisTests(unittest.TestCase):
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source], empty_registration=True)
-            empro = FakeEmpro()
+            empro = FakeEmpro(project=project)
 
             with mock.patch.object(MODULE, "DEFAULT_REGISTRATION_TIMEOUT_SECONDS", 0):
                 with self.assertRaisesRegex(RuntimeError, "may still be completing"):
@@ -764,30 +888,34 @@ class DuplicateAnalysisTests(unittest.TestCase):
 
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertFalse((root / "000002").is_dir())
-            self.assertEqual(project.save_calls, 2)
+            self.assertEqual(project.save_calls, 3)
             self.assertEqual(len(project.create_calls), 1)
-            self.assertEqual(project.create_calls[0][0], False)
+            self.assertEqual(project.create_calls[0][0], True)
             self.assertEqual(len(project.simulations), 0)
+            self.assertTrue(project.simulations.isQueueHeld)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
 
-    def test_unexpected_queued_registration_is_preserved_for_safe_cleanup(self) -> None:
+    def test_native_queued_registration_is_unqueued_before_hold_is_released(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = make_source(root)
             project = FakeProject([source], queue_on_create=True)
 
-            with self.assertRaisesRegex(RuntimeError, "records were preserved"):
-                MODULE.duplicate_analysis_with_results(
-                    FakeEmpro(), project, source, "RF Setup Copy"
-                )
+            empro = FakeEmpro(project=project)
+            result = MODULE.duplicate_analysis_with_results(
+                empro, project, source, "RF Setup Copy"
+            )
 
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertTrue((root / "000002").is_dir())
-            self.assertEqual(project.save_calls, 2)
+            self.assertEqual(result.verified_result_ids, ("000001", "000002"))
+            self.assertEqual(project.save_calls, 4)
             self.assertEqual(len(project.simulations), 2)
-            self.assertTrue(all(sim.status == "Queued" for sim in project.simulations))
-            self.assertEqual(project.create_calls[0][0], False)
+            self.assertTrue(all(sim.status == "Created" for sim in project.simulations))
+            self.assertTrue(all(sim.queue_calls == 1 for sim in project.simulations))
+            self.assertEqual(project.create_calls[0][0], True)
+            self.assertFalse(project.simulations.isQueueHeld)
             self.assertEqual(project.cache_calls, 1)
             self.assertEqual(project.invalidate_calls, 1)
 

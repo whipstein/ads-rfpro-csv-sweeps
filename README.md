@@ -434,21 +434,31 @@ target group, registered-result count, and copy size before making changes. It
 uses the documented deep-copy `Analysis.clone()` API and the index returned by
 `project.analyses.append()` to work with RFPro's registered analysis object.
 It obtains a new ID from `project.simulations.getNextSimulationGroup()`, saves
-that association, and asks RFPro to create the cloned sweep's inactive target
-records with
-`project.createSimulationsFromAnalysis(False, False, [], analysis, ...)`.
+that association, and holds the documented
+`project.simulations.isQueueHeld` property. It then calls the public
+`empro.toolkit.analysis.runAnalysis(..., waitForConfirmation=False,
+saveProject=True, reuseExistingIfPossible=True)` entry point. This is important
+for RFPro 2026's current extraction backend: the public wrapper routes the
+analysis through its native V2 registration path, whereas calling
+`Project.createSimulationsFromAnalysis()` directly can return without ever
+publishing a usable record set.
 
-RFPro therefore owns creation of the final group and point paths. Only after
-every record has a **Created** status does the script copy each solved source
-point into its corresponding registered target path. It matches unique public
-parameter dictionaries when RFPro exposes them; otherwise the unchanged cloned
-sweep is mapped in simulation-ID order. Each target directory is copied to a
-private sibling staging path, the solved source data is overlaid there, and the
-merged directory is atomically swapped into place. This preserves target-only
-RFPro identity metadata. The original Created directory is retained as a backup
-until `AnalysisOutput` verifies the complete duplicate, then removed. A
-verification failure restores all Created-directory backups. The source is
-never modified.
+RFPro therefore owns creation of the final group and point paths. The new
+records may temporarily display **Queued**, but the global queue is already
+held, so a solver cannot start. After every target record and directory appears,
+the script calls the documented `Simulation.setQueued(False)` on those new
+records and verifies that none remains active before restoring the queue's
+previous hold state.
+
+The script then copies each solved source point into its corresponding
+registered target path. It matches unique public parameter dictionaries when
+RFPro exposes them; otherwise the unchanged cloned sweep is mapped in
+simulation-ID order. Each target directory is copied to a private sibling
+staging path, the solved source data is overlaid there, and the merged directory
+is atomically swapped into place. This preserves target-only RFPro identity
+metadata. The original target directory is retained as a backup until
+`AnalysisOutput` verifies the complete duplicate, then removed. A verification
+failure restores all target-directory backups. The source is never modified.
 
 RFPro may expose the new `simulationGroupPath` as the project-relative value
 `./<group-id>` rather than as an absolute path. The verifier accepts that exact
@@ -458,24 +468,24 @@ before checking containment. The script does not assign the deprecated
 authoritative association.
 
 The point copies include hidden reuse metadata, meshes, circuit results, logs,
-and every other saved artifact. The operation does not queue or start a
-simulation. The first creation argument is deliberately `False`; Keysight's
-shipped workflows call `setQueued(True)` separately when they intend to run a
-record, and this script never makes that call. It refuses to proceed while any
+and every other saved artifact. The operation refuses to proceed while any
 simulation is active, when the source mapping is incomplete, when a source path
 falls outside its group, or when the proposed RFPro target already exists.
-Enough free space for the complete copy is required.
+Enough free space for the complete copy is required. If target records cannot
+be safely removed after a registration failure, the script deliberately leaves
+the global RFPro queue **held** and reports that state instead of allowing an
+unexpected solve to begin.
 
-In RFPro's newer backend this registration call can return an empty Python list
-while inactive records are still being created asynchronously. Empty therefore
-does not mean failure. The script processes RFPro events and waits up to
+RFPro's native registration can publish records asynchronously. The script
+processes RFPro events and waits up to
 `DEFAULT_REGISTRATION_TIMEOUT_SECONDS` (300 seconds by default) for every
-expected Created record to appear in `project.simulations`. Each poll calls the
-public `project.simulations.refresh()` method because RFPro's GUI can show newly
+expected record to appear in `project.simulations`. Each poll calls the public
+`project.simulations.refresh()` method because RFPro's GUI can show newly
 created records while the Python simulation-list wrapper is still stale.
 Temporary `SimulationsTable` count-mismatch errors during publication are
-retried. A **Created** status is the expected inactive state; it is not a
-running or queued solve.
+retried, and a complete registration snapshot is printed every ten seconds so
+a timeout reports the observed group binding, records, statuses, and filesystem
+groups instead of merely saying that nothing happened.
 
 Once all target records appear and their solved data has been copied, the
 script saves them, refreshes with `empro.output.resultBrowser().refresh()`, and
@@ -483,18 +493,19 @@ uses `AnalysisOutput` to verify that the duplicate exposes the expected result
 count and exactly the paths owned by its Created records. Transient
 output-refresh delays are retried.
 
-After a target-creation request has been sent, the script never automatically
+After native registration has been requested, the script never automatically
 deletes the duplicate analysis or its records because RFPro may still be
 completing the request. If solved data was already swapped into the targets and
-verification fails, their original Created directories are restored. A timeout
-therefore leaves an inactive, resumable duplicate instead of deleting its
-owner. Only failures before target creation are fully rolled back.
+verification fails, their original target directories are restored. A timeout
+therefore leaves a resumable duplicate instead of deleting its owner. Only
+failures before registration are fully rolled back.
 
-If a timed-out attempt preserved both the duplicate analysis and its copied
-group, do not create another duplicate. Run the operation again with the
-original source selected and enter the exact existing duplicate name in the
-name dialog. The operation recognizes that name as **resume existing**, refreshes
-and verifies its Created records, and does not call simulation creation again.
+If a timed-out attempt preserved the duplicate analysis, do not create another
+duplicate. Run the operation again with the original source selected and enter
+the exact existing duplicate name in the name dialog. The operation recognizes
+that name as **resume existing**. If no complete record set exists, it retries
+that same saved analysis through RFPro's native path while the global queue is
+held; it does not create a second duplicate analysis.
 
 Older copy-first releases can leave two new directories: one contains the
 copied solved data, while a second RFPro-owned group contains the inactive
@@ -506,9 +517,9 @@ An empty `simulationGroup` is recovered from public `Simulation.group()` and
 the GUI asks which one belongs to the duplicate instead of guessing.
 `DEFAULT_RESUME_GROUP_ID` or `--resume-group` supplies an explicit group ID.
 
-New duplicates no longer pre-create or copy into the proposed group before
-RFPro registers it, so the copied data and RFPro records cannot be split across
-two newly allocated groups.
+New duplicates no longer use the direct simulation-creation call that caused
+the repeated empty-record timeout. RFPro's native analysis path creates the
+authoritative group and records before solved data is transplanted.
 
 For an explicit direct launch:
 

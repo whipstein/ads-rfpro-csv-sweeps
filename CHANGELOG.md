@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.16.1 - 2026-09-03
+
+- Replace the unsupported direct `Project.createSimulationsFromAnalysis()`
+  registration attempt with the public
+  `empro.toolkit.analysis.runAnalysis()` entry point used by RFPro's current V2
+  extraction flow.
+- Hold the documented global `SimulationList.isQueueHeld` state before native
+  registration, remove only the newly created target records from that held
+  queue with `Simulation.setQueued(False)`, and restore the previous hold state
+  only after verifying that no target remains active. No solver job is allowed
+  to start.
+- Make preserved v0.16.0 timeouts retry their existing duplicate analysis
+  through the held native path instead of waiting again for records that the
+  direct call will never publish.
+- Print periodic registration diagnostics containing the duplicate group,
+  observed record groups/statuses, and filesystem groups. If safe queue cleanup
+  is impossible, leave RFPro's global queue held and say so explicitly.
+- Add regression coverage for held native registration, immediate unqueueing,
+  restored queue state, and native recovery of a timed-out recordless copy.
+
 ## 0.16.0 - 2026-09-03
 
 - Reverse new duplication order so RFPro creates the inactive target group and
