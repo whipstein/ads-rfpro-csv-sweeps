@@ -2,8 +2,9 @@
 
 Run this script inside RFPro. It deep-clones the selected Analysis, allocates a
 new simulation-group ID, copies the source group directory without modifying
-it, registers the cloned Analysis, verifies its public AnalysisOutput paths,
-and saves the project. It never starts or queues a simulation.
+it, registers the cloned Analysis and copied result paths in RFPro's simulation
+table, verifies its public AnalysisOutput paths, and saves the project. It
+never starts or queues a simulation.
 """
 
 from __future__ import annotations
@@ -475,6 +476,83 @@ def clone_analysis_for_plan(source: Any, plan: DuplicatePlan) -> Any:
     return duplicate
 
 
+def remapped_result_paths(plan: DuplicatePlan) -> tuple[Path, ...]:
+    """Map each registered source result to the same location in the copy."""
+
+    return tuple(
+        plan.duplicate_group_path
+        / Path(os.path.relpath(path, plan.source_group_path))
+        for path in plan.registered_result_paths
+    )
+
+
+def register_duplicate_results(
+    project: Any,
+    duplicate: Any,
+    plan: DuplicatePlan,
+) -> tuple[Any, ...]:
+    """Register copied results through RFPro's own analysis-creation path.
+
+    RFPro's shipped analysis runner passes reusable result directories as the
+    ``existingPaths`` argument to this method.  Merely refreshing
+    ``project.simulations`` does not discover copied directories.  This call
+    creates the simulation-table records but does not queue them; RFPro's run
+    implementation performs a separate ``setQueued(True)`` step when a solve
+    is actually requested.
+    """
+
+    existing_paths = [str(path) for path in remapped_result_paths(plan)]
+    missing = [path for path in existing_paths if not Path(path).is_dir()]
+    if missing:
+        details = "\n  ".join(missing)
+        raise RuntimeError(
+            "Copied result paths are missing before RFPro registration:\n  "
+            + details
+        )
+    try:
+        simulations = project.createSimulationsFromAnalysis(
+            True,
+            False,
+            existing_paths,
+            duplicate,
+            {},
+            {},
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "RFPro could not register the copied result paths with the "
+            f"duplicate analysis: {error}"
+        ) from error
+    registered = tuple(simulations or ())
+    if not registered:
+        raise RuntimeError(
+            "RFPro returned no simulation records while registering the "
+            "copied result paths."
+        )
+    return registered
+
+
+def remove_duplicate_simulation_registrations(project: Any, plan: DuplicatePlan) -> int:
+    """Remove only simulation-table entries that resolve inside the new group."""
+
+    indexes: list[int] = []
+    for index, simulation in enumerate(project.simulations):
+        text = str(
+            _call_or_value(getattr(simulation, "simulationPath", None), "") or ""
+        ).strip()
+        if not text:
+            continue
+        path = resolve_result_path(Path(text), plan.duplicate_group_path)
+        if path_is_within(path, plan.duplicate_group_path):
+            indexes.append(index)
+    if not indexes:
+        return 0
+    with project:
+        for index in reversed(indexes):
+            del project.simulations[index]
+    return len(indexes)
+
+
 def verify_duplicate_output(
     empro_module: Any,
     duplicate: Any,
@@ -544,18 +622,27 @@ def execute_duplicate_plan(
     copy_group_atomically(plan.source_group_path, plan.duplicate_group_path)
 
     appended = False
+    registration_attempted = False
     save_attempted = False
     try:
         with project:
             project.analyses.append(duplicate)
         appended = True
-        project.simulations.refresh()
+        registration_attempted = True
+        register_duplicate_results(project, duplicate, plan)
         verified_ids = verify_duplicate_output(empro_module, duplicate, plan)
         save_attempted = True
         project.saveActiveProject()
     except Exception as error:
         if not save_attempted:
             rollback_errors: list[str] = []
+            if registration_attempted:
+                try:
+                    remove_duplicate_simulation_registrations(project, plan)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"simulation registration rollback failed: {rollback_error}"
+                    )
             if appended:
                 try:
                     with project:

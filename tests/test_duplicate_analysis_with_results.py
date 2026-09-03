@@ -24,12 +24,14 @@ class FakeAnalysis:
         group: str,
         simulation_path: str,
         relative_duplicate_group_path: bool = False,
+        results_registered: bool = True,
     ) -> None:
         self.name = name
         self.result_root = result_root
         self.simulationGroup = group
         self.simulationPath = simulation_path
         self.relative_duplicate_group_path = relative_duplicate_group_path
+        self.results_registered = results_registered
         self.settings = {"frequency": "20 GHz"}
 
     @property
@@ -45,6 +47,7 @@ class FakeAnalysis:
             self.simulationGroup,
             self.simulationPath,
             self.relative_duplicate_group_path,
+            False,
         )
         duplicate.settings = dict(self.settings)
         return duplicate
@@ -84,10 +87,26 @@ class FakeSimulationList(list):
         self.refresh_calls += 1
 
 
+class FakeSimulation:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.isRunning = False
+        self.status = "Completed"
+        self.queue_calls = 0
+
+    def simulationPath(self) -> str:
+        return self.path
+
+    def setQueued(self, _queued=True) -> None:
+        self.queue_calls += 1
+
+
 class FakeProject:
-    def __init__(self, analyses, simulations=None) -> None:
+    def __init__(self, analyses, simulations=None, empty_registration=False) -> None:
         self.analyses = FakeAnalyses(analyses)
         self.simulations = simulations or FakeSimulationList()
+        self.empty_registration = empty_registration
+        self.create_calls = []
         self.save_calls = 0
 
     def __enter__(self):
@@ -99,6 +118,17 @@ class FakeProject:
     def saveActiveProject(self) -> None:
         self.save_calls += 1
 
+    def createSimulationsFromAnalysis(self, *arguments):
+        self.create_calls.append(arguments)
+        if self.empty_registration:
+            return []
+        existing_paths = arguments[2]
+        analysis = arguments[3]
+        created = [FakeSimulation(path) for path in existing_paths]
+        self.simulations.extend(created)
+        analysis.results_registered = True
+        return created
+
 
 class FakeAnalysisOutput:
     def __init__(self, analysis: FakeAnalysis, omit_duplicate: bool = False) -> None:
@@ -106,12 +136,16 @@ class FakeAnalysisOutput:
         self.omit_duplicate = omit_duplicate
 
     def getAvailableSimulationIds(self):
-        if self.omit_duplicate and self.analysis.simulationGroup != "000001":
+        if not self.analysis.results_registered or (
+            self.omit_duplicate and self.analysis.simulationGroup != "000001"
+        ):
             return []
         return ["000001", "000002"]
 
     def getAvailableSimulationPaths(self):
-        if self.omit_duplicate and self.analysis.simulationGroup != "000001":
+        if not self.analysis.results_registered or (
+            self.omit_duplicate and self.analysis.simulationGroup != "000001"
+        ):
             return []
         root = self.analysis.result_root / self.analysis.simulationGroup
         return [str(root / "000001"), str(root / "000002")]
@@ -247,7 +281,17 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup", "RF Setup Copy"])
             self.assertEqual(result.verified_result_ids, ("000001", "000002"))
             self.assertEqual(project.save_calls, 2)
-            self.assertEqual(project.simulations.refresh_calls, 1)
+            self.assertEqual(project.simulations.refresh_calls, 0)
+            self.assertEqual(len(project.create_calls), 1)
+            create_call = project.create_calls[0]
+            self.assertEqual(create_call[0:2], (True, False))
+            self.assertEqual(
+                create_call[2],
+                [str(copied / "000001"), str(copied / "000002")],
+            )
+            self.assertIs(create_call[3], result.duplicate)
+            self.assertEqual(create_call[4:], ({}, {}))
+            self.assertTrue(all(sim.queue_calls == 0 for sim in project.simulations))
 
     def test_registered_result_mismatch_rolls_back_before_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +310,23 @@ class DuplicateAnalysisTests(unittest.TestCase):
             self.assertEqual(project.analyses.names(), ["RF Setup"])
             self.assertFalse((root / "000002").exists())
             self.assertTrue((root / "000001" / "000001" / ".reuse.hash").is_file())
+            self.assertEqual(project.save_calls, 1)
+            self.assertEqual(len(project.simulations), 0)
+            self.assertEqual(project.simulations.refresh_calls, 1)
+
+    def test_empty_rfpro_registration_rolls_back_before_save(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_source(root)
+            project = FakeProject([source], empty_registration=True)
+
+            with self.assertRaisesRegex(RuntimeError, "returned no simulation records"):
+                MODULE.duplicate_analysis_with_results(
+                    FakeEmpro(), project, source, "RF Setup Copy"
+                )
+
+            self.assertEqual(project.analyses.names(), ["RF Setup"])
+            self.assertFalse((root / "000002").exists())
             self.assertEqual(project.save_calls, 1)
 
     def test_running_or_queued_simulation_prevents_save_and_copy(self) -> None:

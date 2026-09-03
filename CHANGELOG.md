@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.2 - 2026-09-02
+
+- Register every copied existing-result path through RFPro's shipped
+  `Project.createSimulationsFromAnalysis(..., existingPaths, ...)` lifecycle.
+  `SimulationList.refresh()` only refreshed known entries and could not attach
+  a newly copied result group to the duplicate analysis.
+- Keep duplication non-running: the registration call is not followed by
+  RFPro's separate `Simulation.setQueued(True)` launch step.
+- Roll back simulation-table entries created for the new group as well as the
+  cloned analysis and copied directory if pre-save verification fails.
+- Add regression coverage proving copied paths are supplied to RFPro, no
+  simulation is queued, and empty or mismatched registration is rolled back.
+
 ## 0.15.1 - 2026-09-02
 
 - Accept RFPro's canonical relative `./<simulation-group>` representation when
